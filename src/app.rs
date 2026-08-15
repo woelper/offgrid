@@ -111,7 +111,7 @@ impl OffgridApp {
         let models_dir = models_dir();
         let _ = std::fs::create_dir_all(&models_dir);
         let (hub_tx, hub_rx) = std::sync::mpsc::channel();
-        let llm = llm::spawn_worker(hardware.cores);
+        let llm = llm::spawn_worker(hardware.physical_cores);
 
         let mut model_loading = false;
         if let Some(last) = &config.last_model {
@@ -687,25 +687,7 @@ impl OffgridApp {
                         if msg.content.is_empty() {
                             ui.label("…");
                         }
-                        for segment in split_think(&msg.content) {
-                            match segment {
-                                Segment::Text(t) => {
-                                    if !t.trim().is_empty() {
-                                        CommonMarkViewer::new().show(
-                                            ui,
-                                            &mut self.md_cache,
-                                            t,
-                                        );
-                                    }
-                                }
-                                Segment::Think(t) => {
-                                    let t = t.trim();
-                                    if !t.is_empty() {
-                                        render_think_block(ui, t);
-                                    }
-                                }
-                            }
-                        }
+                        render_message(ui, &mut self.md_cache, &msg.content);
                         ui.add_space(8.0);
                     }
                 });
@@ -817,6 +799,7 @@ impl OffgridApp {
                         task,
                         self.llm.cmd_tx.clone(),
                         self.agent_auto_approve,
+                        self.config.web_tools,
                     ));
                 }
                 if running {
@@ -840,6 +823,16 @@ impl OffgridApp {
                 }
                 ui.checkbox(&mut self.agent_auto_approve, "auto-approve commands")
                     .on_hover_text("Run shell commands without asking (applies to the next run)");
+                if ui
+                    .checkbox(&mut self.config.web_tools, "allow web tools")
+                    .on_hover_text(
+                        "Give the agent web_search and fetch_url. Fails gracefully when \
+                         offline — the agent falls back to local knowledge.",
+                    )
+                    .changed()
+                {
+                    self.config.save();
+                }
                 if !self.agent_transcript.is_empty()
                     && !running
                     && ui.small_button("Clear").clicked()
@@ -866,25 +859,7 @@ impl OffgridApp {
                         }
                         AgentItem::Assistant(text) => {
                             ui.colored_label(theme::GOOD_GREEN, "Model");
-                            for segment in split_think(text) {
-                                match segment {
-                                    Segment::Text(t) => {
-                                        if !t.trim().is_empty() {
-                                            CommonMarkViewer::new().show(
-                                                ui,
-                                                &mut self.md_cache,
-                                                t,
-                                            );
-                                        }
-                                    }
-                                    Segment::Think(t) => {
-                                        let t = t.trim();
-                                        if !t.is_empty() {
-                                            render_think_block(ui, t);
-                                        }
-                                    }
-                                }
-                            }
+                            render_message(ui, &mut self.md_cache, text);
                             ui.add_space(6.0);
                         }
                         AgentItem::Tool {
@@ -898,12 +873,16 @@ impl OffgridApp {
                                 ui.weak(summary);
                             });
                             if let Some(out) = output {
-                                egui::CollapsingHeader::new("output")
-                                    .id_salt(("tool_output", i))
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        ui.monospace(out);
-                                    });
+                                if out.lines().count() > 5 {
+                                    egui::CollapsingHeader::new("output")
+                                        .id_salt(("tool_output", i))
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.monospace(out);
+                                        });
+                                } else {
+                                    ui.monospace(out);
+                                }
                             }
                             ui.add_space(4.0);
                         }
@@ -915,21 +894,7 @@ impl OffgridApp {
                 }
                 if !self.agent_current.is_empty() {
                     ui.colored_label(theme::GOOD_GREEN, "Model");
-                    for segment in split_think(&self.agent_current) {
-                        match segment {
-                            Segment::Text(t) => {
-                                if !t.trim().is_empty() {
-                                    CommonMarkViewer::new().show(ui, &mut self.md_cache, t);
-                                }
-                            }
-                            Segment::Think(t) => {
-                                let t = t.trim();
-                                if !t.is_empty() {
-                                    render_think_block(ui, t);
-                                }
-                            }
-                        }
-                    }
+                    render_message(ui, &mut self.md_cache, &self.agent_current);
                 }
                 if let Some((command, _)) = &self.agent_approval {
                     egui::Frame::new()
@@ -1100,27 +1065,36 @@ fn shellexpand_home(path: &str) -> String {
 enum Segment<'a> {
     Text(&'a str),
     Think(&'a str),
+    ToolCall(&'a str),
 }
 
-/// Split message content into normal text and `<think>…</think>` segments.
-/// An unclosed `<think>` (mid-stream) is treated as a think segment.
-fn split_think(s: &str) -> Vec<Segment<'_>> {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
+/// Split message content into normal text, `<think>…</think>` and
+/// `<tool_call>…</tool_call>` segments. An unclosed tag (mid-stream) claims
+/// the rest of the text.
+fn split_segments(s: &str) -> Vec<Segment<'_>> {
+    const TAGS: [(&str, &str); 2] = [("<think>", "</think>"), ("<tool_call>", "</tool_call>")];
     let mut out = Vec::new();
     let mut rest = s;
-    while let Some(start) = rest.find(OPEN) {
+    loop {
+        let next = TAGS
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (open, _))| rest.find(open).map(|pos| (pos, i)))
+            .min();
+        let Some((start, tag)) = next else { break };
+        let (open, close) = TAGS[tag];
+        let make = if tag == 0 { Segment::Think } else { Segment::ToolCall };
         if start > 0 {
             out.push(Segment::Text(&rest[..start]));
         }
-        let after = &rest[start + OPEN.len()..];
-        match after.find(CLOSE) {
+        let after = &rest[start + open.len()..];
+        match after.find(close) {
             Some(end) => {
-                out.push(Segment::Think(&after[..end]));
-                rest = &after[end + CLOSE.len()..];
+                out.push(make(&after[..end]));
+                rest = &after[end + close.len()..];
             }
             None => {
-                out.push(Segment::Think(after));
+                out.push(make(after));
                 rest = "";
                 break;
             }
@@ -1130,6 +1104,37 @@ fn split_think(s: &str) -> Vec<Segment<'_>> {
         out.push(Segment::Text(rest));
     }
     out
+}
+
+/// Render one chat/agent message: markdown text, think blocks as quotes,
+/// tool calls as pretty-printed JSON code blocks.
+fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
+    for segment in split_segments(text) {
+        match segment {
+            Segment::Text(t) => {
+                if !t.trim().is_empty() {
+                    CommonMarkViewer::new().show(ui, cache, t);
+                }
+            }
+            Segment::Think(t) => {
+                let t = t.trim();
+                if !t.is_empty() {
+                    render_think_block(ui, t);
+                }
+            }
+            Segment::ToolCall(t) => {
+                let t = t.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let body = serde_json::from_str::<serde_json::Value>(t)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                    .unwrap_or_else(|| t.to_string());
+                CommonMarkViewer::new().show(ui, cache, &format!("```json\n{body}\n```"));
+            }
+        }
+    }
 }
 
 /// Reasoning block, styled like a quote: gray bar on the left, italic gray text.

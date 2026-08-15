@@ -55,7 +55,7 @@ fn smoke(agent_mode: bool) {
         println!("done");
     }
 
-    let handle = llm::spawn_worker(hardware::HardwareProfile::detect().cores);
+    let handle = llm::spawn_worker(hardware::HardwareProfile::detect().physical_cores);
     handle.cmd_tx.send(llm::LlmCmd::Load(path)).unwrap();
     let name = loop {
         match handle.event_rx.recv().unwrap() {
@@ -76,6 +76,7 @@ fn smoke(agent_mode: bool) {
             "Create a file named hello.txt containing exactly: hello offgrid".into(),
             handle.cmd_tx.clone(),
             true,
+            false,
         );
         for event in run.rx {
             match event {

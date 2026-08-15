@@ -15,6 +15,9 @@ const MAX_FILE_READ: u64 = 50 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 60;
+const WEB_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) offgrid/0.1";
+const OFFLINE_HINT: &str =
+    "Continue using local knowledge and mention in your summary that the web was unavailable.";
 
 pub enum AgentEvent {
     /// Streamed model output for the current turn.
@@ -38,12 +41,21 @@ pub fn start(
     task: String,
     cmd_tx: Sender<LlmCmd>,
     auto_approve: bool,
+    web_tools: bool,
 ) -> AgentRun {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     std::thread::spawn(move || {
-        if let Err(e) = run_loop(&workspace, &task, &cmd_tx, &tx, &stop_thread, auto_approve) {
+        if let Err(e) = run_loop(
+            &workspace,
+            &task,
+            &cmd_tx,
+            &tx,
+            &stop_thread,
+            auto_approve,
+            web_tools,
+        ) {
             let _ = tx.send(AgentEvent::Error(e));
         }
     });
@@ -57,11 +69,12 @@ fn run_loop(
     tx: &Sender<AgentEvent>,
     stop: &AtomicBool,
     auto_approve: bool,
+    web_tools: bool,
 ) -> Result<(), String> {
     let mut messages = vec![
         ChatMessage {
             role: Role::System,
-            content: system_prompt(workspace),
+            content: system_prompt(workspace, web_tools),
         },
         ChatMessage {
             role: Role::User,
@@ -118,12 +131,12 @@ fn run_loop(
                 reply: approve_tx,
             });
             match approve_rx.recv() {
-                Ok(true) => execute(&call, workspace),
+                Ok(true) => execute(&call, workspace, web_tools),
                 Ok(false) => "Command denied by the user.".to_string(),
                 Err(_) => break, // UI went away / run aborted
             }
         } else {
-            execute(&call, workspace)
+            execute(&call, workspace, web_tools)
         };
         if stop.load(Ordering::Relaxed) {
             break;
@@ -152,11 +165,19 @@ fn run_loop(
     Ok(())
 }
 
-fn system_prompt(workspace: &Path) -> String {
+fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let listing = list_files_impl(workspace, workspace, 1).unwrap_or_default();
     let agents_md = std::fs::read_to_string(workspace.join("AGENTS.md"))
         .map(|s| format!("\nProject instructions (AGENTS.md):\n{s}\n"))
         .unwrap_or_default();
+    let web = if web_tools {
+        "- web_search: arguments {\"query\": \"...\"} — search the web\n\
+         - fetch_url: arguments {\"url\": \"https://...\"} — fetch a web page as plain text\n\
+         Web tools may be offline: if one reports that web access is unavailable, do NOT \
+         retry more than once — continue with local knowledge.\n"
+    } else {
+        ""
+    };
     format!(
         "You are a coding agent working in the workspace directory {ws}. All paths are \
 relative to it.\n\
@@ -166,6 +187,7 @@ You have these tools:\n\
 - read_file: arguments {{\"path\": \"file\"}} — read a file\n\
 - write_file: arguments {{\"path\": \"file\", \"content\": \"...\"}} — create or overwrite a file\n\
 - run_command: arguments {{\"command\": \"shell command\"}} — run a shell command in the workspace\n\
+{web}\
 \n\
 To use a tool, end your reply with exactly one call in this format:\n\
 <tool_call>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tool_call>\n\
@@ -177,6 +199,7 @@ wrote), reply with a short summary and NO tool call.\n\
 Top-level files in the workspace:\n{listing}",
         ws = workspace.display(),
         agents = agents_md,
+        web = web,
     )
 }
 
@@ -198,6 +221,8 @@ impl ToolCall {
                 self.arg("path").unwrap_or("?"),
                 self.arg("content").map(str::len).unwrap_or(0)
             ),
+            "web_search" => self.arg("query").unwrap_or("?").to_string(),
+            "fetch_url" => self.arg("url").unwrap_or("?").to_string(),
             _ => self.arg("path").unwrap_or("").to_string(),
         }
     }
@@ -220,8 +245,13 @@ pub fn parse_tool_call(response: &str) -> Option<ToolCall> {
     Some(ToolCall { name, arguments })
 }
 
-fn execute(call: &ToolCall, workspace: &Path) -> String {
+fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
     let result = match call.name.as_str() {
+        "web_search" if web_tools => web_search(call.arg("query").unwrap_or("")),
+        "fetch_url" if web_tools => fetch_url(call.arg("url").unwrap_or("")),
+        "web_search" | "fetch_url" => {
+            Err("web tools are disabled — solve the task with local tools only".into())
+        }
         "list_files" => {
             resolve(workspace, call.arg("path").unwrap_or(""))
                 .and_then(|dir| list_files_impl(&dir, workspace, 8))
@@ -285,7 +315,11 @@ pub fn resolve(workspace: &Path, path: &str) -> Result<PathBuf, String> {
     let ws = workspace
         .canonicalize()
         .map_err(|e| format!("workspace: {e}"))?;
-    let full = canon.join(suffix);
+    let full = if suffix.as_os_str().is_empty() {
+        canon
+    } else {
+        canon.join(suffix)
+    };
     if full.starts_with(&ws) {
         Ok(full)
     } else {
@@ -359,6 +393,210 @@ fn run_command(command: &str, workspace: &Path) -> Result<String, String> {
     Ok(result)
 }
 
+fn web_agent() -> ureq::Agent {
+    // Short timeouts so an offline machine fails fast instead of stalling the run.
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(4)))
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
+        .build()
+        .into()
+}
+
+fn web_get(url: &str) -> Result<String, String> {
+    let mut res = web_agent()
+        .get(url)
+        .header("User-Agent", WEB_UA)
+        .call()
+        .map_err(|e| e.to_string())?;
+    res.body_mut().read_to_string().map_err(|e| e.to_string())
+}
+
+fn offline(err: String) -> String {
+    format!("Web access is unavailable (offline?): {err}. {OFFLINE_HINT}")
+}
+
+fn web_search(query: &str) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("empty query".into());
+    }
+    let q = urlencode(query.trim());
+    // Primary: DuckDuckGo Lite. It sometimes serves a bot challenge; treat a
+    // parse miss the same as being offline and fall back to Wikipedia.
+    match web_get(&format!("https://lite.duckduckgo.com/lite/?q={q}")) {
+        Ok(html) => {
+            let results = parse_ddg_lite(&html);
+            if !results.is_empty() {
+                return Ok(results.join("\n\n"));
+            }
+        }
+        Err(_) => {}
+    }
+    match web_get(&format!(
+        "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={q}&format=json&srlimit=5"
+    )) {
+        Ok(json) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let mut out = vec!["(search provider unavailable — Wikipedia results)".to_string()];
+            if let Some(hits) = parsed["query"]["search"].as_array() {
+                for hit in hits {
+                    let title = hit["title"].as_str().unwrap_or_default();
+                    let snippet = html_to_text(hit["snippet"].as_str().unwrap_or_default());
+                    let slug = urlencode(&title.replace(' ', "_"));
+                    out.push(format!(
+                        "{title} — https://en.wikipedia.org/wiki/{slug}\n{snippet}"
+                    ));
+                }
+            }
+            if out.len() > 1 {
+                Ok(out.join("\n\n"))
+            } else {
+                Ok(format!("No results found. {OFFLINE_HINT}"))
+            }
+        }
+        Err(e) => Ok(offline(e)),
+    }
+}
+
+fn fetch_url(url: &str) -> Result<String, String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("only http(s) URLs are supported".into());
+    }
+    match web_get(url) {
+        Ok(html) => Ok(html_to_text(&html)),
+        Err(e) => Ok(offline(e)),
+    }
+}
+
+/// Parse DuckDuckGo Lite results: `<a rel="nofollow" href="//duckduckgo.com/l/?uddg=<url>&amp;rut=...">title</a>`
+/// followed by a `result-snippet` cell.
+fn parse_ddg_lite(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find("uddg=") {
+        rest = &rest[pos + 5..];
+        let end = rest.find(['&', '"']).unwrap_or(rest.len());
+        let url = urldecode(&rest[..end]);
+        let title = rest
+            .find('>')
+            .map(|gt| {
+                let after = &rest[gt + 1..];
+                html_to_text(&after[..after.find("</a>").unwrap_or(0)])
+            })
+            .unwrap_or_default();
+        let snippet = rest
+            .find("result-snippet")
+            .and_then(|s| {
+                let after = &rest[s..];
+                let gt = after.find('>')?;
+                let cell = &after[gt + 1..];
+                Some(html_to_text(&cell[..cell.find("</td>").unwrap_or(0)]))
+            })
+            .unwrap_or_default();
+        if !url.is_empty() && !title.is_empty() {
+            out.push(format!("{title} — {url}\n{snippet}"));
+        }
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out
+}
+
+/// Strip scripts, styles and tags; decode common entities; collapse whitespace.
+fn html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+    for tag in ["script", "style"] {
+        loop {
+            // ascii_lowercase keeps byte offsets identical to the original.
+            let lower = s.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else { break };
+            let end = lower[start..]
+                .find(&format!("</{tag}>"))
+                .map(|e| start + e + tag.len() + 3)
+                .unwrap_or(s.len());
+            s.replace_range(start..end, " ");
+        }
+    }
+    let mut text = String::with_capacity(s.len() / 2);
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    let text = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0usize;
+    for line in text.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub const AGENTS_MD_TEMPLATE: &str = "\
 # Project instructions
 
@@ -396,11 +634,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_ddg_lite_results() {
+        let html = r#"<tr><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Fegui&amp;rut=abc123" class="result-link">egui - <b>Rust</b> docs</a></td></tr>
+<tr><td class="result-snippet">egui is an immediate mode GUI library.</td></tr>
+<tr><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Femilk%2Fegui&amp;rut=def" class="result-link">GitHub - emilk/egui</a></td></tr>"#;
+        let results = parse_ddg_lite(html);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].contains("https://docs.rs/egui"));
+        assert!(results[0].contains("egui - Rust docs"));
+        assert!(results[0].contains("immediate mode GUI"));
+        assert!(results[1].contains("https://github.com/emilk/egui"));
+    }
+
+    #[test]
+    fn html_to_text_strips_scripts_and_tags() {
+        let html = "<html><ScRipt>var x=1;</sCrIpt><style>.a{}</style><p>Hello&nbsp;<b>world</b> &amp; more</p></html>";
+        let text = html_to_text(html);
+        assert!(!text.contains("var x"));
+        assert!(!text.contains(".a{}"));
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world & more"));
+    }
+
+    #[test]
+    fn urldecode_roundtrip() {
+        assert_eq!(urldecode("https%3A%2F%2Fdocs.rs%2Fegui"), "https://docs.rs/egui");
+        assert_eq!(urldecode(&urlencode("a b/c?d=e")), "a b/c?d=e");
+    }
+
+    #[test]
+    fn fetch_url_degrades_gracefully_offline() {
+        // .invalid never resolves — DNS fails fast, like being offline.
+        let out = fetch_url("https://no-such-host.invalid/").unwrap();
+        assert!(out.contains("unavailable"));
+        assert!(out.contains("local knowledge"));
+    }
+
+    #[test]
+    #[ignore = "hits the live network"]
+    fn web_search_live() {
+        let out = web_search("rust programming language").unwrap();
+        println!("--- live search output ---\n{out}");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn web_tools_disabled_is_rejected() {
+        let call = ToolCall {
+            name: "web_search".into(),
+            arguments: serde_json::json!({"query": "x"}),
+        };
+        let out = execute(&call, &std::env::temp_dir(), false);
+        assert!(out.contains("disabled"));
+    }
+
+    #[test]
     fn sandbox_rejects_escape() {
         let ws = std::env::temp_dir();
         assert!(resolve(&ws, "../../etc/passwd").is_err());
         assert!(resolve(&ws, "/etc/passwd").is_err());
         assert!(resolve(&ws, "sub/dir/file.txt").is_ok());
+    }
+
+    #[test]
+    fn resolve_overwrites_existing_file() {
+        let ws = std::env::temp_dir().join("offgrid-resolve-test");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("existing.txt"), "old").unwrap();
+        let path = resolve(&ws, "existing.txt").unwrap();
+        assert!(!path.to_string_lossy().ends_with("/"));
+        std::fs::write(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        std::fs::remove_dir_all(&ws).unwrap();
     }
 
     #[test]

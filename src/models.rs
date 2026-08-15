@@ -51,6 +51,12 @@ pub fn catalog() -> Vec<CatalogEntry> {
             size: 396_705_472,
         },
         CatalogEntry {
+            name: "Qwen3 1.7B (Q4_K_M)",
+            repo: "unsloth/Qwen3-1.7B-GGUF",
+            file: "Qwen3-1.7B-Q4_K_M.gguf",
+            size: 1_107_409_472,
+        },
+        CatalogEntry {
             name: "Llama 3.2 1B Instruct (Q4_K_M)",
             repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
             file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
@@ -79,6 +85,14 @@ pub fn catalog() -> Vec<CatalogEntry> {
             repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
             file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
             size: 4_372_812_000,
+        },
+        // MoE: ~3.3B active params, so it generates at roughly 4B-dense speed
+        // while coding far above anything else that fits in 32 GB of RAM.
+        CatalogEntry {
+            name: "Qwen3 Coder 30B-A3B (Q4_K_M)",
+            repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+            file: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+            size: 18_556_689_568,
         },
     ]
 }

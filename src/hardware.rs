@@ -3,6 +3,9 @@ use sysinfo::System;
 pub struct HardwareProfile {
     pub total_ram: u64,
     pub cores: usize,
+    /// Physical cores — llama.cpp runs fastest with one thread per physical
+    /// core; using SMT threads slows generation down.
+    pub physical_cores: usize,
     pub cpu_brand: String,
 }
 
@@ -16,9 +19,11 @@ impl HardwareProfile {
             .first()
             .map(|c| c.brand().trim().to_string())
             .unwrap_or_else(|| "unknown CPU".to_string());
+        let cores = sys.cpus().len().max(1);
         Self {
             total_ram: sys.total_memory(),
-            cores: sys.cpus().len().max(1),
+            cores,
+            physical_cores: System::physical_core_count().unwrap_or(cores / 2).max(1),
             cpu_brand,
         }
     }

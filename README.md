@@ -20,7 +20,11 @@ works without internet.
   `read_file`, `write_file`, `run_command`) in a Claude Code-like loop. File
   access is sandboxed to the workspace; shell commands need per-command
   approval unless auto-approve is enabled. Drop an `AGENTS.md` in the
-  workspace root to give the agent project instructions. Works best with
+  workspace root to give the agent project instructions. Optional web tools
+  (`web_search` via DuckDuckGo Lite with a Wikipedia fallback, plus
+  `fetch_url`) are off by default and degrade gracefully offline: failures
+  come back to the model as a short "web unavailable" note so the run
+  continues on local knowledge instead of hanging. Works best with
   Qwen3 4B or larger; run `offgrid --smoke-agent` for a headless check.
 - **Serve tab** — optional OpenAI-compatible server on `127.0.0.1:11633`
   (`/v1/models`, `/v1/chat/completions` with SSE streaming) so tools like
