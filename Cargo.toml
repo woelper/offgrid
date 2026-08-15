@@ -1,0 +1,26 @@
+[package]
+name = "offgrid"
+version = "0.1.0"
+edition = "2024"
+description = "Fully local LLM prepper tool: download, chat, code and serve — offline"
+license = "MIT"
+
+[package.metadata.bundle]
+name = "offgrid"
+identifier = "com.woelper.offgrid"
+icon = ["assets/icons/App_Haiku3d.png"]
+category = "Developer Tool"
+short_description = "Fully local LLM prepper tool"
+
+[dependencies]
+directories = "6.0.0"
+eframe = "0.35.0"
+egui_commonmark = "0.24.0"
+egui_extras = { version = "0.35", features = ["image"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+llama-cpp-2 = "0.1.154"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sysinfo = "0.38.4"
+tiny_http = "0.12.0"
+ureq = "3.4.0"

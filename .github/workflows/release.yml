@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev
+
+      # cargo-bundle produces the .deb (Linux) and .app (macOS). Its Windows
+      # (msi) support is still experimental, so Windows ships a plain zip.
+      - name: Install cargo-bundle
+        if: runner.os != 'Windows'
+        run: cargo install cargo-bundle
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo bundle --release --format deb
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          cp target/release/bundle/deb/*.deb "dist/offgrid-${VERSION}-${{ matrix.target }}.deb"
+          tar -C target/release -czf "dist/offgrid-${VERSION}-${{ matrix.target }}.tar.gz" offgrid
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo bundle --release
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          (cd target/release/bundle/osx && zip -ry "${GITHUB_WORKSPACE}/dist/offgrid-${VERSION}-${{ matrix.target }}.app.zip" offgrid.app)
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          7z a "dist/offgrid-${VERSION}-${{ matrix.target }}.zip" ./target/release/offgrid.exe
+
+      - name: Upload to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
