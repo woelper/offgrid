@@ -1,6 +1,6 @@
 [package]
 name = "offgrid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Fully local LLM prepper tool: download, chat, code and serve — offline"
 license = "MIT"
