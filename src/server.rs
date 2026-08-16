@@ -142,11 +142,16 @@ fn handle(
                 .and_then(|s| s.as_bool())
                 .unwrap_or(false);
 
+            let temp = payload
+                .get("temperature")
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.7) as f32;
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             if cmd_tx
                 .send(LlmCmd::Generate {
                     messages,
                     reply: reply_tx,
+                    temp,
                 })
                 .is_err()
             {

@@ -9,11 +9,41 @@ pub const CONTROL_BORDER: Color32 = Color32::from_rgb(140, 140, 140);
 pub const TAB_YELLOW: Color32 = Color32::from_rgb(255, 203, 0);
 pub const TAB_INACTIVE: Color32 = Color32::from_rgb(200, 200, 200);
 pub const DESKTOP_BLUE: Color32 = Color32::from_rgb(51, 102, 152);
+/// The bright blue of Haiku's Installer progress bar.
+pub const PROGRESS_BLUE: Color32 = Color32::from_rgb(90, 155, 240);
 pub const GOOD_GREEN: Color32 = Color32::from_rgb(38, 115, 60);
 pub const WARN_AMBER: Color32 = Color32::from_rgb(160, 112, 8);
 pub const BAD_RED: Color32 = Color32::from_rgb(168, 52, 52);
 
+/// Haiku's system font (Noto Sans) for UI text, Noto Sans Mono for code.
+/// The egui defaults stay in the family lists as fallbacks.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "NotoSans".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Regular.ttf"))
+            .into(),
+    );
+    fonts.font_data.insert(
+        "NotoSansMono".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf"))
+            .into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "NotoSans".into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "NotoSansMono".into());
+    ctx.set_fonts(fonts);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     ctx.set_theme(egui::Theme::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
     let v = &mut style.visuals;

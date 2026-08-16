@@ -29,6 +29,19 @@ impl HardwareProfile {
     }
 }
 
+/// Higher-precision variant for progress displays, where 0.1 GB steps are too
+/// coarse to see movement on large downloads.
+pub fn fmt_bytes_precise(bytes: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else {
+        format!("{:.0} MB", b / MB)
+    }
+}
+
 pub fn fmt_bytes(bytes: u64) -> String {
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MB: f64 = 1024.0 * 1024.0;

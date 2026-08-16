@@ -8,14 +8,14 @@ license = "MIT"
 [package.metadata.bundle]
 name = "offgrid"
 identifier = "com.woelper.offgrid"
-icon = ["assets/icons/App_Haiku3d.png"]
+icon = ["assets/icons/Alert_Idea.png"]
 category = "Developer Tool"
 short_description = "Fully local LLM prepper tool"
 
 [dependencies]
 directories = "6.0.0"
 eframe = "0.35.0"
-egui_commonmark = "0.24.0"
+egui_commonmark = { version = "0.24.0", features = ["better_syntax_highlighting"] }
 egui_extras = { version = "0.35", features = ["image"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 llama-cpp-2 = "0.1.154"

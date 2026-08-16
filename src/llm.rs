@@ -44,6 +44,9 @@ pub enum LlmCmd {
     Generate {
         messages: Vec<ChatMessage>,
         reply: Sender<LlmEvent>,
+        /// Sampling temperature: ~0.7 for chat, lower (~0.25) for agent/tool
+        /// use where malformed JSON and sloppy code are costly.
+        temp: f32,
     },
 }
 
@@ -121,12 +124,18 @@ fn worker(
                 model = None;
                 let _ = tx.send(LlmEvent::Unloaded);
             }
-            LlmCmd::Generate { messages, reply } => {
+            LlmCmd::Generate {
+                messages,
+                reply,
+                temp,
+            } => {
                 let Some(model) = &model else {
                     let _ = reply.send(LlmEvent::Error("no model loaded".into()));
                     continue;
                 };
-                if let Err(e) = generate(&backend, model, &messages, &reply, &stop, n_threads) {
+                if let Err(e) =
+                    generate(&backend, model, &messages, &reply, &stop, n_threads, temp)
+                {
                     let _ = reply.send(LlmEvent::Error(e));
                 }
                 let _ = reply.send(LlmEvent::GenDone);
@@ -142,6 +151,7 @@ fn generate(
     tx: &Sender<LlmEvent>,
     stop: &AtomicBool,
     n_threads: usize,
+    temp: f32,
 ) -> Result<(), String> {
     let chat: Vec<LlamaChatMessage> = messages
         .iter()
@@ -159,7 +169,12 @@ fn generate(
         .str_to_token(&prompt, AddBos::Always)
         .map_err(|e| e.to_string())?;
     if tokens.len() as u32 >= N_CTX - 256 {
-        return Err("context window full — clear the chat to continue".into());
+        // Callers match on this prefix to offer their own remedy.
+        return Err(format!(
+            "context window full ({} tokens, limit {})",
+            tokens.len(),
+            N_CTX
+        ));
     }
 
     let ctx_params = LlamaContextParams::default()
@@ -187,7 +202,7 @@ fn generate(
         .map(|d| d.subsec_nanos())
         .unwrap_or(42);
     let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(0.7),
+        LlamaSampler::temp(temp.max(0.05)),
         LlamaSampler::min_p(0.05, 1),
         LlamaSampler::top_p(0.95, 1),
         LlamaSampler::dist(seed),

@@ -8,7 +8,7 @@ use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::config::{Config, models_dir};
-use crate::hardware::{HardwareProfile, fmt_bytes};
+use crate::hardware::{HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, ChatMessage, LlmCmd, LlmEvent, LlmHandle, Role};
 use crate::agent::{self, AgentEvent, AgentRun};
@@ -17,7 +17,7 @@ use crate::server::{self, ApiServer};
 use crate::theme;
 
 const ICON_LOGO: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/App_Haiku3d.png");
+    egui::include_image!("../assets/icons/Alert_Idea.png");
 const ICON_DISK: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/Device_Harddisk.png");
 const ICON_CHAT: egui::ImageSource<'static> = egui::include_image!("../assets/icons/App_Chat.png");
@@ -33,6 +33,10 @@ const ICON_DEPOT: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/App_HaikuDepot.png");
 const ICON_CODE: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/App_Terminal.png");
+const ICON_FILE: egui::ImageSource<'static> =
+    egui::include_image!("../assets/icons/File_Text.png");
+const ICON_FOLDER: egui::ImageSource<'static> =
+    egui::include_image!("../assets/icons/Folder_generic.png");
 
 #[derive(PartialEq)]
 enum Tab {
@@ -40,6 +44,17 @@ enum Tab {
     Chat,
     Code,
     Serve,
+}
+
+fn tool_icon(name: &str) -> egui::ImageSource<'static> {
+    match name {
+        "run_command" => ICON_CODE,
+        "web_search" => ICON_SEARCH,
+        "fetch_url" => ICON_SERVE,
+        "list_files" => ICON_FOLDER,
+        "read_file" | "write_file" => ICON_FILE,
+        _ => ICON_DISK,
+    }
 }
 
 enum AgentItem {
@@ -208,8 +223,9 @@ impl OffgridApp {
                     self.search_results = results;
                     self.search_pending = false;
                 }
-                Ok(HubEvent::Files { repo, files }) => {
+                Ok(HubEvent::Files { repo, mut files }) => {
                     self.files_pending.remove(&repo);
+                    files.sort_by_key(|f| f.size);
                     self.repo_files.insert(repo, files);
                 }
                 Ok(HubEvent::Error(e)) => {
@@ -279,6 +295,9 @@ impl OffgridApp {
                             *slot = Some(output);
                         }
                     }
+                    AgentEvent::Info(text) => {
+                        self.agent_transcript.push(AgentItem::Info(text));
+                    }
                     AgentEvent::NeedsApproval { command, reply } => {
                         self.agent_approval = Some((command, reply));
                     }
@@ -342,7 +361,11 @@ impl OffgridApp {
                 Ok(LlmEvent::Error(e)) => {
                     self.model_loading = false;
                     self.generating = false;
-                    self.last_error = Some(e);
+                    self.last_error = Some(if e.starts_with("context window full") {
+                        format!("{e} — press Clear (next to Send) to start a new conversation")
+                    } else {
+                        e
+                    });
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -384,6 +407,7 @@ impl OffgridApp {
         let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
             messages: self.messages.clone(),
             reply: self.llm.event_tx.clone(),
+            temp: 0.7,
         });
         self.messages.push(ChatMessage {
             role: Role::Assistant,
@@ -511,12 +535,15 @@ impl OffgridApp {
                         };
                         ui.add(
                             egui::ProgressBar::new(frac)
-                                .desired_width(200.0)
-                                .fill(theme::DESKTOP_BLUE)
+                                .desired_width(280.0)
+                                .desired_height(14.0)
+                                .fill(theme::PROGRESS_BLUE)
+                                .corner_radius(egui::CornerRadius::same(2))
                                 .text(format!(
-                                    "{} / {}",
-                                    fmt_bytes(dl.bytes),
-                                    fmt_bytes(dl.total)
+                                    "{} / {}  ({:.1}%)",
+                                    fmt_bytes_precise(dl.bytes),
+                                    fmt_bytes_precise(dl.total),
+                                    frac * 100.0
                                 )),
                         );
                     });
@@ -538,7 +565,8 @@ impl OffgridApp {
                     .striped(true)
                     .show(ui, |ui| {
                         for entry in &catalog {
-                            ui.label(entry.name);
+                            ui.label(entry.name)
+                                .on_hover_text(models::quant_tooltip(entry.file));
                             ui.weak(fmt_bytes(entry.size));
                             self.fit_badge(ui, entry.size);
                             if self.is_downloaded(entry.file) {
@@ -573,11 +601,17 @@ impl OffgridApp {
                     ui.spinner();
                 }
             });
+            ui.weak(
+                "Q4_K_M is the sweet spot for most machines — higher Q means better but \
+                 bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
+                 the highest-quality quant that fits your RAM.",
+            );
             let results = self.search_results.clone();
             for repo in &results {
                 let open = egui::CollapsingHeader::new(format!(
                     "{}  ({} downloads)",
-                    repo.id, repo.downloads
+                    repo.id,
+                    fmt_count(repo.downloads)
                 ))
                 .show(ui, |ui| {
                     match self.repo_files.get(&repo.id).cloned() {
@@ -585,15 +619,40 @@ impl OffgridApp {
                             if files.is_empty() {
                                 ui.weak("no .gguf files in this repo");
                             }
+                            let models: Vec<_> = files
+                                .iter()
+                                .filter(|f| models::is_model_file(&f.name))
+                                .collect();
+                            let best = models
+                                .iter()
+                                .filter(|f| {
+                                    Fit::of(f.size, self.hardware.total_ram) == Fit::Fits
+                                })
+                                .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
+                                .map(|f| f.name.clone());
                             egui::Grid::new(("repo_files", &repo.id))
-                                .num_columns(4)
+                                .num_columns(5)
                                 .spacing([16.0, 6.0])
                                 .striped(true)
                                 .show(ui, |ui| {
-                                    for f in &files {
-                                        ui.label(&f.name);
+                                    for f in &models {
+                                        let tip = models::quant_tooltip(&f.name);
+                                        ui.label(&f.name).on_hover_text(&tip);
                                         ui.weak(fmt_bytes(f.size));
                                         self.fit_badge(ui, f.size);
+                                        ui.horizontal(|ui| {
+                                            let tag = models::quant_tag(&f.name);
+                                            if !tag.label.is_empty() {
+                                                ui.colored_label(tag.color, tag.label)
+                                                    .on_hover_text(&tip);
+                                            }
+                                            if best.as_deref() == Some(f.name.as_str()) {
+                                                ui.strong("• best pick").on_hover_text(
+                                                    "The highest-quality quant of this repo \
+                                                     that fits your RAM.",
+                                                );
+                                            }
+                                        });
                                         if self.is_downloaded(&f.name) {
                                             ui.weak("downloaded");
                                         } else if self.is_downloading(&f.name) {
@@ -769,27 +828,33 @@ impl OffgridApp {
         });
 
         theme::group(ui, "Task", None, |ui| {
-            ui.add(
+            let task_resp = ui.add(
                 egui::TextEdit::multiline(&mut self.agent_task)
                     .hint_text(
                         "Describe a task, e.g. \"write a python script that prints the first \
-                         20 primes, run it, and fix any errors\"",
+                         20 primes, run it, and fix any errors\" (Enter to run, Shift+Enter \
+                         for newline)",
                     )
                     .desired_rows(2)
                     .desired_width(f32::INFINITY),
             );
+            let submit = task_resp.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
             ui.horizontal(|ui| {
                 let running = self.agent_run.is_some();
                 let ready = !running
                     && self.loaded_model.is_some()
                     && self.workspace_path().is_some()
                     && !self.agent_task.trim().is_empty();
-                if ui
+                if (ui
                     .add_enabled(ready, egui::Button::new("▶ Run"))
                     .clicked()
+                    || submit)
+                    && ready
                 {
                     let ws = self.workspace_path().unwrap();
                     let task = self.agent_task.trim().to_string();
+                    self.agent_task = task.clone(); // drop the submit newline
                     self.agent_transcript.push(AgentItem::Task(task.clone()));
                     self.agent_current.clear();
                     self.live_tokens = 0;
@@ -868,7 +933,7 @@ impl OffgridApp {
                             output,
                         } => {
                             ui.horizontal(|ui| {
-                                theme::icon(ui, ICON_CODE, 14.0);
+                                theme::icon(ui, tool_icon(name), 22.0);
                                 ui.strong(name);
                                 ui.weak(summary);
                             });
@@ -902,7 +967,10 @@ impl OffgridApp {
                         .corner_radius(egui::CornerRadius::same(3))
                         .inner_margin(8.0)
                         .show(ui, |ui| {
-                            ui.strong("The agent wants to run a command:");
+                            ui.horizontal(|ui| {
+                                theme::icon(ui, ICON_CODE, 22.0);
+                                ui.strong("The agent wants to run a command:");
+                            });
                             ui.monospace(command);
                             ui.horizontal(|ui| {
                                 if ui.button("Approve").clicked() {
@@ -971,7 +1039,11 @@ impl OffgridApp {
                 ui.weak("Works the same for any tool that accepts an OpenAI-compatible base URL.");
             });
             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                ui.code(&snippet);
+                CommonMarkViewer::new().show(
+                    ui,
+                    &mut self.md_cache,
+                    &format!("```json\n{snippet}\n```"),
+                );
             });
         });
     }
@@ -1053,6 +1125,14 @@ impl eframe::App for OffgridApp {
     }
 }
 
+fn fmt_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 fn shellexpand_home(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1124,14 +1204,9 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
             }
             Segment::ToolCall(t) => {
                 let t = t.trim();
-                if t.is_empty() {
-                    continue;
+                if !t.is_empty() {
+                    render_tool_call_block(ui, cache, t);
                 }
-                let body = serde_json::from_str::<serde_json::Value>(t)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or_else(|| t.to_string());
-                CommonMarkViewer::new().show(ui, cache, &format!("```json\n{body}\n```"));
             }
         }
     }
@@ -1144,13 +1219,77 @@ mod tests {
 
     const DEMO_RAM: u64 = 32 * 1024 * 1024 * 1024;
 
-    /// A deterministic replica of the main screen (canned data, no threads,
-    /// no config/disk access) rendered with the real theme, icons and widgets.
-    fn demo_ui(ui: &mut egui::Ui) {
+    /// Wrap the demo screen in a faked Haiku desktop: blue backdrop, a window
+    /// with the yellow title tab, border and drop shadow — for a README
+    /// screenshot that looks like a real desktop capture.
+    fn desktop_ui(ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         theme::apply(&ctx);
         egui_extras::install_image_loaders(&ctx);
 
+        let desktop = ui.max_rect();
+        ui.painter()
+            .rect_filled(desktop, 0.0, egui::Color32::from_rgb(51, 102, 152));
+
+        let margin = 46.0;
+        let tab_h = 30.0;
+        let win = egui::Rect::from_min_max(
+            desktop.min + egui::vec2(margin, margin + tab_h),
+            desktop.max - egui::vec2(margin, margin),
+        );
+
+        // Haiku window tab: yellow, rounded top, close box + bold title.
+        let tab = egui::Rect::from_min_size(
+            egui::pos2(win.min.x, win.min.y - tab_h + 1.0),
+            egui::vec2(170.0, tab_h),
+        );
+        let tab_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 90, 0));
+        ui.painter().rect(
+            tab,
+            egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
+            theme::TAB_YELLOW,
+            tab_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let close = egui::Rect::from_center_size(
+            egui::pos2(tab.min.x + 18.0, tab.center().y),
+            egui::vec2(13.0, 13.0),
+        );
+        ui.painter().rect(
+            close,
+            2.0,
+            egui::Color32::from_rgb(255, 226, 100),
+            tab_stroke,
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            egui::pos2(tab.min.x + 34.0, tab.center().y),
+            egui::Align2::LEFT_CENTER,
+            "offgrid",
+            egui::FontId::proportional(15.0),
+            egui::Color32::BLACK,
+        );
+
+        let frame = egui::Frame::new()
+            .fill(theme::PANEL)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)))
+            .shadow(egui::Shadow {
+                offset: [4, 6],
+                blur: 18,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(110),
+            });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(win), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_min_size(win.size() - egui::vec2(16.0, 16.0));
+                demo_ui(ui);
+            });
+        });
+    }
+
+    /// A deterministic replica of the main screen (canned data, no threads,
+    /// no config/disk access) rendered with the real theme, icons and widgets.
+    fn demo_ui(ui: &mut egui::Ui) {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1247,10 +1386,45 @@ mod tests {
     #[test]
     fn main_screen_snapshot() {
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(900.0, 430.0))
-            .build_ui(demo_ui);
+            .with_size(egui::vec2(1000.0, 580.0))
+            .build_ui(desktop_ui);
         harness.run();
         harness.snapshot("offgrid");
+    }
+}
+
+/// Render a `<tool_call>` for humans: a long `content` argument (write_file)
+/// is pulled out of the JSON and shown as its own code block with real
+/// newlines, highlighted by the target file's extension.
+fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &str) {
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(mut v) => {
+            let lang = v["arguments"]["path"]
+                .as_str()
+                .and_then(|p| p.rsplit('.').next())
+                .unwrap_or("")
+                .to_string();
+            let content = v["arguments"]
+                .as_object_mut()
+                .and_then(|args| args.remove("content"))
+                .and_then(|c| c.as_str().map(String::from));
+            let head = serde_json::to_string_pretty(&v).unwrap_or_else(|_| t.to_string());
+            CommonMarkViewer::new().show(ui, cache, &format!("```json\n{head}\n```"));
+            if let Some(content) = content {
+                // Four-backtick fence so content containing ``` stays intact.
+                CommonMarkViewer::new()
+                    .show(ui, cache, &format!("````{lang}\n{content}\n````"));
+            }
+        }
+        Err(_) => {
+            // Mid-stream, the JSON is incomplete — show it raw, but unescape
+            // the common sequences so code stays readable while it streams.
+            let display = t
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"");
+            CommonMarkViewer::new().show(ui, cache, &format!("````json\n{display}\n````"));
+        }
     }
 }
 

@@ -22,6 +22,8 @@ const OFFLINE_HINT: &str =
 pub enum AgentEvent {
     /// Streamed model output for the current turn.
     Token(String),
+    /// Status note for the transcript (e.g. context compaction).
+    Info(String),
     /// The model's turn finished; `content` is the full reply.
     TurnDone,
     ToolCall { name: String, summary: String },
@@ -82,6 +84,7 @@ fn run_loop(
         },
     ];
 
+    let mut format_retries = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -92,10 +95,14 @@ fn run_loop(
             .send(LlmCmd::Generate {
                 messages: messages.clone(),
                 reply: reply_tx,
+                // Low temperature: agent runs need valid JSON and careful
+                // code much more than they need creative variety.
+                temp: 0.25,
             })
             .map_err(|_| "LLM worker unavailable".to_string())?;
 
         let mut response = String::new();
+        let mut gen_error: Option<String> = None;
         for event in reply_rx {
             match event {
                 LlmEvent::Token(t) => {
@@ -103,9 +110,24 @@ fn run_loop(
                     let _ = tx.send(AgentEvent::Token(t));
                 }
                 LlmEvent::GenDone => break,
-                LlmEvent::Error(e) => return Err(e),
+                LlmEvent::Error(e) => gen_error = Some(e),
                 _ => {}
             }
+        }
+        if let Some(e) = gen_error {
+            // On context overflow, trim old tool outputs and retry the turn
+            // instead of aborting the run.
+            if e.starts_with("context window full") && compact_transcript(&mut messages) {
+                let _ = tx.send(AgentEvent::Info(
+                    "context window full — trimmed older tool outputs, retrying".into(),
+                ));
+                continue;
+            }
+            return Err(if e.starts_with("context window full") {
+                format!("{e} — the task transcript is too long even after trimming; try a smaller task")
+            } else {
+                e
+            });
         }
         let _ = tx.send(AgentEvent::TurnDone);
         messages.push(ChatMessage {
@@ -114,6 +136,25 @@ fn run_loop(
         });
 
         let Some(call) = parse_tool_call(&response) else {
+            // A reply that clearly tried to call a tool but could not be
+            // parsed gets one corrective nudge instead of ending the run.
+            let attempted = response.contains("<tool_call>")
+                || (response.contains("\"name\"") && response.contains("\"arguments\""));
+            if attempted && format_retries < 2 {
+                format_retries += 1;
+                let _ = tx.send(AgentEvent::Info(
+                    "tool call could not be parsed — asking the model to retry".into(),
+                ));
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: "Your tool call could not be parsed. Emit exactly one call as \
+                              <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
+                              with valid JSON — or, if the task is finished, reply with a \
+                              summary and no tool call."
+                        .into(),
+                });
+                continue;
+            }
             let _ = tx.send(AgentEvent::Done { iterations: iteration });
             return Ok(());
         };
@@ -165,6 +206,22 @@ fn run_loop(
     Ok(())
 }
 
+/// Shrink old tool responses (all but the most recent messages) to free
+/// context. Returns whether anything was trimmed.
+fn compact_transcript(messages: &mut [ChatMessage]) -> bool {
+    let keep_from = messages.len().saturating_sub(4);
+    let mut changed = false;
+    for m in &mut messages[..keep_from] {
+        if m.role == Role::User && m.content.starts_with("<tool_response>") && m.content.len() > 600
+        {
+            let head: String = m.content.chars().take(300).collect();
+            m.content = format!("{head}\n[older tool output trimmed]\n</tool_response>");
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let listing = list_files_impl(workspace, workspace, 1).unwrap_or_default();
     let agents_md = std::fs::read_to_string(workspace.join("AGENTS.md"))
@@ -173,8 +230,10 @@ fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let web = if web_tools {
         "- web_search: arguments {\"query\": \"...\"} — search the web\n\
          - fetch_url: arguments {\"url\": \"https://...\"} — fetch a web page as plain text\n\
-         Web tools may be offline: if one reports that web access is unavailable, do NOT \
-         retry more than once — continue with local knowledge.\n"
+         If the task involves \"latest\", \"current\", version numbers, URLs, or anything \
+         possibly newer than your training data, call web_search FIRST instead of \
+         answering from memory. Web tools may be offline: if one reports that web access \
+         is unavailable, do NOT retry more than once — continue with local knowledge.\n"
     } else {
         ""
     };
@@ -192,8 +251,17 @@ You have these tools:\n\
 To use a tool, end your reply with exactly one call in this format:\n\
 <tool_call>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tool_call>\n\
 The result will come back in a <tool_response> block. Use one tool at a time.\n\
-When the task is complete (verify your work when possible, e.g. by running code you \
-wrote), reply with a short summary and NO tool call.\n\
+\n\
+Example turn:\n\
+  user: What is in this project?\n\
+  you: I'll look at the files.\n\
+  <tool_call>{{\"name\": \"list_files\", \"arguments\": {{}}}}</tool_call>\n\
+  (a <tool_response> block arrives, then you continue with the next step)\n\
+\n\
+After writing or changing code, ALWAYS run it or the project's tests with \
+run_command and fix any errors until it succeeds — never declare code done \
+without running it.\n\
+When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 \n\
 Top-level files in the workspace:\n{listing}",
@@ -228,21 +296,104 @@ impl ToolCall {
     }
 }
 
+const KNOWN_TOOLS: [&str; 6] = [
+    "list_files",
+    "read_file",
+    "write_file",
+    "run_command",
+    "web_search",
+    "fetch_url",
+];
+
 pub fn parse_tool_call(response: &str) -> Option<ToolCall> {
-    const OPEN: &str = "<tool_call>";
-    const CLOSE: &str = "</tool_call>";
     // Ignore anything inside <think> blocks by only looking after the last one.
     let searchable = match response.rfind("</think>") {
         Some(i) => &response[i..],
         None => response,
     };
-    let start = searchable.find(OPEN)?;
-    let rest = &searchable[start + OPEN.len()..];
-    let end = rest.find(CLOSE).unwrap_or(rest.len());
-    let json: serde_json::Value = serde_json::from_str(rest[..end].trim()).ok()?;
+
+    // 1) The requested format: <tool_call>{json}</tool_call>
+    if let Some(start) = searchable.find("<tool_call>") {
+        let rest = &searchable[start + "<tool_call>".len()..];
+        let end = rest.find("</tool_call>").unwrap_or(rest.len());
+        if let Some(call) = call_from_json(rest[..end].trim(), false) {
+            return Some(call);
+        }
+    }
+
+    // 2) Lenient: a ```json fenced block holding the call object.
+    let mut rest = searchable;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let body_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &after[body_start..];
+        let end = body.find("```").unwrap_or(body.len());
+        if let Some(call) = call_from_json(body[..end].trim(), true) {
+            return Some(call);
+        }
+        rest = &after[body_start + end..];
+    }
+
+    // 3) Lenient: a bare, balanced JSON object mentioning a known tool.
+    let mut from = 0;
+    for _ in 0..20 {
+        let Some(rel) = searchable[from..].find('{') else { break };
+        let start = from + rel;
+        if let Some(end) = balanced_json_end(&searchable[start..]) {
+            if let Some(call) = call_from_json(&searchable[start..start + end], true) {
+                return Some(call);
+            }
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// Parse a candidate JSON string into a tool call. `strict_names` restricts to
+/// known tools — used for the lenient fallbacks so ordinary JSON in a summary
+/// is not mistaken for a call.
+fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
+    let json: serde_json::Value = serde_json::from_str(s).ok()?;
     let name = json.get("name")?.as_str()?.to_string();
-    let arguments = json.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    if strict_names && !KNOWN_TOOLS.contains(&name.as_str()) {
+        return None;
+    }
+    let arguments = json
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     Some(ToolCall { name, arguments })
+}
+
+/// Byte offset one past the end of the balanced JSON object starting at `s[0]`
+/// (which must be '{'), respecting strings and escapes.
+fn balanced_json_end(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
@@ -628,6 +779,23 @@ mod tests {
     }
 
     #[test]
+    fn lenient_parses_fenced_json() {
+        let r = "I'll check the files:\n```json\n{\"name\": \"list_files\", \"arguments\": {\"path\": \"src\"}}\n```";
+        let call = parse_tool_call(r).unwrap();
+        assert_eq!(call.name, "list_files");
+        assert_eq!(call.arg("path"), Some("src"));
+    }
+
+    #[test]
+    fn lenient_parses_bare_json_for_known_tools_only() {
+        let r = "Running it now: {\"name\": \"run_command\", \"arguments\": {\"command\": \"ls\"}}";
+        assert_eq!(parse_tool_call(r).unwrap().name, "run_command");
+        // Unknown names in bare JSON are ordinary prose, not calls.
+        let prose = "The config is {\"name\": \"my-app\", \"arguments\": {\"debug\": true}}";
+        assert!(parse_tool_call(prose).is_none());
+    }
+
+    #[test]
     fn tolerates_missing_close_tag() {
         let r = "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}";
         assert_eq!(parse_tool_call(r).unwrap().name, "read_file");
@@ -660,6 +828,24 @@ mod tests {
     fn urldecode_roundtrip() {
         assert_eq!(urldecode("https%3A%2F%2Fdocs.rs%2Fegui"), "https://docs.rs/egui");
         assert_eq!(urldecode(&urlencode("a b/c?d=e")), "a b/c?d=e");
+    }
+
+    #[test]
+    fn compacts_old_tool_responses_only() {
+        let long = format!("<tool_response>\n{}\n</tool_response>", "x".repeat(2000));
+        let mut messages = vec![
+            ChatMessage { role: Role::System, content: "sys".into() },
+            ChatMessage { role: Role::User, content: long.clone() },   // old → trimmed
+            ChatMessage { role: Role::Assistant, content: "a".into() },
+            ChatMessage { role: Role::User, content: long.clone() },   // recent → kept
+            ChatMessage { role: Role::Assistant, content: "b".into() },
+            ChatMessage { role: Role::User, content: "task".into() },
+        ];
+        assert!(compact_transcript(&mut messages));
+        assert!(messages[1].content.contains("[older tool output trimmed]"));
+        assert!(messages[1].content.len() < 500);
+        assert_eq!(messages[3].content, long); // within the keep window
+        assert!(!compact_transcript(&mut messages)); // second pass: nothing left to trim
     }
 
     #[test]

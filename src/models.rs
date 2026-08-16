@@ -33,6 +33,114 @@ impl Fit {
     }
 }
 
+pub struct QuantTag {
+    pub label: &'static str,
+    pub color: egui::Color32,
+    /// Preference rank for picking a default (lower is better).
+    pub pref: u8,
+    pub desc: &'static str,
+}
+
+/// Hover text explaining what this quantisation means for the user.
+pub fn quant_tooltip(name: &str) -> String {
+    let mut text = quant_tag(name).desc.to_string();
+    let n = name.to_ascii_uppercase();
+    if n.contains("UD-") {
+        text.push_str("\nUD = unsloth \"dynamic\": slightly better quality at the same size.");
+    }
+    if n.contains("IQ") {
+        text.push_str("\nIQ = importance-quantised: smaller, but a bit slower on CPU.");
+    }
+    text
+}
+
+/// Files that are not standalone chat models (vision projectors etc.).
+pub fn is_model_file(name: &str) -> bool {
+    !name.to_ascii_lowercase().contains("mmproj")
+}
+
+/// Classify a GGUF quantisation from its file name.
+pub fn quant_tag(name: &str) -> QuantTag {
+    let n = name.to_ascii_uppercase();
+    let has = |s: &str| n.contains(s);
+    if has("IQ1") {
+        QuantTag {
+            label: "very low quality",
+            color: crate::theme::BAD_RED,
+            pref: 40,
+            desc: "Severely degraded — expect broken output. Avoid unless nothing else fits.",
+        }
+    } else if has("IQ2") || has("Q2_") || n.ends_with("Q2") {
+        QuantTag {
+            label: "low quality",
+            color: crate::theme::WARN_AMBER,
+            pref: 30,
+            desc: "Noticeably degraded. A last resort for RAM-starved machines.",
+        }
+    } else if has("IQ3") || has("Q3_") {
+        QuantTag {
+            label: "reduced quality",
+            color: crate::theme::WARN_AMBER,
+            pref: 12,
+            desc: "A compromise when Q4 doesn't fit: quality dips but stays usable.",
+        }
+    } else if has("Q4_K_M") {
+        QuantTag {
+            label: "recommended",
+            color: crate::theme::GOOD_GREEN,
+            pref: 0,
+            desc: "The sweet spot: ~95% of full quality at about a third of the size. \
+                   Take this one if it fits.",
+        }
+    } else if has("IQ4") || has("Q4_") {
+        QuantTag {
+            label: "good",
+            color: crate::theme::GOOD_GREEN,
+            pref: 2,
+            desc: "Nearly as good as Q4_K_M — a fine choice if that variant is missing or too big.",
+        }
+    } else if has("Q5_") {
+        QuantTag {
+            label: "high quality",
+            color: crate::theme::GOOD_GREEN,
+            pref: 5,
+            desc: "Slightly better than Q4 for noticeably more RAM and slower generation. \
+                   Only if you have room to spare.",
+        }
+    } else if has("Q6_") || has("Q6K") {
+        QuantTag {
+            label: "near-lossless",
+            color: crate::theme::DESKTOP_BLUE,
+            pref: 8,
+            desc: "Practically indistinguishable from the original — big and slow on CPU, \
+                   rarely worth it.",
+        }
+    } else if has("Q8_") {
+        QuantTag {
+            label: "near-lossless",
+            color: crate::theme::DESKTOP_BLUE,
+            pref: 10,
+            desc: "Practically indistinguishable from the original — big and slow on CPU, \
+                   rarely worth it.",
+        }
+    } else if has("F16") || has("BF16") || has("F32") {
+        QuantTag {
+            label: "unquantised",
+            color: egui::Color32::GRAY,
+            pref: 50,
+            desc: "Original full-precision weights — huge and slow. Meant for conversion, \
+                   not for running on a CPU.",
+        }
+    } else {
+        QuantTag {
+            label: "",
+            color: egui::Color32::GRAY,
+            pref: 20,
+            desc: "Unrecognised quantisation scheme.",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CatalogEntry {
     pub name: &'static str,
@@ -110,6 +218,30 @@ pub struct LocalModel {
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quant_preference_ordering() {
+        // best-pick preference: Q4_K_M beats everything, Q5 beats Q3, IQ1 last
+        let pref = |n: &str| quant_tag(n).pref;
+        assert!(pref("m-Q4_K_M.gguf") < pref("m-Q4_K_S.gguf"));
+        assert!(pref("m-Q4_K_S.gguf") < pref("m-Q5_K_M.gguf"));
+        assert!(pref("m-Q5_K_M.gguf") < pref("m-Q3_K_M.gguf"));
+        assert!(pref("m-UD-Q4_K_XL.gguf") < pref("m-UD-IQ2_XXS.gguf"));
+        assert!(pref("m-IQ2_XXS.gguf") < pref("m-IQ1_M.gguf"));
+        assert_eq!(quant_tag("m-Q4_K_M.gguf").label, "recommended");
+    }
+
+    #[test]
+    fn mmproj_files_are_not_models() {
+        assert!(!is_model_file("mmproj-BF16.gguf"));
+        assert!(!is_model_file("mmproj-model-f16.gguf"));
+        assert!(is_model_file("Qwen3-4B-Q4_K_M.gguf"));
+    }
 }
 
 pub fn scan_local(dir: &Path) -> Vec<LocalModel> {

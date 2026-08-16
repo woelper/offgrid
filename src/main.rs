@@ -19,10 +19,13 @@ fn main() -> eframe::Result {
         smoke(true);
         return Ok(());
     }
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/Alert_Idea.png"))
+        .unwrap_or_default();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([900.0, 650.0])
-            .with_title("offgrid"),
+            .with_title("offgrid")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
@@ -81,6 +84,7 @@ fn smoke(agent_mode: bool) {
         for event in run.rx {
             match event {
                 agent::AgentEvent::Token(t) => print!("{t}"),
+                agent::AgentEvent::Info(t) => println!("[info] {t}"),
                 agent::AgentEvent::TurnDone => println!("\n---"),
                 agent::AgentEvent::ToolCall { name, summary } => {
                     println!("[tool call] {name}: {summary}");
@@ -113,6 +117,7 @@ fn smoke(agent_mode: bool) {
                 content: "Reply with exactly: hello from offgrid".into(),
             }],
             reply: reply_tx,
+            temp: 0.7,
         })
         .unwrap();
     print!("chat: ");
