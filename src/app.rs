@@ -469,7 +469,7 @@ impl OffgridApp {
                                 theme::icon(ui, ICON_DISK, 16.0);
                                 ui.label(&model.name);
                                 if loaded {
-                                    ui.colored_label(theme::GOOD_GREEN, "●");
+                                    ui.colored_label(theme::GOOD_GREEN, "•");
                                 }
                             });
                             ui.weak(fmt_bytes(model.size));
@@ -946,7 +946,7 @@ impl OffgridApp {
 
             if self.api_server.is_some() {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::GOOD_GREEN, "● running");
+                    ui.colored_label(theme::GOOD_GREEN, "• running");
                     ui.monospace(format!("http://127.0.0.1:{}/v1", self.server_port()));
                 });
                 if self.loaded_model.is_none() {
@@ -1134,6 +1134,123 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
                 CommonMarkViewer::new().show(ui, cache, &format!("```json\n{body}\n```"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardware::fmt_bytes;
+
+    const DEMO_RAM: u64 = 32 * 1024 * 1024 * 1024;
+
+    /// A deterministic replica of the main screen (canned data, no threads,
+    /// no config/disk access) rendered with the real theme, icons and widgets.
+    fn demo_ui(ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        theme::apply(&ctx);
+        egui_extras::install_image_loaders(&ctx);
+
+        egui::Panel::top("top").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                theme::icon(ui, ICON_LOGO, 22.0);
+                ui.heading(egui::RichText::new("offgrid").strong());
+                ui.separator();
+                ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
+                ui.separator();
+                ui.colored_label(theme::GOOD_GREEN, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
+                let _ = ui.small_button("Unload");
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let _ = theme::tab(ui, ICON_DISK, "Models", true);
+                let _ = theme::tab(ui, ICON_CHAT, "Chat", false);
+                let _ = theme::tab(ui, ICON_CODE, "Code", false);
+                let _ = theme::tab(ui, ICON_SERVE, "Serve", false);
+            });
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            theme::group(ui, "On disk", Some(ICON_DISK), |ui| {
+                egui::Grid::new("local_models")
+                    .num_columns(4)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let rows: [(&str, u64, bool); 3] = [
+                            ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
+                            ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
+                            ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", 18_556_689_568, false),
+                        ];
+                        for (name, size, loaded) in rows {
+                            ui.horizontal(|ui| {
+                                theme::icon(ui, ICON_DISK, 16.0);
+                                ui.label(name);
+                                if loaded {
+                                    ui.colored_label(theme::GOOD_GREEN, "•");
+                                }
+                            });
+                            ui.weak(fmt_bytes(size));
+                            let (label, color) = Fit::of(size, DEMO_RAM).badge();
+                            ui.colored_label(color, label);
+                            ui.horizontal(|ui| {
+                                let _ = ui.add_enabled(
+                                    !loaded,
+                                    egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
+                                );
+                                let _ = ui.add(egui::Button::image_and_text(
+                                    egui::Image::new(ICON_TRASH)
+                                        .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                    "Delete",
+                                ));
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+
+            theme::group(ui, "Get models", Some(ICON_DEPOT), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Recommended for your hardware:");
+                    ui.strong("Qwen3 Coder 30B-A3B (Q4_K_M)");
+                });
+                ui.separator();
+                egui::Grid::new("catalog")
+                    .num_columns(4)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let rows: [(&str, u64); 3] = [
+                            ("Qwen3 1.7B (Q4_K_M)", 1_107_409_472),
+                            ("Gemma 3 4B Instruct (Q4_K_M)", 2_489_758_112),
+                            ("Mistral 7B Instruct v0.3 (Q4_K_M)", 4_372_812_000),
+                        ];
+                        for (name, size) in rows {
+                            ui.label(name);
+                            ui.weak(fmt_bytes(size));
+                            let (label, color) = Fit::of(size, DEMO_RAM).badge();
+                            ui.colored_label(color, label);
+                            let _ = ui.add(egui::Button::image_and_text(
+                                egui::Image::new(ICON_DOWNLOAD)
+                                    .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                "Download",
+                            ));
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+
+    #[test]
+    fn main_screen_snapshot() {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 430.0))
+            .build_ui(demo_ui);
+        harness.run();
+        harness.snapshot("offgrid");
     }
 }
 
