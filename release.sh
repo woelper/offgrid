@@ -30,7 +30,7 @@ git commit -m "release v$new"
 git tag "v$new"
 
 echo "tagged v$new"
-read -r -p "push now (git push && git push --tags)? [y/N] " answer
+read -r -p "push now (git push && git push --tags)? [y/N] " answer || answer=""
 if [[ "$answer" == [yY]* ]]; then
     git push && git push --tags
     echo "pushed — the release workflow is building on GitHub"
