@@ -47,6 +47,17 @@ cargo run --release
 
 Use `--release` — CPU inference in debug builds is much slower.
 
+## macOS releases
+
+The `.app` in the releases is ad-hoc signed but not notarized (no Apple
+developer account). On first launch, right-click the app and choose "Open"
+instead of double-clicking. If macOS still refuses, clear the download
+quarantine flag:
+
+```sh
+xattr -cr /Applications/offgrid.app
+```
+
 ## Headless smoke test
 
 ```sh

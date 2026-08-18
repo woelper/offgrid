@@ -58,7 +58,12 @@ jobs:
           cargo bundle --release
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist
-          (cd target/release/bundle/osx && zip -ry "${GITHUB_WORKSPACE}/dist/offgrid-${VERSION}-${{ matrix.target }}.app.zip" offgrid.app)
+          # Ad-hoc signature: without any signature, Apple Silicon macOS
+          # refuses to launch the app and reports it as "damaged".
+          codesign --force --deep --sign - target/release/bundle/osx/offgrid.app
+          # ditto is Apple's archiver; it preserves bundle metadata that zip drops.
+          ditto -c -k --keepParent target/release/bundle/osx/offgrid.app \
+            "dist/offgrid-${VERSION}-${{ matrix.target }}.app.zip"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
