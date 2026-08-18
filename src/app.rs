@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
+use crate::agent::{self, AgentEvent, AgentRun};
 use crate::config::{Config, models_dir};
 use crate::hardware::{HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, ChatMessage, LlmCmd, LlmEvent, LlmHandle, Role};
-use crate::agent::{self, AgentEvent, AgentRun};
 use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
 use crate::theme;
@@ -33,8 +33,7 @@ const ICON_DEPOT: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/App_HaikuDepot.png");
 const ICON_CODE: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/App_Terminal.png");
-const ICON_FILE: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/File_Text.png");
+const ICON_FILE: egui::ImageSource<'static> = egui::include_image!("../assets/icons/File_Text.png");
 const ICON_FOLDER: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/Folder_generic.png");
 
@@ -129,11 +128,11 @@ impl OffgridApp {
         let llm = llm::spawn_worker(hardware.physical_cores);
 
         let mut model_loading = false;
-        if let Some(last) = &config.last_model {
-            if last.exists() {
-                let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
-                model_loading = true;
-            }
+        if let Some(last) = &config.last_model
+            && last.exists()
+        {
+            let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
+            model_loading = true;
         }
 
         let loaded_model_shared = Arc::new(Mutex::new(None));
@@ -216,6 +215,22 @@ impl OffgridApp {
         self.local_models = models::scan_local(&self.models_dir);
     }
 
+    /// End the current agent run and note why in the transcript.
+    fn agent_finished(&mut self, note: String) {
+        self.agent_transcript.push(AgentItem::Info(note));
+        self.agent_run = None;
+        self.agent_approval = None;
+        self.llm.stop.store(false, Ordering::Relaxed);
+    }
+
+    /// Track a streamed token for the live tok/s display.
+    fn note_token(&mut self) {
+        self.live_tokens += 1;
+        if self.live_start.is_none() {
+            self.live_start = Some(std::time::Instant::now());
+        }
+    }
+
     fn drain_events(&mut self) {
         loop {
             match self.hub_rx.try_recv() {
@@ -267,10 +282,7 @@ impl OffgridApp {
             for event in events {
                 match event {
                     AgentEvent::Token(t) => {
-                        self.live_tokens += 1;
-                        if self.live_start.is_none() {
-                            self.live_start = Some(std::time::Instant::now());
-                        }
+                        self.note_token();
                         self.agent_current.push_str(&t);
                     }
                     AgentEvent::TurnDone => {
@@ -302,18 +314,10 @@ impl OffgridApp {
                         self.agent_approval = Some((command, reply));
                     }
                     AgentEvent::Done { iterations } => {
-                        self.agent_transcript
-                            .push(AgentItem::Info(format!("finished after {iterations} turn(s)")));
-                        self.agent_run = None;
-                        self.agent_approval = None;
-                        self.llm.stop.store(false, Ordering::Relaxed);
+                        self.agent_finished(format!("finished after {iterations} turn(s)"));
                     }
                     AgentEvent::Error(e) => {
-                        self.agent_transcript
-                            .push(AgentItem::Info(format!("error: {e}")));
-                        self.agent_run = None;
-                        self.agent_approval = None;
-                        self.llm.stop.store(false, Ordering::Relaxed);
+                        self.agent_finished(format!("error: {e}"));
                     }
                 }
             }
@@ -330,14 +334,11 @@ impl OffgridApp {
                     self.set_loaded(None);
                 }
                 Ok(LlmEvent::Token(text)) => {
-                    self.live_tokens += 1;
-                    if self.live_start.is_none() {
-                        self.live_start = Some(std::time::Instant::now());
-                    }
-                    if let Some(last) = self.messages.last_mut() {
-                        if last.role == Role::Assistant {
-                            last.content.push_str(&text);
-                        }
+                    self.note_token();
+                    if let Some(last) = self.messages.last_mut()
+                        && last.role == Role::Assistant
+                    {
+                        last.content.push_str(&text);
                     }
                 }
                 Ok(LlmEvent::Stats {
@@ -487,8 +488,7 @@ impl OffgridApp {
                     .striped(true)
                     .show(ui, |ui| {
                         for model in &locals {
-                            let loaded =
-                                self.loaded_model.as_deref() == Some(model.name.as_str());
+                            let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
                             ui.horizontal(|ui| {
                                 theme::icon(ui, ICON_DISK, 16.0);
                                 ui.label(&model.name);
@@ -502,8 +502,7 @@ impl OffgridApp {
                                 if ui
                                     .add_enabled(
                                         !loaded && !self.model_loading,
-                                        egui::Button::new("Load")
-                                            .min_size(egui::vec2(60.0, 0.0)),
+                                        egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
                                     )
                                     .clicked()
                                 {
@@ -582,101 +581,104 @@ impl OffgridApp {
             });
 
             theme::group(ui, "Search Hugging Face", Some(ICON_SEARCH), |ui| {
-            ui.horizontal(|ui| {
-                let resp = ui.text_edit_singleline(&mut self.search_query);
-                let submitted =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let search_clicked = ui
-                    .add(egui::Button::image_and_text(
-                        egui::Image::new(ICON_SEARCH).fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                        "Search",
-                    ))
-                    .clicked();
-                if (search_clicked || submitted) && !self.search_query.trim().is_empty() {
-                    self.search_pending = true;
-                    self.search_results.clear();
-                    hub::spawn_search(self.search_query.trim().to_string(), self.hub_tx.clone());
-                }
-                if self.search_pending {
-                    ui.spinner();
-                }
-            });
-            ui.weak(
-                "Q4_K_M is the sweet spot for most machines — higher Q means better but \
-                 bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
-                 the highest-quality quant that fits your RAM.",
-            );
-            let results = self.search_results.clone();
-            for repo in &results {
-                let open = egui::CollapsingHeader::new(format!(
-                    "{}  ({} downloads)",
-                    repo.id,
-                    fmt_count(repo.downloads)
-                ))
-                .show(ui, |ui| {
-                    match self.repo_files.get(&repo.id).cloned() {
-                        Some(files) => {
-                            if files.is_empty() {
-                                ui.weak("no .gguf files in this repo");
-                            }
-                            let models: Vec<_> = files
-                                .iter()
-                                .filter(|f| models::is_model_file(&f.name))
-                                .collect();
-                            let best = models
-                                .iter()
-                                .filter(|f| {
-                                    Fit::of(f.size, self.hardware.total_ram) == Fit::Fits
-                                })
-                                .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
-                                .map(|f| f.name.clone());
-                            egui::Grid::new(("repo_files", &repo.id))
-                                .num_columns(5)
-                                .spacing([16.0, 6.0])
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    for f in &models {
-                                        let tip = models::quant_tooltip(&f.name);
-                                        ui.label(&f.name).on_hover_text(&tip);
-                                        ui.weak(fmt_bytes(f.size));
-                                        self.fit_badge(ui, f.size);
-                                        ui.horizontal(|ui| {
-                                            let tag = models::quant_tag(&f.name);
-                                            if !tag.label.is_empty() {
-                                                ui.colored_label(tag.color, tag.label)
-                                                    .on_hover_text(&tip);
-                                            }
-                                            if best.as_deref() == Some(f.name.as_str()) {
-                                                ui.strong("• best pick").on_hover_text(
-                                                    "The highest-quality quant of this repo \
-                                                     that fits your RAM.",
-                                                );
-                                            }
-                                        });
-                                        if self.is_downloaded(&f.name) {
-                                            ui.weak("downloaded");
-                                        } else if self.is_downloading(&f.name) {
-                                            ui.spinner();
-                                        } else if Self::download_button(ui) {
-                                            self.start_download(&repo.id, &f.name, f.size);
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        }
-                        None => {
-                            ui.spinner();
-                        }
+                ui.horizontal(|ui| {
+                    let resp = ui.text_edit_singleline(&mut self.search_query);
+                    let submitted =
+                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let search_clicked = ui
+                        .add(egui::Button::image_and_text(
+                            egui::Image::new(ICON_SEARCH).fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                            "Search",
+                        ))
+                        .clicked();
+                    if (search_clicked || submitted) && !self.search_query.trim().is_empty() {
+                        self.search_pending = true;
+                        self.search_results.clear();
+                        hub::spawn_search(
+                            self.search_query.trim().to_string(),
+                            self.hub_tx.clone(),
+                        );
+                    }
+                    if self.search_pending {
+                        ui.spinner();
                     }
                 });
-                if open.body_response.is_some()
-                    && !self.repo_files.contains_key(&repo.id)
-                    && !self.files_pending.contains(&repo.id)
-                {
-                    self.files_pending.insert(repo.id.clone());
-                    hub::spawn_list_files(repo.id.clone(), self.hub_tx.clone());
+                ui.weak(
+                    "Q4_K_M is the sweet spot for most machines — higher Q means better but \
+                 bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
+                 the highest-quality quant that fits your RAM.",
+                );
+                let results = self.search_results.clone();
+                for repo in &results {
+                    let open = egui::CollapsingHeader::new(format!(
+                        "{}  ({} downloads)",
+                        repo.id,
+                        fmt_count(repo.downloads)
+                    ))
+                    .show(ui, |ui| {
+                        match self.repo_files.get(&repo.id).cloned() {
+                            Some(files) => {
+                                if files.is_empty() {
+                                    ui.weak("no .gguf files in this repo");
+                                }
+                                let models: Vec<_> = files
+                                    .iter()
+                                    .filter(|f| models::is_model_file(&f.name))
+                                    .collect();
+                                let best = models
+                                    .iter()
+                                    .filter(|f| {
+                                        Fit::of(f.size, self.hardware.total_ram) == Fit::Fits
+                                    })
+                                    .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
+                                    .map(|f| f.name.clone());
+                                egui::Grid::new(("repo_files", &repo.id))
+                                    .num_columns(5)
+                                    .spacing([16.0, 6.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for f in &models {
+                                            let tip = models::quant_tooltip(&f.name);
+                                            ui.label(&f.name).on_hover_text(&tip);
+                                            ui.weak(fmt_bytes(f.size));
+                                            self.fit_badge(ui, f.size);
+                                            ui.horizontal(|ui| {
+                                                let tag = models::quant_tag(&f.name);
+                                                if !tag.label.is_empty() {
+                                                    ui.colored_label(tag.color, tag.label)
+                                                        .on_hover_text(&tip);
+                                                }
+                                                if best.as_deref() == Some(f.name.as_str()) {
+                                                    ui.strong("• best pick").on_hover_text(
+                                                        "The highest-quality quant of this repo \
+                                                     that fits your RAM.",
+                                                    );
+                                                }
+                                            });
+                                            if self.is_downloaded(&f.name) {
+                                                ui.weak("downloaded");
+                                            } else if self.is_downloading(&f.name) {
+                                                ui.spinner();
+                                            } else if Self::download_button(ui) {
+                                                self.start_download(&repo.id, &f.name, f.size);
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            None => {
+                                ui.spinner();
+                            }
+                        }
+                    });
+                    if open.body_response.is_some()
+                        && !self.repo_files.contains_key(&repo.id)
+                        && !self.files_pending.contains(&repo.id)
+                    {
+                        self.files_pending.insert(repo.id.clone());
+                        hub::spawn_list_files(repo.id.clone(), self.hub_tx.clone());
+                    }
                 }
-            }
             });
         });
     }
@@ -757,12 +759,7 @@ impl OffgridApp {
         let models: serde_json::Map<String, serde_json::Value> = self
             .local_models
             .iter()
-            .map(|m| {
-                (
-                    m.name.clone(),
-                    serde_json::json!({"name": m.name.clone()}),
-                )
-            })
+            .map(|m| (m.name.clone(), serde_json::json!({"name": m.name.clone()})))
             .collect();
         let snippet = serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
@@ -812,12 +809,10 @@ impl OffgridApp {
                                     "A project instructions file the agent reads before every task",
                                 )
                                 .clicked()
-                        {
-                            if let Err(e) =
+                            && let Err(e) =
                                 std::fs::write(ws.join("AGENTS.md"), agent::AGENTS_MD_TEMPLATE)
-                            {
-                                self.last_error = Some(format!("could not create AGENTS.md: {e}"));
-                            }
+                        {
+                            self.last_error = Some(format!("could not create AGENTS.md: {e}"));
                         }
                     }
                     None => {
@@ -846,11 +841,7 @@ impl OffgridApp {
                     && self.loaded_model.is_some()
                     && self.workspace_path().is_some()
                     && !self.agent_task.trim().is_empty();
-                if (ui
-                    .add_enabled(ready, egui::Button::new("▶ Run"))
-                    .clicked()
-                    || submit)
-                    && ready
+                if (ui.add_enabled(ready, egui::Button::new("▶ Run")).clicked() || submit) && ready
                 {
                     let ws = self.workspace_path().unwrap();
                     let task = self.agent_task.trim().to_string();
@@ -880,10 +871,7 @@ impl OffgridApp {
                     ui.spinner();
                     if let Some(start) = self.live_start {
                         let secs = start.elapsed().as_secs_f32().max(0.001);
-                        ui.weak(format!(
-                            "{:.1} tok/s",
-                            self.live_tokens as f32 / secs
-                        ));
+                        ui.weak(format!("{:.1} tok/s", self.live_tokens as f32 / secs));
                     }
                 }
                 ui.checkbox(&mut self.agent_auto_approve, "auto-approve commands")
@@ -982,10 +970,10 @@ impl OffgridApp {
                             });
                         });
                 }
-                if let Some(answer) = approve_clicked {
-                    if let Some((_, reply)) = self.agent_approval.take() {
-                        let _ = reply.send(answer);
-                    }
+                if let Some(answer) = approve_clicked
+                    && let Some((_, reply)) = self.agent_approval.take()
+                {
+                    let _ = reply.send(answer);
                 }
             });
     }
@@ -1038,13 +1026,15 @@ impl OffgridApp {
                 }
                 ui.weak("Works the same for any tool that accepts an OpenAI-compatible base URL.");
             });
-            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                CommonMarkViewer::new().show(
-                    ui,
-                    &mut self.md_cache,
-                    &format!("```json\n{snippet}\n```"),
-                );
-            });
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    CommonMarkViewer::new().show(
+                        ui,
+                        &mut self.md_cache,
+                        &format!("```json\n{snippet}\n```"),
+                    );
+                });
         });
     }
 
@@ -1080,7 +1070,6 @@ impl OffgridApp {
                     });
                 });
         }
-
     }
 }
 
@@ -1134,10 +1123,10 @@ fn fmt_count(n: u64) -> String {
 }
 
 fn shellexpand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest).display().to_string();
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest).display().to_string();
     }
     path.to_string()
 }
@@ -1163,7 +1152,11 @@ fn split_segments(s: &str) -> Vec<Segment<'_>> {
             .min();
         let Some((start, tag)) = next else { break };
         let (open, close) = TAGS[tag];
-        let make = if tag == 0 { Segment::Think } else { Segment::ToolCall };
+        let make = if tag == 0 {
+            Segment::Think
+        } else {
+            Segment::ToolCall
+        };
         if start > 0 {
             out.push(Segment::Text(&rest[..start]));
         }
@@ -1212,6 +1205,65 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     }
 }
 
+/// Render a `<tool_call>` for humans: a long `content` argument (write_file)
+/// is pulled out of the JSON and shown as its own code block with real
+/// newlines, highlighted by the target file's extension.
+fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &str) {
+    match serde_json::from_str::<serde_json::Value>(t) {
+        Ok(mut v) => {
+            let lang = v["arguments"]["path"]
+                .as_str()
+                .and_then(|p| p.rsplit('.').next())
+                .unwrap_or("")
+                .to_string();
+            let content = v["arguments"]
+                .as_object_mut()
+                .and_then(|args| args.remove("content"))
+                .and_then(|c| c.as_str().map(String::from));
+            let head = serde_json::to_string_pretty(&v).unwrap_or_else(|_| t.to_string());
+            CommonMarkViewer::new().show(ui, cache, &format!("```json\n{head}\n```"));
+            if let Some(content) = content {
+                // Four-backtick fence so content containing ``` stays intact.
+                CommonMarkViewer::new().show(ui, cache, &format!("````{lang}\n{content}\n````"));
+            }
+        }
+        Err(_) => {
+            // Mid-stream, the JSON is incomplete — show it raw, but unescape
+            // the common sequences so code stays readable while it streams.
+            let display = t
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"");
+            CommonMarkViewer::new().show(ui, cache, &format!("````json\n{display}\n````"));
+        }
+    }
+}
+
+/// Reasoning block, styled like a quote: gray bar on the left, italic gray text.
+fn render_think_block(ui: &mut egui::Ui, text: &str) {
+    let response = egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 4,
+            top: 4,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .italics()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        })
+        .response;
+    let rect = response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y)),
+        1.0,
+        ui.visuals().weak_text_color().gamma_multiply(0.5),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,7 +1298,12 @@ mod tests {
         let tab_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 90, 0));
         ui.painter().rect(
             tab,
-            egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 },
+            egui::CornerRadius {
+                nw: 4,
+                ne: 4,
+                sw: 0,
+                se: 0,
+            },
             theme::TAB_YELLOW,
             tab_stroke,
             egui::StrokeKind::Inside,
@@ -1391,64 +1448,4 @@ mod tests {
         harness.run();
         harness.snapshot("offgrid");
     }
-}
-
-/// Render a `<tool_call>` for humans: a long `content` argument (write_file)
-/// is pulled out of the JSON and shown as its own code block with real
-/// newlines, highlighted by the target file's extension.
-fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &str) {
-    match serde_json::from_str::<serde_json::Value>(t) {
-        Ok(mut v) => {
-            let lang = v["arguments"]["path"]
-                .as_str()
-                .and_then(|p| p.rsplit('.').next())
-                .unwrap_or("")
-                .to_string();
-            let content = v["arguments"]
-                .as_object_mut()
-                .and_then(|args| args.remove("content"))
-                .and_then(|c| c.as_str().map(String::from));
-            let head = serde_json::to_string_pretty(&v).unwrap_or_else(|_| t.to_string());
-            CommonMarkViewer::new().show(ui, cache, &format!("```json\n{head}\n```"));
-            if let Some(content) = content {
-                // Four-backtick fence so content containing ``` stays intact.
-                CommonMarkViewer::new()
-                    .show(ui, cache, &format!("````{lang}\n{content}\n````"));
-            }
-        }
-        Err(_) => {
-            // Mid-stream, the JSON is incomplete — show it raw, but unescape
-            // the common sequences so code stays readable while it streams.
-            let display = t
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\\"", "\"");
-            CommonMarkViewer::new().show(ui, cache, &format!("````json\n{display}\n````"));
-        }
-    }
-}
-
-/// Reasoning block, styled like a quote: gray bar on the left, italic gray text.
-fn render_think_block(ui: &mut egui::Ui, text: &str) {
-    let response = egui::Frame::new()
-        .inner_margin(egui::Margin {
-            left: 12,
-            right: 4,
-            top: 4,
-            bottom: 4,
-        })
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(text)
-                    .italics()
-                    .color(ui.visuals().weak_text_color()),
-            );
-        })
-        .response;
-    let rect = response.rect;
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y)),
-        1.0,
-        ui.visuals().weak_text_color().gamma_multiply(0.5),
-    );
 }

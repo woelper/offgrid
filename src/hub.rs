@@ -22,10 +22,7 @@ pub enum HubEvent {
 
 fn get_json(url: &str) -> Result<serde_json::Value, String> {
     let mut res = ureq::get(url).call().map_err(|e| e.to_string())?;
-    let text = res
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| e.to_string())?;
+    let text = res.body_mut().read_to_string().map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
@@ -171,10 +168,7 @@ fn urlencode(s: &str) -> String {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
                 c.to_string()
             } else {
-                c.to_string()
-                    .bytes()
-                    .map(|b| format!("%{b:02X}"))
-                    .collect()
+                c.to_string().bytes().map(|b| format!("%{b:02X}")).collect()
             }
         })
         .collect()

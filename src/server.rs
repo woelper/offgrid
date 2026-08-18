@@ -45,9 +45,7 @@ pub fn start(
                     let cmd_tx = cmd_tx.clone();
                     let models_dir = models_dir.clone();
                     let loaded_model = loaded_model.clone();
-                    std::thread::spawn(move || {
-                        handle(request, cmd_tx, models_dir, loaded_model)
-                    });
+                    std::thread::spawn(move || handle(request, cmd_tx, models_dir, loaded_model));
                 }
                 Ok(None) => {}
                 Err(_) => break,
@@ -104,8 +102,10 @@ fn handle(
                 return;
             }
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
-                let _ = request
-                    .respond(json_response(400, json!({"error": {"message": "invalid JSON"}})));
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "invalid JSON"}}),
+                ));
                 return;
             };
             let model_name = loaded_model
@@ -133,8 +133,10 @@ fn handle(
                 })
                 .unwrap_or_default();
             if messages.is_empty() {
-                let _ = request
-                    .respond(json_response(400, json!({"error": {"message": "no messages"}})));
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "no messages"}}),
+                ));
                 return;
             }
             let stream = payload
@@ -208,8 +210,10 @@ fn handle(
             }
         }
         _ => {
-            let _ = request
-                .respond(json_response(404, json!({"error": {"message": "not found"}})));
+            let _ = request.respond(json_response(
+                404,
+                json!({"error": {"message": "not found"}}),
+            ));
         }
     }
 }

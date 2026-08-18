@@ -13,8 +13,7 @@ pub struct Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "offgrid")
-        .map(|d| d.config_dir().join("config.json"))
+    directories::ProjectDirs::from("", "", "offgrid").map(|d| d.config_dir().join("config.json"))
 }
 
 impl Config {

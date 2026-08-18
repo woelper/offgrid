@@ -26,10 +26,20 @@ pub enum AgentEvent {
     Info(String),
     /// The model's turn finished; `content` is the full reply.
     TurnDone,
-    ToolCall { name: String, summary: String },
-    ToolResult { output: String },
-    NeedsApproval { command: String, reply: Sender<bool> },
-    Done { iterations: usize },
+    ToolCall {
+        name: String,
+        summary: String,
+    },
+    ToolResult {
+        output: String,
+    },
+    NeedsApproval {
+        command: String,
+        reply: Sender<bool>,
+    },
+    Done {
+        iterations: usize,
+    },
     Error(String),
 }
 
@@ -124,7 +134,9 @@ fn run_loop(
                 continue;
             }
             return Err(if e.starts_with("context window full") {
-                format!("{e} — the task transcript is too long even after trimming; try a smaller task")
+                format!(
+                    "{e} — the task transcript is too long even after trimming; try a smaller task"
+                )
             } else {
                 e
             });
@@ -155,7 +167,9 @@ fn run_loop(
                 });
                 continue;
             }
-            let _ = tx.send(AgentEvent::Done { iterations: iteration });
+            let _ = tx.send(AgentEvent::Done {
+                iterations: iteration,
+            });
             return Ok(());
         };
 
@@ -337,12 +351,14 @@ pub fn parse_tool_call(response: &str) -> Option<ToolCall> {
     // 3) Lenient: a bare, balanced JSON object mentioning a known tool.
     let mut from = 0;
     for _ in 0..20 {
-        let Some(rel) = searchable[from..].find('{') else { break };
+        let Some(rel) = searchable[from..].find('{') else {
+            break;
+        };
         let start = from + rel;
-        if let Some(end) = balanced_json_end(&searchable[start..]) {
-            if let Some(call) = call_from_json(&searchable[start..start + end], true) {
-                return Some(call);
-            }
+        if let Some(end) = balanced_json_end(&searchable[start..])
+            && let Some(call) = call_from_json(&searchable[start..start + end], true)
+        {
+            return Some(call);
         }
         from = start + 1;
     }
@@ -403,14 +419,14 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
         "web_search" | "fetch_url" => {
             Err("web tools are disabled — solve the task with local tools only".into())
         }
-        "list_files" => {
-            resolve(workspace, call.arg("path").unwrap_or(""))
-                .and_then(|dir| list_files_impl(&dir, workspace, 8))
-        }
+        "list_files" => resolve(workspace, call.arg("path").unwrap_or(""))
+            .and_then(|dir| list_files_impl(&dir, workspace, 8)),
         "read_file" => resolve(workspace, call.arg("path").unwrap_or("")).and_then(|path| {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if size > MAX_FILE_READ {
-                return Err(format!("file too large ({size} bytes, limit {MAX_FILE_READ})"));
+                return Err(format!(
+                    "file too large ({size} bytes, limit {MAX_FILE_READ})"
+                ));
             }
             std::fs::read_to_string(&path).map_err(|e| e.to_string())
         }),
@@ -539,7 +555,10 @@ fn run_command(command: &str, workspace: &Path) -> Result<String, String> {
         result.push_str(&stderr);
     }
     if !output.status.success() {
-        result.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+        result.push_str(&format!(
+            "\n[exit code: {}]",
+            output.status.code().unwrap_or(-1)
+        ));
     }
     Ok(result)
 }
@@ -573,14 +592,11 @@ fn web_search(query: &str) -> Result<String, String> {
     let q = urlencode(query.trim());
     // Primary: DuckDuckGo Lite. It sometimes serves a bot challenge; treat a
     // parse miss the same as being offline and fall back to Wikipedia.
-    match web_get(&format!("https://lite.duckduckgo.com/lite/?q={q}")) {
-        Ok(html) => {
-            let results = parse_ddg_lite(&html);
-            if !results.is_empty() {
-                return Ok(results.join("\n\n"));
-            }
+    if let Ok(html) = web_get(&format!("https://lite.duckduckgo.com/lite/?q={q}")) {
+        let results = parse_ddg_lite(&html);
+        if !results.is_empty() {
+            return Ok(results.join("\n\n"));
         }
-        Err(_) => {}
     }
     match web_get(&format!(
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={q}&format=json&srlimit=5"
@@ -661,7 +677,9 @@ fn html_to_text(html: &str) -> String {
         loop {
             // ascii_lowercase keeps byte offsets identical to the original.
             let lower = s.to_ascii_lowercase();
-            let Some(start) = lower.find(&format!("<{tag}")) else { break };
+            let Some(start) = lower.find(&format!("<{tag}")) else {
+                break;
+            };
             let end = lower[start..]
                 .find(&format!("</{tag}>"))
                 .map(|e| start + e + tag.len() + 3)
@@ -826,7 +844,10 @@ mod tests {
 
     #[test]
     fn urldecode_roundtrip() {
-        assert_eq!(urldecode("https%3A%2F%2Fdocs.rs%2Fegui"), "https://docs.rs/egui");
+        assert_eq!(
+            urldecode("https%3A%2F%2Fdocs.rs%2Fegui"),
+            "https://docs.rs/egui"
+        );
         assert_eq!(urldecode(&urlencode("a b/c?d=e")), "a b/c?d=e");
     }
 
@@ -834,12 +855,30 @@ mod tests {
     fn compacts_old_tool_responses_only() {
         let long = format!("<tool_response>\n{}\n</tool_response>", "x".repeat(2000));
         let mut messages = vec![
-            ChatMessage { role: Role::System, content: "sys".into() },
-            ChatMessage { role: Role::User, content: long.clone() },   // old → trimmed
-            ChatMessage { role: Role::Assistant, content: "a".into() },
-            ChatMessage { role: Role::User, content: long.clone() },   // recent → kept
-            ChatMessage { role: Role::Assistant, content: "b".into() },
-            ChatMessage { role: Role::User, content: "task".into() },
+            ChatMessage {
+                role: Role::System,
+                content: "sys".into(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: long.clone(),
+            }, // old → trimmed
+            ChatMessage {
+                role: Role::Assistant,
+                content: "a".into(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: long.clone(),
+            }, // recent → kept
+            ChatMessage {
+                role: Role::Assistant,
+                content: "b".into(),
+            },
+            ChatMessage {
+                role: Role::User,
+                content: "task".into(),
+            },
         ];
         assert!(compact_transcript(&mut messages));
         assert!(messages[1].content.contains("[older tool output trimmed]"));

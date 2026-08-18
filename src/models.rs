@@ -220,6 +220,25 @@ pub struct LocalModel {
     pub size: u64,
 }
 
+pub fn scan_local(dir: &Path) -> Vec<LocalModel> {
+    let mut models = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "gguf") {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                models.push(LocalModel { name, path, size });
+            }
+        }
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    models
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,23 +261,4 @@ mod tests {
         assert!(!is_model_file("mmproj-model-f16.gguf"));
         assert!(is_model_file("Qwen3-4B-Q4_K_M.gguf"));
     }
-}
-
-pub fn scan_local(dir: &Path) -> Vec<LocalModel> {
-    let mut models = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gguf") {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                models.push(LocalModel { name, path, size });
-            }
-        }
-    }
-    models.sort_by(|a, b| a.name.cmp(&b.name));
-    models
 }

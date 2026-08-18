@@ -86,12 +86,7 @@ pub fn spawn_worker(n_threads: usize) -> LlmHandle {
     }
 }
 
-fn worker(
-    cmd_rx: Receiver<LlmCmd>,
-    tx: Sender<LlmEvent>,
-    stop: Arc<AtomicBool>,
-    n_threads: usize,
-) {
+fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>, n_threads: usize) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
         Err(e) => {
@@ -133,8 +128,7 @@ fn worker(
                     let _ = reply.send(LlmEvent::Error("no model loaded".into()));
                     continue;
                 };
-                if let Err(e) =
-                    generate(&backend, model, &messages, &reply, &stop, n_threads, temp)
+                if let Err(e) = generate(&backend, model, &messages, &reply, &stop, n_threads, temp)
                 {
                     let _ = reply.send(LlmEvent::Error(e));
                 }
