@@ -535,30 +535,80 @@ fn list_files_impl(dir: &Path, workspace: &Path, max_depth: usize) -> Result<Str
 }
 
 fn run_command(command: &str, workspace: &Path) -> Result<String, String> {
+    run_command_with_timeout(command, workspace, COMMAND_TIMEOUT_SECS)
+}
+
+/// Run a shell command with a timeout enforced in-process. The GNU `timeout`
+/// binary we used before does not exist on macOS or Windows (os error 2).
+fn run_command_with_timeout(
+    command: &str,
+    workspace: &Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    use std::io::Read as _;
+    use wait_timeout::ChildExt;
+
     if command.is_empty() {
         return Err("empty command".into());
     }
-    // `timeout` keeps a runaway command from hanging the agent thread forever.
-    let output = Command::new("timeout")
-        .arg(COMMAND_TIMEOUT_SECS.to_string())
-        .arg("bash")
-        .arg("-c")
-        .arg(command)
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(command);
+        c
+    };
+    let mut child = cmd
         .current_dir(workspace)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start shell: {e}"))?;
+
+    // Drain the pipes on threads so a chatty child can't fill the pipe
+    // buffer, block, and turn into a false timeout.
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = match child
+        .wait_timeout(std::time::Duration::from_secs(timeout_secs))
+        .map_err(|e| e.to_string())?
+    {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("command timed out after {timeout_secs}s"));
+        }
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    let stderr = err_thread.join().unwrap_or_default();
+
     let mut result = String::new();
-    result.push_str(&String::from_utf8_lossy(&output.stdout));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    result.push_str(&String::from_utf8_lossy(&stdout));
+    let stderr = String::from_utf8_lossy(&stderr);
     if !stderr.trim().is_empty() {
         result.push_str("\n[stderr]\n");
         result.push_str(&stderr);
     }
-    if !output.status.success() {
-        result.push_str(&format!(
-            "\n[exit code: {}]",
-            output.status.code().unwrap_or(-1)
-        ));
+    if !status.success() {
+        result.push_str(&format!("\n[exit code: {}]", status.code().unwrap_or(-1)));
     }
     Ok(result)
 }
@@ -911,6 +961,24 @@ mod tests {
         };
         let out = execute(&call, &std::env::temp_dir(), false);
         assert!(out.contains("disabled"));
+    }
+
+    #[test]
+    fn run_command_captures_output_and_exit_code() {
+        let ws = std::env::temp_dir();
+        let out = run_command_with_timeout("echo hello", &ws, 10).unwrap();
+        assert!(out.contains("hello"));
+        let out = run_command_with_timeout("echo oops >&2; exit 3", &ws, 10).unwrap();
+        assert!(out.contains("[stderr]"));
+        assert!(out.contains("oops"));
+        assert!(out.contains("[exit code: 3]"));
+    }
+
+    #[test]
+    fn run_command_times_out() {
+        let ws = std::env::temp_dir();
+        let err = run_command_with_timeout("sleep 30", &ws, 1).unwrap_err();
+        assert!(err.contains("timed out"));
     }
 
     #[test]
