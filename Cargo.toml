@@ -27,3 +27,15 @@ ureq = "3.4.0"
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
+
+# min-sized-rust settings (https://github.com/johnthagen/min-sized-rust).
+# Deliberate deviation: opt-level stays 3 instead of "z" — the cmake crate
+# maps s/z to a MinSizeRel (-Os) build of llama.cpp, which slows inference.
+# Note: `cargo test` must run without --release (panic = "abort" breaks the
+# libtest harness).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
