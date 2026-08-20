@@ -89,7 +89,7 @@ fn smoke(agent_mode: bool) {
                 agent::AgentEvent::ToolCall { name, summary } => {
                     println!("[tool call] {name}: {summary}");
                 }
-                agent::AgentEvent::ToolResult { output } => {
+                agent::AgentEvent::ToolResult { output, .. } => {
                     println!("[tool result] {output}");
                 }
                 agent::AgentEvent::NeedsApproval { .. } => println!("[unexpected approval req]"),

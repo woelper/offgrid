@@ -43,6 +43,7 @@ enum AgentItem {
         name: String,
         summary: String,
         output: Option<String>,
+        ok: Option<bool>,
     },
     Info(String),
 }
@@ -287,13 +288,18 @@ impl OffgridApp {
                             name,
                             summary,
                             output: None,
+                            ok: None,
                         });
                     }
-                    AgentEvent::ToolResult { output } => {
-                        if let Some(AgentItem::Tool { output: slot, .. }) =
-                            self.agent_transcript.last_mut()
+                    AgentEvent::ToolResult { output, ok } => {
+                        if let Some(AgentItem::Tool {
+                            output: slot,
+                            ok: ok_slot,
+                            ..
+                        }) = self.agent_transcript.last_mut()
                         {
                             *slot = Some(output);
+                            *ok_slot = Some(ok);
                         }
                     }
                     AgentEvent::Info(text) => {
@@ -456,8 +462,13 @@ impl OffgridApp {
             "Appearance",
             Some(theme::icons().settings.clone()),
             |ui| {
+                let row_h = theme::skin().control_height;
                 ui.horizontal(|ui| {
-                    ui.label("UI style:");
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(70.0, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| ui.label("UI style:"),
+                    );
                     let mut selected = theme::kind();
                     egui::ComboBox::from_id_salt("skin_select")
                         .selected_text(selected.label())
@@ -1003,11 +1014,21 @@ impl OffgridApp {
                             name,
                             summary,
                             output,
+                            ok,
                         } => {
                             ui.horizontal(|ui| {
                                 theme::icon(ui, tool_icon(name), 22.0);
                                 ui.strong(name);
                                 ui.weak(summary);
+                                match ok {
+                                    Some(true) => {
+                                        ui.colored_label(theme::skin().good, "\u{2714}");
+                                    }
+                                    Some(false) => {
+                                        ui.colored_label(theme::skin().bad, "\u{2716} failed");
+                                    }
+                                    None => {}
+                                }
                             });
                             if let Some(out) = output {
                                 if out.lines().count() > 5 {

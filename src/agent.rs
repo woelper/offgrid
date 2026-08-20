@@ -32,6 +32,9 @@ pub enum AgentEvent {
     },
     ToolResult {
         output: String,
+        /// Whether the tool completed successfully (derived from the output
+        /// markers this crate itself produces — cross-platform by design).
+        ok: bool,
     },
     NeedsApproval {
         command: String,
@@ -202,11 +205,15 @@ fn run_loop(
             output.truncate(MAX_TOOL_OUTPUT);
             output.push_str("\n[output truncated]");
         }
+        let ok = tool_output_ok(&output);
         if output.is_empty() {
-            output = "(no output)".to_string();
+            // Commands like cp/rm succeed silently — say so explicitly, for
+            // both the transcript and the model.
+            output = "(no output — completed successfully)".to_string();
         }
         let _ = tx.send(AgentEvent::ToolResult {
             output: output.clone(),
+            ok,
         });
         messages.push(ChatMessage {
             role: Role::User,
@@ -218,6 +225,16 @@ fn run_loop(
         iterations: MAX_ITERATIONS,
     });
     Ok(())
+}
+
+/// Did a tool call succeed? All failure paths in this crate mark the output:
+/// file/web tools prefix "Error:", run_command appends a non-zero
+/// "[exit code: …]", denials and offline results carry fixed phrases.
+fn tool_output_ok(output: &str) -> bool {
+    !(output.starts_with("Error:")
+        || output.contains("\n[exit code:")
+        || output.starts_with("Command denied")
+        || output.starts_with("Web access is unavailable"))
 }
 
 /// Shrink old tool responses (all but the most recent messages) to free
@@ -1007,7 +1024,7 @@ mod tests {
             let event = run.rx.recv_timeout(remaining).expect("agent run timed out");
             match event {
                 AgentEvent::ToolCall { name, .. } if name == "fetch_url" => saw_call = true,
-                AgentEvent::ToolResult { output } => {
+                AgentEvent::ToolResult { output, .. } => {
                     saw_result = output.contains("hello from the fake web");
                 }
                 AgentEvent::Done { .. } => break,
