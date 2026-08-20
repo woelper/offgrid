@@ -1093,9 +1093,11 @@ impl eframe::App for OffgridApp {
         self.drain_events();
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("top").show(ui, |ui| {
-            self.top_bar(ui);
-        });
+        egui::Panel::top("top")
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                self.top_bar(ui);
+            });
 
         if let Some(err) = self.last_error.clone() {
             egui::Panel::bottom("error_bar").show(ui, |ui| {
@@ -1418,31 +1420,33 @@ mod tests {
     /// A deterministic replica of the main screen (canned data, no threads,
     /// no config/disk access) rendered with the real theme, icons and widgets.
     fn demo_ui(ui: &mut egui::Ui) {
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                theme::icon(ui, ICON_LOGO, 22.0);
-                ui.heading(egui::RichText::new("offgrid").strong());
-                ui.separator();
-                ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
-                ui.separator();
-                ui.colored_label(theme::skin().good, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
-                let unload = ui.small_button("Unload");
-                theme::gloss(ui, unload.rect);
+        egui::Panel::top("top")
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    theme::icon(ui, ICON_LOGO, 22.0);
+                    ui.heading(egui::RichText::new("offgrid").strong());
+                    ui.separator();
+                    ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
+                    ui.separator();
+                    ui.colored_label(theme::skin().good, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
+                    let unload = ui.small_button("Unload");
+                    theme::gloss(ui, unload.rect);
+                });
+                ui.add_space(4.0);
+                let mut tab = Tab::Models;
+                theme::tab_bar(
+                    ui,
+                    &mut tab,
+                    &[
+                        (Tab::Models, ICON_DISK, "Models"),
+                        (Tab::Chat, ICON_CHAT, "Chat"),
+                        (Tab::Code, ICON_CODE, "Code"),
+                        (Tab::Serve, ICON_SERVE, "Serve"),
+                    ],
+                );
             });
-            ui.add_space(4.0);
-            let mut tab = Tab::Models;
-            theme::tab_bar(
-                ui,
-                &mut tab,
-                &[
-                    (Tab::Models, ICON_DISK, "Models"),
-                    (Tab::Chat, ICON_CHAT, "Chat"),
-                    (Tab::Code, ICON_CODE, "Code"),
-                    (Tab::Serve, ICON_SERVE, "Serve"),
-                ],
-            );
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             theme::group(ui, "On disk", Some(ICON_DISK), |ui| {
