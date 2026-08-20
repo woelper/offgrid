@@ -30,7 +30,9 @@ pub struct Skin {
     /// Primary accent (links, checkbox marks, selection stroke).
     pub accent: Color32,
     pub selection: Color32,
-    pub progress: Color32,
+    /// Vertical gradient of the progress-bar fill (Haiku Installer style).
+    pub progress_top: Color32,
+    pub progress_bottom: Color32,
     pub good: Color32,
     pub warn: Color32,
     pub bad: Color32,
@@ -52,7 +54,8 @@ pub const HAIKU: Skin = Skin {
     tab_inactive: Color32::from_rgb(199, 199, 199),
     accent: Color32::from_rgb(51, 102, 152),
     selection: Color32::from_rgb(170, 200, 235),
-    progress: Color32::from_rgb(90, 155, 240),
+    progress_top: Color32::from_rgb(158, 200, 250),
+    progress_bottom: Color32::from_rgb(64, 118, 210),
     good: Color32::from_rgb(38, 115, 60),
     warn: Color32::from_rgb(160, 112, 8),
     bad: Color32::from_rgb(168, 52, 52),
@@ -213,6 +216,9 @@ pub fn tab_bar<T: Copy + PartialEq>(
             Stroke::new(1.5, s.panel),
         );
     }
+    for r in &rects {
+        gloss(ui, *r);
+    }
     for (i, _) in items.iter().enumerate() {
         let r = rects[i];
         let icon_rect = egui::Rect::from_center_size(
@@ -317,4 +323,82 @@ pub fn group<R>(
 
 pub fn icon(ui: &mut egui::Ui, source: egui::ImageSource<'static>, size: f32) {
     ui.add(egui::Image::new(source).fit_to_exact_size(egui::vec2(size, size)));
+}
+
+/// Paint a rectangle with a vertical gradient using a mesh with per-vertex
+/// colors — egui's way to get gradients without textures.
+pub fn vertical_gradient(p: &egui::Painter, rect: egui::Rect, top: Color32, bottom: Color32) {
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    p.add(egui::Shape::mesh(mesh));
+}
+
+/// Subtle 3D sheen overlaid on an already-painted widget: translucent white
+/// fading out over the top half, a hint of shadow toward the bottom.
+pub fn gloss(ui: &egui::Ui, rect: egui::Rect) {
+    let r = rect.shrink(1.0);
+    if r.height() < 4.0 {
+        return;
+    }
+    let mid = egui::pos2(r.max.x, r.center().y);
+    vertical_gradient(
+        ui.painter(),
+        egui::Rect::from_min_max(r.min, mid),
+        Color32::from_white_alpha(56),
+        Color32::from_white_alpha(6),
+    );
+    vertical_gradient(
+        ui.painter(),
+        egui::Rect::from_min_max(egui::pos2(r.min.x, r.center().y), r.max),
+        Color32::TRANSPARENT,
+        Color32::from_black_alpha(14),
+    );
+}
+
+/// A standard button with the skin's gloss gradient applied.
+pub fn button(
+    ui: &mut egui::Ui,
+    icon: Option<(egui::ImageSource<'static>, f32)>,
+    label: &str,
+) -> egui::Response {
+    let resp = match icon {
+        Some((src, size)) => ui.add(egui::Button::image_and_text(
+            egui::Image::new(src).fit_to_exact_size(egui::vec2(size, size)),
+            label,
+        )),
+        None => ui.add(egui::Button::new(label)),
+    };
+    gloss(ui, resp.rect);
+    resp
+}
+
+/// Haiku Installer style progress bar: full width, white track with a thin
+/// border, gradient blue fill, squared corners. Status text belongs on the
+/// line above, not inside the bar.
+pub fn progress_bar(ui: &mut egui::Ui, frac: f32) {
+    let s = skin();
+    let h = 16.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect(
+        rect,
+        CornerRadius::same(1),
+        Color32::WHITE,
+        Stroke::new(1.0, s.control_border),
+        StrokeKind::Inside,
+    );
+    let fill_w = ((rect.width() - 2.0) * frac.clamp(0.0, 1.0)).floor();
+    if fill_w >= 1.0 {
+        let fill = egui::Rect::from_min_size(
+            rect.min + egui::vec2(1.0, 1.0),
+            egui::vec2(fill_w, rect.height() - 2.0),
+        );
+        vertical_gradient(p, fill, s.progress_top, s.progress_bottom);
+    }
 }

@@ -437,7 +437,9 @@ impl OffgridApp {
                 ui.label("loading model…");
             } else if let Some(name) = &self.loaded_model {
                 ui.colored_label(theme::skin().good, name);
-                if ui.small_button("Unload").clicked() {
+                let unload = ui.small_button("Unload");
+                theme::gloss(ui, unload.rect);
+                if unload.clicked() {
                     let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
                 }
             } else {
@@ -463,11 +465,7 @@ impl OffgridApp {
     }
 
     fn download_button(ui: &mut egui::Ui) -> bool {
-        ui.add(egui::Button::image_and_text(
-            egui::Image::new(ICON_DOWNLOAD).fit_to_exact_size(egui::vec2(18.0, 18.0)),
-            "Download",
-        ))
-        .clicked()
+        theme::button(ui, Some((ICON_DOWNLOAD, 18.0)), "Download").clicked()
     }
 
     fn models_ui(&mut self, ui: &mut egui::Ui) {
@@ -497,19 +495,14 @@ impl OffgridApp {
                         badge,
                         |ui| {
                             // right-to-left: first added sits at the right edge
-                            clicked_delete = ui
-                                .add(egui::Button::image_and_text(
-                                    egui::Image::new(ICON_TRASH)
-                                        .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                    "Delete",
-                                ))
-                                .clicked();
-                            clicked_load = ui
-                                .add_enabled(
-                                    can_load,
-                                    egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
-                                )
-                                .clicked();
+                            clicked_delete =
+                                theme::button(ui, Some((ICON_TRASH, 18.0)), "Delete").clicked();
+                            let load = ui.add_enabled(
+                                can_load,
+                                egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
+                            );
+                            theme::gloss(ui, load.rect);
+                            clicked_load = load.clicked();
                         },
                     );
                     if clicked_load {
@@ -521,36 +514,34 @@ impl OffgridApp {
                 }
 
                 for dl in &self.downloads {
+                    let frac = if dl.total > 0 {
+                        dl.bytes as f32 / dl.total as f32
+                    } else {
+                        0.0
+                    };
+                    let elapsed = dl.started.elapsed().as_secs_f32();
+                    let speed = dl.bytes as f32 / elapsed.max(0.1);
+                    let eta = if speed > 1.0 && dl.total > dl.bytes {
+                        fmt_eta((dl.total - dl.bytes) as f32 / speed)
+                    } else {
+                        "—".to_string()
+                    };
+                    // Haiku Installer layout: status line above, bar below.
                     ui.horizontal(|ui| {
                         theme::icon(ui, ICON_DOWNLOAD, 16.0);
                         ui.add(egui::Label::new(&dl.file).truncate());
-                        let frac = if dl.total > 0 {
-                            dl.bytes as f32 / dl.total as f32
-                        } else {
-                            0.0
-                        };
-                        let elapsed = dl.started.elapsed().as_secs_f32();
-                        let speed = dl.bytes as f32 / elapsed.max(0.1);
-                        let eta = if speed > 1.0 && dl.total > dl.bytes {
-                            fmt_eta((dl.total - dl.bytes) as f32 / speed)
-                        } else {
-                            "—".to_string()
-                        };
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(340.0)
-                                .desired_height(14.0)
-                                .fill(theme::skin().progress)
-                                .corner_radius(egui::CornerRadius::same(2))
-                                .text(format!(
-                                    "{} / {} · {}/s · {}",
-                                    fmt_bytes_precise(dl.bytes),
-                                    fmt_bytes_precise(dl.total),
-                                    fmt_bytes(speed as u64),
-                                    eta
-                                )),
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.weak(format!(
+                                "{} / {} · {}/s · {}",
+                                fmt_bytes_precise(dl.bytes),
+                                fmt_bytes_precise(dl.total),
+                                fmt_bytes(speed as u64),
+                                eta
+                            ));
+                        });
                     });
+                    theme::progress_bar(ui, frac);
+                    ui.add_space(4.0);
                 }
             });
 
@@ -599,12 +590,8 @@ impl OffgridApp {
                     let resp = ui.text_edit_singleline(&mut self.search_query);
                     let submitted =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let search_clicked = ui
-                        .add(egui::Button::image_and_text(
-                            egui::Image::new(ICON_SEARCH).fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                            "Search",
-                        ))
-                        .clicked();
+                    let search_clicked =
+                        theme::button(ui, Some((ICON_SEARCH, 14.0)), "Search").clicked();
                     if (search_clicked || submitted) && !self.search_query.trim().is_empty() {
                         self.search_pending = true;
                         self.search_results.clear();
@@ -731,21 +718,16 @@ impl OffgridApp {
                         && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                     ui.vertical(|ui| {
                         if self.generating {
-                            if ui.button("Stop").clicked() {
+                            if theme::button(ui, None, "Stop").clicked() {
                                 self.llm.stop.store(true, Ordering::Relaxed);
                             }
                             ui.spinner();
                         } else {
-                            if ui.button("Send").clicked() || send_key {
+                            if theme::button(ui, None, "Send").clicked() || send_key {
                                 self.send_chat();
                             }
                             if !self.messages.is_empty()
-                                && ui
-                                    .add(egui::Button::image_and_text(
-                                        egui::Image::new(ICON_TRASH)
-                                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                                        "Clear history",
-                                    ))
+                                && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
                                     .on_hover_text("Start a fresh conversation")
                                     .clicked()
                             {
@@ -821,13 +803,7 @@ impl OffgridApp {
                         ui.weak("no folder selected");
                     }
                 }
-                if ui
-                    .add(egui::Button::image_and_text(
-                        egui::Image::new(ICON_FOLDER).fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                        "Browse…",
-                    ))
-                    .clicked()
-                {
+                if theme::button(ui, Some((ICON_FOLDER, 16.0)), "Browse…").clicked() {
                     let start = self
                         .workspace_path()
                         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -842,8 +818,7 @@ impl OffgridApp {
                     Some(ws) => {
                         ui.colored_label(theme::skin().good, "✔");
                         if !ws.join("AGENTS.md").exists()
-                            && ui
-                                .button("Create AGENTS.md")
+                            && theme::button(ui, None, "Create AGENTS.md")
                                 .on_hover_text(
                                     "A project instructions file the agent reads before every task",
                                 )
@@ -882,8 +857,9 @@ impl OffgridApp {
                     && self.loaded_model.is_some()
                     && self.workspace_path().is_some()
                     && !self.agent_task.trim().is_empty();
-                if (ui.add_enabled(ready, egui::Button::new("▶ Run")).clicked() || submit) && ready
-                {
+                let run_resp = ui.add_enabled(ready, egui::Button::new("▶ Run"));
+                theme::gloss(ui, run_resp.rect);
+                if (run_resp.clicked() || submit) && ready {
                     let ws = self.workspace_path().unwrap();
                     let task = self.agent_task.trim().to_string();
                     self.agent_task = task.clone(); // drop the submit newline
@@ -900,7 +876,7 @@ impl OffgridApp {
                     ));
                 }
                 if running {
-                    if ui.button("Stop").clicked() {
+                    if theme::button(ui, None, "Stop").clicked() {
                         if let Some(run) = &self.agent_run {
                             run.stop.store(true, Ordering::Relaxed);
                         }
@@ -928,11 +904,7 @@ impl OffgridApp {
                 }
                 if !self.agent_transcript.is_empty()
                     && !running
-                    && ui
-                        .add(egui::Button::image_and_text(
-                            egui::Image::new(ICON_TRASH).fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                            "Clear history",
-                        ))
+                    && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
                         .on_hover_text("Clear the task transcript")
                         .clicked()
                 {
@@ -1007,10 +979,10 @@ impl OffgridApp {
                             });
                             ui.monospace(command);
                             ui.horizontal(|ui| {
-                                if ui.button("Approve").clicked() {
+                                if theme::button(ui, None, "Approve").clicked() {
                                     approve_clicked = Some(true);
                                 }
-                                if ui.button("Deny").clicked() {
+                                if theme::button(ui, None, "Deny").clicked() {
                                     approve_clicked = Some(false);
                                 }
                             });
@@ -1064,7 +1036,7 @@ impl OffgridApp {
             );
             let snippet = self.opencode_snippet();
             ui.horizontal(|ui| {
-                if ui.button("Copy").clicked() {
+                if theme::button(ui, None, "Copy").clicked() {
                     ui.ctx().copy_text(snippet.clone());
                 }
                 ui.weak("Works the same for any tool that accepts an OpenAI-compatible base URL.");
@@ -1097,7 +1069,7 @@ impl OffgridApp {
                         ));
                     });
                     ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
+                        if theme::button(ui, None, "Delete").clicked() {
                             if self.loaded_model.as_deref() == Some(model.name.as_str()) {
                                 let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
                             }
@@ -1107,7 +1079,7 @@ impl OffgridApp {
                             self.rescan();
                             self.confirm_delete = None;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if theme::button(ui, None, "Cancel").clicked() {
                             self.confirm_delete = None;
                         }
                     });
@@ -1455,7 +1427,8 @@ mod tests {
                 ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
                 ui.separator();
                 ui.colored_label(theme::skin().good, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
-                let _ = ui.small_button("Unload");
+                let unload = ui.small_button("Unload");
+                theme::gloss(ui, unload.rect);
             });
             ui.add_space(4.0);
             let mut tab = Tab::Models;
@@ -1492,18 +1465,23 @@ mod tests {
                         size,
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
-                            let _ = ui.add(egui::Button::image_and_text(
-                                egui::Image::new(ICON_TRASH)
-                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                "Delete",
-                            ));
-                            let _ = ui.add_enabled(
+                            let _ = theme::button(ui, Some((ICON_TRASH, 18.0)), "Delete");
+                            let load = ui.add_enabled(
                                 !loaded,
                                 egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
                             );
+                            theme::gloss(ui, load.rect);
                         },
                     );
                 }
+                ui.horizontal(|ui| {
+                    theme::icon(ui, ICON_DOWNLOAD, 16.0);
+                    ui.add(egui::Label::new("Qwen3.8-27B-UD-Q4_K_M.gguf").truncate());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak("9.87 GB / 15.30 GB · 8.2 MB/s · 11:04 left");
+                    });
+                });
+                theme::progress_bar(ui, 0.645);
             });
 
             theme::group(ui, "Get models", Some(ICON_DEPOT), |ui| {
@@ -1527,11 +1505,7 @@ mod tests {
                         size,
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
-                            let _ = ui.add(egui::Button::image_and_text(
-                                egui::Image::new(ICON_DOWNLOAD)
-                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
-                                "Download",
-                            ));
+                            let _ = theme::button(ui, Some((ICON_DOWNLOAD, 18.0)), "Download");
                         },
                     );
                 }
@@ -1542,7 +1516,7 @@ mod tests {
     #[test]
     fn main_screen_snapshot() {
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1000.0, 580.0))
+            .with_size(egui::vec2(1000.0, 640.0))
             .build_ui(desktop_ui);
         harness.run();
         harness.snapshot("offgrid");
