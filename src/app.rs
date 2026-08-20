@@ -16,29 +16,6 @@ use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
 use crate::theme;
 
-const ICON_LOGO: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Alert_Idea.png");
-const ICON_DISK: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Device_Harddisk.png");
-const ICON_CHAT: egui::ImageSource<'static> = egui::include_image!("../assets/icons/App_Chat.png");
-const ICON_SERVE: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Server_Net.png");
-const ICON_DOWNLOAD: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Action_Download.png");
-const ICON_SEARCH: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Action_Search.png");
-const ICON_TRASH: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Trash_Empty.png");
-const ICON_DEPOT: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/App_HaikuDepot.png");
-const ICON_CODE: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/App_Terminal.png");
-const ICON_FILE: egui::ImageSource<'static> = egui::include_image!("../assets/icons/File_Text.png");
-const ICON_FOLDER: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Folder_generic.png");
-const ICON_SETTINGS: egui::ImageSource<'static> =
-    egui::include_image!("../assets/icons/Prefs_Appearance.png");
-
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Models,
@@ -50,12 +27,12 @@ enum Tab {
 
 fn tool_icon(name: &str) -> egui::ImageSource<'static> {
     match name {
-        "run_command" => ICON_CODE,
-        "web_search" => ICON_SEARCH,
-        "fetch_url" => ICON_SERVE,
-        "list_files" => ICON_FOLDER,
-        "read_file" | "write_file" => ICON_FILE,
-        _ => ICON_DISK,
+        "run_command" => theme::icons().code.clone(),
+        "web_search" => theme::icons().search.clone(),
+        "fetch_url" => theme::icons().serve.clone(),
+        "list_files" => theme::icons().folder.clone(),
+        "read_file" | "write_file" => theme::icons().file.clone(),
+        _ => theme::icons().disk.clone(),
     }
 }
 
@@ -435,7 +412,7 @@ impl OffgridApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            theme::icon(ui, ICON_LOGO, 22.0);
+            theme::icon(ui, theme::icons().logo.clone(), 22.0);
             ui.heading(egui::RichText::new("offgrid").strong());
             ui.separator();
             ui.label(format!(
@@ -464,39 +441,44 @@ impl OffgridApp {
             ui,
             &mut self.tab,
             &[
-                (Tab::Models, ICON_DISK, "Models"),
-                (Tab::Chat, ICON_CHAT, "Chat"),
-                (Tab::Code, ICON_CODE, "Code"),
-                (Tab::Serve, ICON_SERVE, "Serve"),
-                (Tab::Settings, ICON_SETTINGS, "Settings"),
+                (Tab::Models, theme::icons().disk.clone(), "Models"),
+                (Tab::Chat, theme::icons().chat.clone(), "Chat"),
+                (Tab::Code, theme::icons().code.clone(), "Code"),
+                (Tab::Serve, theme::icons().serve.clone(), "Serve"),
+                (Tab::Settings, theme::icons().settings.clone(), "Settings"),
             ],
         );
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        theme::group(ui, "Appearance", Some(ICON_SETTINGS), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("UI style:");
-                let mut selected = theme::kind();
-                egui::ComboBox::from_id_salt("skin_select")
-                    .selected_text(selected.label())
-                    .show_ui(ui, |ui| {
-                        for kind in theme::SkinKind::ALL {
-                            ui.selectable_value(&mut selected, kind, kind.label());
-                        }
-                    });
-                if selected != theme::kind() {
-                    theme::set_kind(selected);
-                    theme::apply(ui.ctx());
-                    self.config.skin = Some(selected.id().to_string());
-                    self.config.save();
-                }
-            });
-            ui.weak(
-                "Haiku is offgrid's native look. \"egui default\" is the stock egui \
+        theme::group(
+            ui,
+            "Appearance",
+            Some(theme::icons().settings.clone()),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("UI style:");
+                    let mut selected = theme::kind();
+                    egui::ComboBox::from_id_salt("skin_select")
+                        .selected_text(selected.label())
+                        .show_ui(ui, |ui| {
+                            for kind in theme::SkinKind::ALL {
+                                ui.selectable_value(&mut selected, kind, kind.label());
+                            }
+                        });
+                    if selected != theme::kind() {
+                        theme::set_kind(selected);
+                        theme::apply(ui.ctx());
+                        self.config.skin = Some(selected.id().to_string());
+                        self.config.save();
+                    }
+                });
+                ui.weak(
+                    "Haiku is offgrid's native look. \"egui default\" is the stock egui \
                  dark theme with its default fonts.",
-            );
-        });
+                );
+            },
+        );
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
@@ -505,12 +487,17 @@ impl OffgridApp {
     }
 
     fn download_button(ui: &mut egui::Ui) -> bool {
-        theme::button(ui, Some((ICON_DOWNLOAD, 22.0)), "Download").clicked()
+        theme::button(
+            ui,
+            Some((theme::icons().download.clone(), 22.0)),
+            "Download",
+        )
+        .clicked()
     }
 
     fn models_ui(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            theme::group(ui, "On disk", Some(ICON_DISK), |ui| {
+            theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
                 if self.local_models.is_empty() {
                     ui.weak("No models yet — download one below.");
                 }
@@ -525,7 +512,7 @@ impl OffgridApp {
                         ui,
                         i % 2 == 1,
                         |ui| {
-                            theme::icon(ui, ICON_DISK, 16.0);
+                            theme::icon(ui, theme::icons().disk.clone(), 16.0);
                             ui.add(egui::Label::new(&model.name).truncate());
                             if loaded {
                                 ui.colored_label(theme::skin().good, "•");
@@ -536,7 +523,7 @@ impl OffgridApp {
                         |ui| {
                             // right-to-left: first added sits at the right edge
                             clicked_delete =
-                                theme::button(ui, Some((ICON_TRASH, 18.0)), "Delete").clicked();
+                                theme::button(ui, Some((theme::icons().trash.clone(), 18.0)), "Delete").clicked();
                             let load = ui.add_enabled(
                                 can_load,
                                 egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
@@ -568,7 +555,7 @@ impl OffgridApp {
                     };
                     // Haiku Installer layout: status line above, bar below.
                     ui.horizontal(|ui| {
-                        theme::icon(ui, ICON_DOWNLOAD, 16.0);
+                        theme::icon(ui, theme::icons().download.clone(), 16.0);
                         ui.add(egui::Label::new(&dl.file).truncate());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.weak(format!(
@@ -585,7 +572,7 @@ impl OffgridApp {
                 }
             });
 
-            theme::group(ui, "Get models", Some(ICON_DEPOT), |ui| {
+            theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
                 if let Some(rec) = models::recommended(self.hardware.total_ram) {
                     ui.horizontal(|ui| {
                         ui.label("Recommended for your hardware:");
@@ -625,7 +612,7 @@ impl OffgridApp {
                 }
             });
 
-            theme::group(ui, "Search Hugging Face", Some(ICON_SEARCH), |ui| {
+            theme::group(ui, "Search Hugging Face", Some(theme::icons().search.clone()), |ui| {
                 ui.horizontal(|ui| {
                     let h = theme::skin().control_height;
                     let resp = ui.add_sized(
@@ -637,7 +624,7 @@ impl OffgridApp {
                     let search = ui.add_sized(
                         [0.0, h],
                         egui::Button::image_and_text(
-                            egui::Image::new(ICON_SEARCH).fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                            egui::Image::new(theme::icons().search.clone()).fit_to_exact_size(egui::vec2(16.0, 16.0)),
                             "Search",
                         ),
                     );
@@ -775,9 +762,13 @@ impl OffgridApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.generating
                             && !self.messages.is_empty()
-                            && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
-                                .on_hover_text("Start a fresh conversation")
-                                .clicked()
+                            && theme::button(
+                                ui,
+                                Some((theme::icons().trash.clone(), 14.0)),
+                                "Clear history",
+                            )
+                            .on_hover_text("Start a fresh conversation")
+                            .clicked()
                         {
                             self.messages.clear();
                         }
@@ -861,7 +852,7 @@ impl OffgridApp {
     }
 
     fn code_ui(&mut self, ui: &mut egui::Ui) {
-        theme::group(ui, "Workspace", Some(ICON_CODE), |ui| {
+        theme::group(ui, "Workspace", Some(theme::icons().code.clone()), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Folder:");
                 match &self.config.workspace {
@@ -872,7 +863,9 @@ impl OffgridApp {
                         ui.weak("no folder selected");
                     }
                 }
-                if theme::button(ui, Some((ICON_FOLDER, 16.0)), "Browse…").clicked() {
+                if theme::button(ui, Some((theme::icons().folder.clone(), 16.0)), "Browse…")
+                    .clicked()
+                {
                     let start = self
                         .workspace_path()
                         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -973,9 +966,13 @@ impl OffgridApp {
                 }
                 if !self.agent_transcript.is_empty()
                     && !running
-                    && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
-                        .on_hover_text("Clear the task transcript")
-                        .clicked()
+                    && theme::button(
+                        ui,
+                        Some((theme::icons().trash.clone(), 14.0)),
+                        "Clear history",
+                    )
+                    .on_hover_text("Clear the task transcript")
+                    .clicked()
                 {
                     self.agent_transcript.clear();
                 }
@@ -1043,7 +1040,7 @@ impl OffgridApp {
                         .inner_margin(8.0)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                theme::icon(ui, ICON_CODE, 22.0);
+                                theme::icon(ui, theme::icons().code.clone(), 22.0);
                                 ui.strong("The agent wants to run a command:");
                             });
                             ui.monospace(command);
@@ -1066,7 +1063,7 @@ impl OffgridApp {
     }
 
     fn serve_ui(&mut self, ui: &mut egui::Ui) {
-        theme::group(ui, "API server", Some(ICON_SERVE), |ui| {
+        theme::group(ui, "API server", Some(theme::icons().serve.clone()), |ui| {
             ui.label(
                 "Expose your local models over an OpenAI-compatible API so other tools \
                  (opencode, aider, editors, scripts) can use them — still fully local.",
@@ -1130,7 +1127,7 @@ impl OffgridApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        theme::icon(ui, ICON_TRASH, 24.0);
+                        theme::icon(ui, theme::icons().trash.clone(), 24.0);
                         ui.label(format!(
                             "Permanently delete {} ({})?",
                             model.name,
@@ -1500,7 +1497,7 @@ mod tests {
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    theme::icon(ui, ICON_LOGO, 22.0);
+                    theme::icon(ui, theme::icons().logo.clone(), 22.0);
                     ui.heading(egui::RichText::new("offgrid").strong());
                     ui.separator();
                     ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
@@ -1515,17 +1512,17 @@ mod tests {
                     ui,
                     &mut tab,
                     &[
-                        (Tab::Models, ICON_DISK, "Models"),
-                        (Tab::Chat, ICON_CHAT, "Chat"),
-                        (Tab::Code, ICON_CODE, "Code"),
-                        (Tab::Serve, ICON_SERVE, "Serve"),
-                        (Tab::Settings, ICON_SETTINGS, "Settings"),
+                        (Tab::Models, theme::icons().disk.clone(), "Models"),
+                        (Tab::Chat, theme::icons().chat.clone(), "Chat"),
+                        (Tab::Code, theme::icons().code.clone(), "Code"),
+                        (Tab::Serve, theme::icons().serve.clone(), "Serve"),
+                        (Tab::Settings, theme::icons().settings.clone(), "Settings"),
                     ],
                 );
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            theme::group(ui, "On disk", Some(ICON_DISK), |ui| {
+            theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
                 let rows: [(&str, u64, bool); 3] = [
                     ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
                     ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
@@ -1536,7 +1533,7 @@ mod tests {
                         ui,
                         i % 2 == 1,
                         |ui| {
-                            theme::icon(ui, ICON_DISK, 16.0);
+                            theme::icon(ui, theme::icons().disk.clone(), 16.0);
                             ui.add(egui::Label::new(name).truncate());
                             if loaded {
                                 ui.colored_label(theme::skin().good, "•");
@@ -1545,7 +1542,11 @@ mod tests {
                         size,
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
-                            let _ = theme::button(ui, Some((ICON_TRASH, 18.0)), "Delete");
+                            let _ = theme::button(
+                                ui,
+                                Some((theme::icons().trash.clone(), 18.0)),
+                                "Delete",
+                            );
                             let load = ui.add_enabled(
                                 !loaded,
                                 egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
@@ -1555,7 +1556,7 @@ mod tests {
                     );
                 }
                 ui.horizontal(|ui| {
-                    theme::icon(ui, ICON_DOWNLOAD, 16.0);
+                    theme::icon(ui, theme::icons().download.clone(), 16.0);
                     ui.add(egui::Label::new("Qwen3.8-27B-UD-Q4_K_M.gguf").truncate());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.weak("9.87 GB / 15.30 GB · 8.2 MB/s · 11:04 left");
@@ -1564,7 +1565,7 @@ mod tests {
                 theme::progress_bar(ui, 0.645);
             });
 
-            theme::group(ui, "Get models", Some(ICON_DEPOT), |ui| {
+            theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Recommended for your hardware:");
                     ui.strong("Qwen3 Coder 30B-A3B (Q4_K_M)");
@@ -1585,7 +1586,11 @@ mod tests {
                         size,
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
-                            let _ = theme::button(ui, Some((ICON_DOWNLOAD, 22.0)), "Download");
+                            let _ = theme::button(
+                                ui,
+                                Some((theme::icons().download.clone(), 22.0)),
+                                "Download",
+                            );
                         },
                     );
                 }

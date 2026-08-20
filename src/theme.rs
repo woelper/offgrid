@@ -10,15 +10,17 @@ use eframe::egui::{self, Color32, CornerRadius, Stroke, StrokeKind};
 pub enum SkinKind {
     #[default]
     Haiku,
+    Material,
     EguiDefault,
 }
 
 impl SkinKind {
-    pub const ALL: [SkinKind; 2] = [SkinKind::Haiku, SkinKind::EguiDefault];
+    pub const ALL: [SkinKind; 3] = [SkinKind::Haiku, SkinKind::Material, SkinKind::EguiDefault];
 
     pub fn label(self) -> &'static str {
         match self {
             SkinKind::Haiku => "Haiku",
+            SkinKind::Material => "Material",
             SkinKind::EguiDefault => "egui default",
         }
     }
@@ -26,6 +28,7 @@ impl SkinKind {
     pub fn id(self) -> &'static str {
         match self {
             SkinKind::Haiku => "haiku",
+            SkinKind::Material => "material",
             SkinKind::EguiDefault => "egui",
         }
     }
@@ -33,6 +36,7 @@ impl SkinKind {
     pub fn from_id(id: &str) -> Self {
         match id {
             "egui" => SkinKind::EguiDefault,
+            "material" => SkinKind::Material,
             _ => SkinKind::Haiku,
         }
     }
@@ -43,6 +47,7 @@ static ACTIVE_SKIN: AtomicU8 = AtomicU8::new(0);
 pub fn kind() -> SkinKind {
     match ACTIVE_SKIN.load(Ordering::Relaxed) {
         1 => SkinKind::EguiDefault,
+        2 => SkinKind::Material,
         _ => SkinKind::Haiku,
     }
 }
@@ -51,6 +56,7 @@ pub fn set_kind(kind: SkinKind) {
     let v = match kind {
         SkinKind::Haiku => 0,
         SkinKind::EguiDefault => 1,
+        SkinKind::Material => 2,
     };
     ACTIVE_SKIN.store(v, Ordering::Relaxed);
 }
@@ -92,6 +98,8 @@ pub struct Skin {
     pub tab_radius: u8,
     /// Height for single-line inputs so they line up with buttons.
     pub control_height: f32,
+    /// Gradient sheen on buttons and tabs (Haiku's 3D look).
+    pub gloss: bool,
 }
 
 pub const HAIKU: Skin = Skin {
@@ -119,6 +127,7 @@ pub const HAIKU: Skin = Skin {
     button_padding: egui::Vec2::new(12.0, 6.0),
     tab_radius: 3,
     control_height: 30.0,
+    gloss: true,
 };
 
 /// Skin values matching egui's stock dark theme, so the custom widgets
@@ -147,12 +156,97 @@ pub const EGUI_DEFAULT: Skin = Skin {
     button_padding: egui::Vec2::new(8.0, 4.0),
     tab_radius: 4,
     control_height: 26.0,
+    gloss: false,
+};
+
+/// Clean, flat light theme in the spirit of Material design
+/// (palette borrowed from the `transcribe` app).
+pub const MATERIAL: Skin = Skin {
+    panel: Color32::from_rgb(0xf7, 0xf8, 0xfb),
+    faint: Color32::from_rgb(0xee, 0xf1, 0xf6),
+    control: Color32::from_rgb(0xe9, 0xed, 0xf3),
+    control_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
+    control_border_hover: Color32::from_rgb(0xb0, 0xb8, 0xc4),
+    window_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
+    title: Color32::from_rgb(0xe9, 0xed, 0xf3),
+    title_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
+    tab_strip_top: Color32::from_rgb(0xee, 0xf1, 0xf6),
+    tab_strip_bottom: Color32::from_rgb(0xe4, 0xe8, 0xef),
+    tab_active_top: Color32::WHITE,
+    tab_divider: Color32::from_rgb(0xd5, 0xda, 0xe2),
+    accent: Color32::from_rgb(0x11, 0x72, 0xdc),
+    selection: Color32::from_rgb(0xc4, 0xe1, 0xfb),
+    progress_top: Color32::from_rgb(0x5a, 0xa2, 0xee),
+    progress_bottom: Color32::from_rgb(0x11, 0x72, 0xdc),
+    good: Color32::from_rgb(0x1e, 0x8e, 0x3e),
+    warn: Color32::from_rgb(0xb2, 0x6a, 0x00),
+    bad: Color32::from_rgb(0xd9, 0x30, 0x25),
+    button_radius: 10,
+    button_padding: egui::Vec2::new(14.0, 7.0),
+    tab_radius: 8,
+    control_height: 32.0,
+    gloss: false,
 };
 
 pub fn skin() -> &'static Skin {
     match kind() {
         SkinKind::Haiku => &HAIKU,
+        SkinKind::Material => &MATERIAL,
         SkinKind::EguiDefault => &EGUI_DEFAULT,
+    }
+}
+
+/// The icon set is part of the skin: Haiku uses the original Haiku artwork,
+/// the other styles use a neutral line-icon set.
+pub struct IconSet {
+    pub logo: egui::ImageSource<'static>,
+    pub disk: egui::ImageSource<'static>,
+    pub chat: egui::ImageSource<'static>,
+    pub serve: egui::ImageSource<'static>,
+    pub download: egui::ImageSource<'static>,
+    pub search: egui::ImageSource<'static>,
+    pub trash: egui::ImageSource<'static>,
+    pub depot: egui::ImageSource<'static>,
+    pub code: egui::ImageSource<'static>,
+    pub file: egui::ImageSource<'static>,
+    pub folder: egui::ImageSource<'static>,
+    pub settings: egui::ImageSource<'static>,
+}
+
+pub static HAIKU_ICONS: IconSet = IconSet {
+    logo: egui::include_image!("../assets/icons/Alert_Idea.png"),
+    disk: egui::include_image!("../assets/icons/Device_Harddisk.png"),
+    chat: egui::include_image!("../assets/icons/App_Chat.png"),
+    serve: egui::include_image!("../assets/icons/Server_Net.png"),
+    download: egui::include_image!("../assets/icons/Action_Download.png"),
+    search: egui::include_image!("../assets/icons/Action_Search.png"),
+    trash: egui::include_image!("../assets/icons/Trash_Empty.png"),
+    depot: egui::include_image!("../assets/icons/App_HaikuDepot.png"),
+    code: egui::include_image!("../assets/icons/App_Terminal.png"),
+    file: egui::include_image!("../assets/icons/File_Text.png"),
+    folder: egui::include_image!("../assets/icons/Folder_generic.png"),
+    settings: egui::include_image!("../assets/icons/Prefs_Appearance.png"),
+};
+
+pub static NEUTRAL_ICONS: IconSet = IconSet {
+    logo: egui::include_image!("../assets/icons/neutral/logo.png"),
+    disk: egui::include_image!("../assets/icons/neutral/disk.png"),
+    chat: egui::include_image!("../assets/icons/neutral/chat.png"),
+    serve: egui::include_image!("../assets/icons/neutral/serve.png"),
+    download: egui::include_image!("../assets/icons/neutral/download.png"),
+    search: egui::include_image!("../assets/icons/neutral/search.png"),
+    trash: egui::include_image!("../assets/icons/neutral/trash.png"),
+    depot: egui::include_image!("../assets/icons/neutral/depot.png"),
+    code: egui::include_image!("../assets/icons/neutral/code.png"),
+    file: egui::include_image!("../assets/icons/neutral/file.png"),
+    folder: egui::include_image!("../assets/icons/neutral/folder.png"),
+    settings: egui::include_image!("../assets/icons/neutral/settings.png"),
+};
+
+pub fn icons() -> &'static IconSet {
+    match kind() {
+        SkinKind::Haiku => &HAIKU_ICONS,
+        _ => &NEUTRAL_ICONS,
     }
 }
 
@@ -189,7 +283,81 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+fn install_fonts_material(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "PlexSans".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"))
+            .into(),
+    );
+    fonts.font_data.insert(
+        "PlexMono".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"))
+            .into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "PlexSans".into());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "PlexMono".into());
+    ctx.set_fonts(fonts);
+}
+
+fn apply_material(ctx: &egui::Context) {
+    let s = skin();
+    install_fonts_material(ctx);
+    ctx.set_theme(egui::Theme::Light);
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    let mut v = egui::Visuals::light();
+    v.override_text_color = Some(Color32::from_rgb(0x30, 0x34, 0x3c));
+    v.panel_fill = s.panel;
+    v.window_fill = s.panel;
+    v.faint_bg_color = s.faint;
+    v.extreme_bg_color = Color32::WHITE;
+    v.hyperlink_color = s.accent;
+    v.selection.bg_fill = s.selection;
+    v.selection.stroke = Stroke::new(1.0, s.accent);
+    v.window_corner_radius = CornerRadius::same(12);
+    // Flat, borderless controls.
+    for w in [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = CornerRadius::same(s.button_radius);
+        w.bg_stroke = Stroke::NONE;
+        w.expansion = 0.0;
+        w.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
+    }
+    v.widgets.noninteractive.corner_radius = CornerRadius::same(s.button_radius);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, s.control_border);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
+    v.widgets.inactive.bg_fill = s.control;
+    v.widgets.inactive.weak_bg_fill = s.control;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    v.widgets.active.bg_fill = s.selection;
+    v.widgets.active.weak_bg_fill = s.selection;
+    v.widgets.open.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    v.widgets.open.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    style.visuals = v;
+    style.spacing.button_padding = s.button_padding;
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    ctx.set_style_of(egui::Theme::Light, style.clone());
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    if kind() == SkinKind::Material {
+        apply_material(ctx);
+        return;
+    }
     if kind() == SkinKind::EguiDefault {
         // Stock egui: default fonts, default dark style.
         ctx.set_fonts(egui::FontDefinitions::default());
@@ -462,6 +630,9 @@ pub fn vertical_gradient(p: &egui::Painter, rect: egui::Rect, top: Color32, bott
 /// Subtle 3D sheen overlaid on an already-painted widget: translucent white
 /// fading out over the top half, a hint of shadow toward the bottom.
 pub fn gloss(ui: &egui::Ui, rect: egui::Rect) {
+    if !skin().gloss {
+        return;
+    }
     let r = rect.shrink(1.0);
     if r.height() < 4.0 {
         return;
