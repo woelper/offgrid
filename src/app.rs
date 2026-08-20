@@ -469,7 +469,7 @@ impl OffgridApp {
 
     fn download_button(ui: &mut egui::Ui) -> bool {
         ui.add(egui::Button::image_and_text(
-            egui::Image::new(ICON_DOWNLOAD).fit_to_exact_size(egui::vec2(14.0, 14.0)),
+            egui::Image::new(ICON_DOWNLOAD).fit_to_exact_size(egui::vec2(18.0, 18.0)),
             "Download",
         ))
         .clicked()
@@ -482,67 +482,77 @@ impl OffgridApp {
                     ui.weak("No models yet — download one below.");
                 }
                 let locals = self.local_models.clone();
-                egui::Grid::new("local_models")
-                    .num_columns(4)
-                    .spacing([16.0, 6.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for model in &locals {
-                            let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
-                            ui.horizontal(|ui| {
-                                theme::icon(ui, ICON_DISK, 16.0);
-                                ui.label(&model.name);
-                                if loaded {
-                                    ui.colored_label(theme::GOOD_GREEN, "•");
-                                }
-                            });
-                            ui.weak(fmt_bytes(model.size));
-                            self.fit_badge(ui, model.size);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        !loaded && !self.model_loading,
-                                        egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.load_model(model.path.clone());
-                                }
-                                if ui
-                                    .add(egui::Button::image_and_text(
-                                        egui::Image::new(ICON_TRASH)
-                                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                                        "Delete",
-                                    ))
-                                    .clicked()
-                                {
-                                    self.confirm_delete = Some(model.clone());
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
+                for (i, model) in locals.iter().enumerate() {
+                    let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
+                    let can_load = !loaded && !self.model_loading;
+                    let badge = Fit::of(model.size, self.hardware.total_ram).badge();
+                    let mut clicked_load = false;
+                    let mut clicked_delete = false;
+                    list_row(
+                        ui,
+                        i % 2 == 1,
+                        |ui| {
+                            theme::icon(ui, ICON_DISK, 16.0);
+                            ui.add(egui::Label::new(&model.name).truncate());
+                            if loaded {
+                                ui.colored_label(theme::GOOD_GREEN, "•");
+                            }
+                        },
+                        model.size,
+                        badge,
+                        |ui| {
+                            // right-to-left: first added sits at the right edge
+                            clicked_delete = ui
+                                .add(egui::Button::image_and_text(
+                                    egui::Image::new(ICON_TRASH)
+                                        .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                    "Delete",
+                                ))
+                                .clicked();
+                            clicked_load = ui
+                                .add_enabled(
+                                    can_load,
+                                    egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
+                                )
+                                .clicked();
+                        },
+                    );
+                    if clicked_load {
+                        self.load_model(model.path.clone());
+                    }
+                    if clicked_delete {
+                        self.confirm_delete = Some(model.clone());
+                    }
+                }
 
                 for dl in &self.downloads {
                     ui.horizontal(|ui| {
                         theme::icon(ui, ICON_DOWNLOAD, 16.0);
-                        ui.label(&dl.file);
+                        ui.add(egui::Label::new(&dl.file).truncate());
                         let frac = if dl.total > 0 {
                             dl.bytes as f32 / dl.total as f32
                         } else {
                             0.0
                         };
+                        let elapsed = dl.started.elapsed().as_secs_f32();
+                        let speed = dl.bytes as f32 / elapsed.max(0.1);
+                        let eta = if speed > 1.0 && dl.total > dl.bytes {
+                            fmt_eta((dl.total - dl.bytes) as f32 / speed)
+                        } else {
+                            "—".to_string()
+                        };
                         ui.add(
                             egui::ProgressBar::new(frac)
-                                .desired_width(280.0)
+                                .desired_width(340.0)
                                 .desired_height(14.0)
                                 .fill(theme::PROGRESS_BLUE)
                                 .corner_radius(egui::CornerRadius::same(2))
                                 .text(format!(
-                                    "{} / {}  ({:.1}%)",
+                                    "{} / {} · {}/s · {}",
                                     fmt_bytes_precise(dl.bytes),
                                     fmt_bytes_precise(dl.total),
-                                    frac * 100.0
+                                    fmt_bytes(speed as u64),
+                                    eta
                                 )),
                         );
                     });
@@ -558,26 +568,35 @@ impl OffgridApp {
                     ui.separator();
                 }
                 let catalog = models::catalog();
-                egui::Grid::new("catalog")
-                    .num_columns(4)
-                    .spacing([16.0, 6.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for entry in &catalog {
-                            ui.label(entry.name)
-                                .on_hover_text(models::quant_tooltip(entry.file));
-                            ui.weak(fmt_bytes(entry.size));
-                            self.fit_badge(ui, entry.size);
-                            if self.is_downloaded(entry.file) {
+                for (i, entry) in catalog.iter().enumerate() {
+                    let badge = Fit::of(entry.size, self.hardware.total_ram).badge();
+                    let downloaded = self.is_downloaded(entry.file);
+                    let downloading = self.is_downloading(entry.file);
+                    let tooltip = models::quant_tooltip(entry.file);
+                    let mut clicked_download = false;
+                    list_row(
+                        ui,
+                        i % 2 == 1,
+                        |ui| {
+                            ui.add(egui::Label::new(entry.name).truncate())
+                                .on_hover_text(tooltip);
+                        },
+                        entry.size,
+                        badge,
+                        |ui| {
+                            if downloaded {
                                 ui.weak("downloaded");
-                            } else if self.is_downloading(entry.file) {
+                            } else if downloading {
                                 ui.spinner();
-                            } else if Self::download_button(ui) {
-                                self.start_download(entry.repo, entry.file, entry.size);
+                            } else {
+                                clicked_download = Self::download_button(ui);
                             }
-                            ui.end_row();
-                        }
-                    });
+                        },
+                    );
+                    if clicked_download {
+                        self.start_download(entry.repo, entry.file, entry.size);
+                    }
+                }
             });
 
             theme::group(ui, "Search Hugging Face", Some(ICON_SEARCH), |ui| {
@@ -725,7 +744,16 @@ impl OffgridApp {
                             if ui.button("Send").clicked() || send_key {
                                 self.send_chat();
                             }
-                            if !self.messages.is_empty() && ui.small_button("Clear").clicked() {
+                            if !self.messages.is_empty()
+                                && ui
+                                    .add(egui::Button::image_and_text(
+                                        egui::Image::new(ICON_TRASH)
+                                            .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                        "Clear history",
+                                    ))
+                                    .on_hover_text("Start a fresh conversation")
+                                    .clicked()
+                            {
                                 self.messages.clear();
                             }
                         }
@@ -790,14 +818,30 @@ impl OffgridApp {
         theme::group(ui, "Workspace", Some(ICON_CODE), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Folder:");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.workspace_input)
-                        .hint_text("/path/to/project")
-                        .desired_width(320.0),
-                );
-                if resp.changed() {
-                    self.config.workspace = self.workspace_path();
-                    self.config.save();
+                match &self.config.workspace {
+                    Some(p) => {
+                        ui.monospace(p.display().to_string());
+                    }
+                    None => {
+                        ui.weak("no folder selected");
+                    }
+                }
+                if ui
+                    .add(egui::Button::image_and_text(
+                        egui::Image::new(ICON_FOLDER).fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                        "Browse…",
+                    ))
+                    .clicked()
+                {
+                    let start = self
+                        .workspace_path()
+                        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    if let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() {
+                        self.workspace_input = dir.display().to_string();
+                        self.config.workspace = Some(dir);
+                        self.config.save();
+                    }
                 }
                 match self.workspace_path() {
                     Some(ws) => {
@@ -816,7 +860,9 @@ impl OffgridApp {
                         }
                     }
                     None => {
-                        ui.colored_label(theme::BAD_RED, "not a folder");
+                        if !self.workspace_input.trim().is_empty() {
+                            ui.colored_label(theme::BAD_RED, "not a folder");
+                        }
                     }
                 }
             });
@@ -888,7 +934,13 @@ impl OffgridApp {
                 }
                 if !self.agent_transcript.is_empty()
                     && !running
-                    && ui.small_button("Clear").clicked()
+                    && ui
+                        .add(egui::Button::image_and_text(
+                            egui::Image::new(ICON_TRASH).fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                            "Clear history",
+                        ))
+                        .on_hover_text("Clear the task transcript")
+                        .clicked()
                 {
                     self.agent_transcript.clear();
                 }
@@ -1114,6 +1166,63 @@ impl eframe::App for OffgridApp {
     }
 }
 
+const COL_NAME: f32 = 340.0;
+const COL_SIZE: f32 = 80.0;
+const COL_BADGE: f32 = 60.0;
+const ROW_H: f32 = 26.0;
+
+/// A model-list row with fixed-width columns (shared between "On disk" and
+/// "Get models" so the two tables line up) and right-aligned actions.
+fn list_row(
+    ui: &mut egui::Ui,
+    stripe: bool,
+    name: impl FnOnce(&mut egui::Ui),
+    size: u64,
+    badge: (&'static str, egui::Color32),
+    actions: impl FnOnce(&mut egui::Ui),
+) {
+    let fill = if stripe {
+        ui.visuals().faint_bg_color
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let cell = egui::Layout::left_to_right(egui::Align::Center);
+                ui.allocate_ui_with_layout(egui::vec2(COL_NAME, ROW_H), cell, |ui| {
+                    ui.set_width(COL_NAME);
+                    name(ui);
+                });
+                ui.allocate_ui_with_layout(egui::vec2(COL_SIZE, ROW_H), cell, |ui| {
+                    ui.set_width(COL_SIZE);
+                    ui.weak(fmt_bytes(size));
+                });
+                let (label, color) = badge;
+                ui.allocate_ui_with_layout(egui::vec2(COL_BADGE, ROW_H), cell, |ui| {
+                    ui.set_width(COL_BADGE);
+                    ui.colored_label(color, label);
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
+            });
+        });
+}
+
+fn fmt_eta(secs: f32) -> String {
+    if !secs.is_finite() || secs > 359_999.0 {
+        return "—".into();
+    }
+    let s = secs as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02} left", s / 3600, (s % 3600) / 60, s % 60)
+    } else {
+        format!("{}:{:02} left", s / 60, s % 60)
+    }
+}
+
 fn fmt_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -1267,7 +1376,6 @@ fn render_think_block(ui: &mut egui::Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::fmt_bytes;
 
     const DEMO_RAM: u64 = 32 * 1024 * 1024 * 1024;
 
@@ -1370,41 +1478,37 @@ mod tests {
 
         egui::CentralPanel::default().show(ui, |ui| {
             theme::group(ui, "On disk", Some(ICON_DISK), |ui| {
-                egui::Grid::new("local_models")
-                    .num_columns(4)
-                    .spacing([16.0, 6.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        let rows: [(&str, u64, bool); 3] = [
-                            ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
-                            ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
-                            ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", 18_556_689_568, false),
-                        ];
-                        for (name, size, loaded) in rows {
-                            ui.horizontal(|ui| {
-                                theme::icon(ui, ICON_DISK, 16.0);
-                                ui.label(name);
-                                if loaded {
-                                    ui.colored_label(theme::GOOD_GREEN, "•");
-                                }
-                            });
-                            ui.weak(fmt_bytes(size));
-                            let (label, color) = Fit::of(size, DEMO_RAM).badge();
-                            ui.colored_label(color, label);
-                            ui.horizontal(|ui| {
-                                let _ = ui.add_enabled(
-                                    !loaded,
-                                    egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
-                                );
-                                let _ = ui.add(egui::Button::image_and_text(
-                                    egui::Image::new(ICON_TRASH)
-                                        .fit_to_exact_size(egui::vec2(14.0, 14.0)),
-                                    "Delete",
-                                ));
-                            });
-                            ui.end_row();
-                        }
-                    });
+                let rows: [(&str, u64, bool); 3] = [
+                    ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
+                    ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
+                    ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", 18_556_689_568, false),
+                ];
+                for (i, (name, size, loaded)) in rows.into_iter().enumerate() {
+                    list_row(
+                        ui,
+                        i % 2 == 1,
+                        |ui| {
+                            theme::icon(ui, ICON_DISK, 16.0);
+                            ui.add(egui::Label::new(name).truncate());
+                            if loaded {
+                                ui.colored_label(theme::GOOD_GREEN, "•");
+                            }
+                        },
+                        size,
+                        Fit::of(size, DEMO_RAM).badge(),
+                        |ui| {
+                            let _ = ui.add(egui::Button::image_and_text(
+                                egui::Image::new(ICON_TRASH)
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
+                                "Delete",
+                            ));
+                            let _ = ui.add_enabled(
+                                !loaded,
+                                egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
+                            );
+                        },
+                    );
+                }
             });
 
             theme::group(ui, "Get models", Some(ICON_DEPOT), |ui| {
@@ -1413,29 +1517,29 @@ mod tests {
                     ui.strong("Qwen3 Coder 30B-A3B (Q4_K_M)");
                 });
                 ui.separator();
-                egui::Grid::new("catalog")
-                    .num_columns(4)
-                    .spacing([16.0, 6.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        let rows: [(&str, u64); 3] = [
-                            ("Qwen3 1.7B (Q4_K_M)", 1_107_409_472),
-                            ("Gemma 3 4B Instruct (Q4_K_M)", 2_489_758_112),
-                            ("Mistral 7B Instruct v0.3 (Q4_K_M)", 4_372_812_000),
-                        ];
-                        for (name, size) in rows {
-                            ui.label(name);
-                            ui.weak(fmt_bytes(size));
-                            let (label, color) = Fit::of(size, DEMO_RAM).badge();
-                            ui.colored_label(color, label);
+                let rows: [(&str, u64); 3] = [
+                    ("Qwen3 1.7B (Q4_K_M)", 1_107_409_472),
+                    ("Gemma 3 4B Instruct (Q4_K_M)", 2_489_758_112),
+                    ("Mistral 7B Instruct v0.3 (Q4_K_M)", 4_372_812_000),
+                ];
+                for (i, (name, size)) in rows.into_iter().enumerate() {
+                    list_row(
+                        ui,
+                        i % 2 == 1,
+                        |ui| {
+                            ui.add(egui::Label::new(name).truncate());
+                        },
+                        size,
+                        Fit::of(size, DEMO_RAM).badge(),
+                        |ui| {
                             let _ = ui.add(egui::Button::image_and_text(
                                 egui::Image::new(ICON_DOWNLOAD)
-                                    .fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                                    .fit_to_exact_size(egui::vec2(18.0, 18.0)),
                                 "Download",
                             ));
-                            ui.end_row();
-                        }
-                    });
+                        },
+                    );
+                }
             });
         });
     }

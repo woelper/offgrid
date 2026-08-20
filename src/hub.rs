@@ -98,6 +98,7 @@ pub struct ActiveDownload {
     pub file: String,
     pub bytes: u64,
     pub total: u64,
+    pub started: std::time::Instant,
     pub rx: Receiver<DownloadEvent>,
 }
 
@@ -115,6 +116,7 @@ pub fn start_download(repo: &str, file: &str, size_hint: u64, dest_dir: &Path) -
         file: file.to_string(),
         bytes: 0,
         total: size_hint,
+        started: std::time::Instant::now(),
         rx,
     }
 }
