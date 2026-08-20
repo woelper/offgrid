@@ -917,8 +917,7 @@ impl OffgridApp {
                 }
                 theme::checkbox(ui, &mut self.agent_auto_approve, "auto-approve commands")
                     .on_hover_text("Run shell commands without asking (applies to the next run)");
-                if ui
-                    .checkbox(&mut self.config.web_tools, "allow web tools")
+                if theme::checkbox(ui, &mut self.config.web_tools, "allow web tools")
                     .on_hover_text(
                         "Give the agent web_search and fetch_url. Fails gracefully when \
                          offline — the agent falls back to local knowledge.",
@@ -1034,10 +1033,7 @@ impl OffgridApp {
             ui.add_space(4.0);
 
             let mut enabled = self.config.server_enabled;
-            if ui
-                .checkbox(&mut enabled, "Enable server (127.0.0.1 only)")
-                .changed()
-            {
+            if theme::checkbox(ui, &mut enabled, "Enable server (127.0.0.1 only)").changed() {
                 self.config.server_enabled = enabled;
                 if enabled {
                     self.start_server();
