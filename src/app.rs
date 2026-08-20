@@ -82,6 +82,7 @@ pub struct OffgridApp {
     hub_rx: Receiver<HubEvent>,
     search_query: String,
     search_pending: bool,
+    last_search: Option<String>,
     search_results: Vec<RepoResult>,
     repo_files: HashMap<String, Vec<RepoFile>>,
     files_pending: HashSet<String>,
@@ -157,6 +158,7 @@ impl OffgridApp {
             hub_rx,
             search_query: String::new(),
             search_pending: false,
+            last_search: None,
             search_results: Vec::new(),
             repo_files: HashMap::new(),
             files_pending: HashSet::new(),
@@ -380,11 +382,12 @@ impl OffgridApp {
     }
 
     fn is_downloaded(&self, file: &str) -> bool {
-        self.models_dir.join(file).exists()
+        self.models_dir.join(file_basename(file)).exists()
     }
 
     fn is_downloading(&self, file: &str) -> bool {
-        self.downloads.iter().any(|d| d.file == file)
+        let name = file_basename(file);
+        self.downloads.iter().any(|d| d.file == name)
     }
 
     fn start_download(&mut self, repo: &str, file: &str, size: u64) {
@@ -639,6 +642,7 @@ impl OffgridApp {
                     if (search_clicked || submitted) && !self.search_query.trim().is_empty() {
                         self.search_pending = true;
                         self.search_results.clear();
+                        self.last_search = Some(self.search_query.trim().to_string());
                         hub::spawn_search(
                             self.search_query.trim().to_string(),
                             self.hub_tx.clone(),
@@ -653,6 +657,14 @@ impl OffgridApp {
                  bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
                  the highest-quality quant that fits your RAM.",
                 );
+                if !self.search_pending
+                    && self.search_results.is_empty()
+                    && let Some(q) = &self.last_search
+                {
+                    ui.weak(format!(
+                        "No GGUF repositories found for \"{q}\" — try fewer or different words."
+                    ));
+                }
                 let results = self.search_results.clone();
                 for repo in &results {
                     let open = egui::CollapsingHeader::new(format!(
@@ -1238,6 +1250,11 @@ fn fmt_eta(secs: f32) -> String {
     } else {
         format!("{}:{:02} left", s / 60, s % 60)
     }
+}
+
+/// Repo files may live in subfolders; local files are always flat.
+fn file_basename(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
 }
 
 fn fmt_count(n: u64) -> String {

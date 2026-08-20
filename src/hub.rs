@@ -60,7 +60,8 @@ pub fn spawn_search(query: String, tx: Sender<HubEvent>) {
 
 pub fn spawn_list_files(repo: String, tx: Sender<HubEvent>) {
     std::thread::spawn(move || {
-        let url = format!("https://huggingface.co/api/models/{repo}/tree/main");
+        // recursive: many repos keep their quants in subfolders.
+        let url = format!("https://huggingface.co/api/models/{repo}/tree/main?recursive=true");
         let event = match get_json(&url) {
             Ok(json) => {
                 let files = json
@@ -69,7 +70,9 @@ pub fn spawn_list_files(repo: String, tx: Sender<HubEvent>) {
                         arr.iter()
                             .filter_map(|f| {
                                 let name = f.get("path")?.as_str()?;
-                                if !name.ends_with(".gguf") {
+                                // Skip multi-part shards (…-00001-of-00003.gguf):
+                                // they can't be used as a single download.
+                                if !name.ends_with(".gguf") || name.contains("-of-") {
                                     return None;
                                 }
                                 Some(RepoFile {
@@ -105,7 +108,12 @@ pub struct ActiveDownload {
 pub fn start_download(repo: &str, file: &str, size_hint: u64, dest_dir: &Path) -> ActiveDownload {
     let (tx, rx) = std::sync::mpsc::channel();
     let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
-    let dest = dest_dir.join(file);
+    // `file` may live in a repo subfolder — save it flat under its basename.
+    let file = Path::new(file)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file.to_string());
+    let dest = dest_dir.join(&file);
     let dest_dir = dest_dir.to_path_buf();
     std::thread::spawn(move || {
         if let Err(e) = download(&url, &dest, &dest_dir, size_hint, &tx) {
