@@ -30,6 +30,8 @@ pub struct Skin {
     pub tab_strip_top: Color32,
     pub tab_strip_bottom: Color32,
     pub tab_active_top: Color32,
+    /// Faint vertical divider between inactive tabs.
+    pub tab_divider: Color32,
     /// Primary accent (links, checkbox marks, selection stroke).
     pub accent: Color32,
     pub selection: Color32,
@@ -56,9 +58,10 @@ pub const HAIKU: Skin = Skin {
     window_border: Color32::from_rgb(80, 80, 80),
     title: Color32::from_rgb(255, 203, 0),
     title_border: Color32::from_rgb(120, 90, 0),
-    tab_strip_top: Color32::from_rgb(214, 214, 214),
-    tab_strip_bottom: Color32::from_rgb(194, 194, 194),
-    tab_active_top: Color32::from_rgb(235, 235, 235),
+    tab_strip_top: Color32::from_rgb(211, 211, 211),
+    tab_strip_bottom: Color32::from_rgb(201, 201, 201),
+    tab_active_top: Color32::from_rgb(228, 228, 228),
+    tab_divider: Color32::from_rgb(183, 183, 183),
     accent: Color32::from_rgb(51, 102, 152),
     selection: Color32::from_rgb(170, 200, 235),
     progress_top: Color32::from_rgb(158, 200, 250),
@@ -217,9 +220,10 @@ pub fn tab_bar<T: Copy + PartialEq>(
         egui::Rect::from_min_max(egui::pos2(x0, baseline - strip_h), egui::pos2(x1, baseline));
     vertical_gradient(p, strip, s.tab_strip_top, s.tab_strip_bottom);
     p.hline(x0..=x1, strip.min.y, border);
+    let divider = Stroke::new(1.0, s.tab_divider);
     for (i, (value, _, _)) in items.iter().enumerate() {
         if *current != *value {
-            p.vline(rects[i].max.x, strip.min.y..=baseline, border);
+            p.vline(rects[i].max.x, strip.min.y..=baseline, divider);
         }
     }
     // Continuous baseline under the whole bar…
