@@ -737,6 +737,7 @@ impl OffgridApp {
                     let resp = ui.add_sized(
                         [ui.available_width() - 88.0, input_h],
                         egui::TextEdit::multiline(&mut self.input)
+                            .desired_rows(2) // keep intrinsic height below add_sized's
                             .hint_text("Type a message… (Enter to send, Shift+Enter for newline)"),
                     );
                     let send_key = resp.has_focus()

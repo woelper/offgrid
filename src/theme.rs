@@ -26,7 +26,10 @@ pub struct Skin {
     pub title: Color32,
     #[allow(dead_code)]
     pub title_border: Color32,
-    pub tab_inactive: Color32,
+    /// Vertical gradients for the tab strip and the active tab.
+    pub tab_strip_top: Color32,
+    pub tab_strip_bottom: Color32,
+    pub tab_active_top: Color32,
     /// Primary accent (links, checkbox marks, selection stroke).
     pub accent: Color32,
     pub selection: Color32,
@@ -53,7 +56,9 @@ pub const HAIKU: Skin = Skin {
     window_border: Color32::from_rgb(80, 80, 80),
     title: Color32::from_rgb(255, 203, 0),
     title_border: Color32::from_rgb(120, 90, 0),
-    tab_inactive: Color32::from_rgb(202, 202, 202),
+    tab_strip_top: Color32::from_rgb(214, 214, 214),
+    tab_strip_bottom: Color32::from_rgb(194, 194, 194),
+    tab_active_top: Color32::from_rgb(235, 235, 235),
     accent: Color32::from_rgb(51, 102, 152),
     selection: Color32::from_rgb(170, 200, 235),
     progress_top: Color32::from_rgb(158, 200, 250),
@@ -202,33 +207,33 @@ pub fn tab_bar<T: Copy + PartialEq>(
     };
     let border = Stroke::new(1.0, s.control_border);
     let p = ui.painter();
-    // The inactive area is a continuous full-width strip; inactive tabs are
-    // just segments of it, divided by vertical lines (like Haiku's BTabView).
+    // The inactive area is a continuous strip running from window edge to
+    // window edge (past the panel's inner margin); inactive tabs are just
+    // segments of it, divided by vertical lines (like Haiku's BTabView).
+    let x0 = ui.clip_rect().min.x;
+    let x1 = ui.clip_rect().max.x;
     let strip_h = bar_h - 7.0;
-    let strip = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.min.x, baseline - strip_h),
-        egui::pos2(bar_rect.max.x, baseline),
-    );
-    p.rect_filled(strip, 0.0, s.tab_inactive);
-    p.hline(strip.min.x..=strip.max.x, strip.min.y, border);
-    gloss(ui, strip);
+    let strip =
+        egui::Rect::from_min_max(egui::pos2(x0, baseline - strip_h), egui::pos2(x1, baseline));
+    vertical_gradient(p, strip, s.tab_strip_top, s.tab_strip_bottom);
+    p.hline(x0..=x1, strip.min.y, border);
     for (i, (value, _, _)) in items.iter().enumerate() {
         if *current != *value {
             p.vline(rects[i].max.x, strip.min.y..=baseline, border);
         }
     }
     // Continuous baseline under the whole bar…
-    p.hline(bar_rect.min.x..=bar_rect.max.x, baseline, border);
+    p.hline(x0..=x1, baseline, border);
     // …then the active tab painted over it, borderless at the bottom.
     if let Some(i) = items.iter().position(|(v, _, _)| *v == *current) {
         let r = rects[i];
-        p.rect(r, radius, s.panel, border, StrokeKind::Inside);
+        vertical_gradient(p, r.shrink(0.5), s.tab_active_top, s.panel);
+        p.rect(r, radius, Color32::TRANSPARENT, border, StrokeKind::Inside);
         p.hline(
             (r.min.x + 1.0)..=(r.max.x - 1.0),
             r.max.y - 0.5,
             Stroke::new(1.5, s.panel),
         );
-        gloss(ui, r);
     }
     for (i, _) in items.iter().enumerate() {
         let r = rects[i];
