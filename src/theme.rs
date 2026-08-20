@@ -168,7 +168,7 @@ pub fn tab_bar<T: Copy + PartialEq>(
 ) {
     let s = skin();
     let bar_h = 30.0;
-    let pad = 10.0;
+    let pad = 15.0;
     let icon_s = 18.0;
     let gap = 6.0;
     let full_w = ui.available_width();
