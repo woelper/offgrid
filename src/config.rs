@@ -10,6 +10,7 @@ pub struct Config {
     pub server_port: Option<u16>,
     pub workspace: Option<PathBuf>,
     pub web_tools: bool,
+    pub skin: Option<String>,
 }
 
 fn config_path() -> Option<PathBuf> {

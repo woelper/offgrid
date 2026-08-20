@@ -2,12 +2,57 @@
 //! app uses; `SkinKind` selects one (Haiku is the only skin today — add a
 //! variant + const to introduce another look).
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use eframe::egui::{self, Color32, CornerRadius, Stroke, StrokeKind};
 
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum SkinKind {
     #[default]
     Haiku,
+    EguiDefault,
+}
+
+impl SkinKind {
+    pub const ALL: [SkinKind; 2] = [SkinKind::Haiku, SkinKind::EguiDefault];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SkinKind::Haiku => "Haiku",
+            SkinKind::EguiDefault => "egui default",
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            SkinKind::Haiku => "haiku",
+            SkinKind::EguiDefault => "egui",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Self {
+        match id {
+            "egui" => SkinKind::EguiDefault,
+            _ => SkinKind::Haiku,
+        }
+    }
+}
+
+static ACTIVE_SKIN: AtomicU8 = AtomicU8::new(0);
+
+pub fn kind() -> SkinKind {
+    match ACTIVE_SKIN.load(Ordering::Relaxed) {
+        1 => SkinKind::EguiDefault,
+        _ => SkinKind::Haiku,
+    }
+}
+
+pub fn set_kind(kind: SkinKind) {
+    let v = match kind {
+        SkinKind::Haiku => 0,
+        SkinKind::EguiDefault => 1,
+    };
+    ACTIVE_SKIN.store(v, Ordering::Relaxed);
 }
 
 pub struct Skin {
@@ -76,10 +121,46 @@ pub const HAIKU: Skin = Skin {
     control_height: 30.0,
 };
 
+/// Skin values matching egui's stock dark theme, so the custom widgets
+/// (tabs, checkboxes, progress bar) blend in when the Haiku look is off.
+pub const EGUI_DEFAULT: Skin = Skin {
+    panel: Color32::from_gray(27),
+    faint: Color32::from_gray(36),
+    control: Color32::from_gray(60),
+    control_border: Color32::from_gray(85),
+    control_border_hover: Color32::from_gray(150),
+    window_border: Color32::from_gray(60),
+    title: Color32::from_gray(60),
+    title_border: Color32::from_gray(90),
+    tab_strip_top: Color32::from_gray(34),
+    tab_strip_bottom: Color32::from_gray(22),
+    tab_active_top: Color32::from_gray(40),
+    tab_divider: Color32::from_gray(55),
+    accent: Color32::from_rgb(110, 170, 255),
+    selection: Color32::from_rgb(0, 92, 128),
+    progress_top: Color32::from_rgb(110, 170, 255),
+    progress_bottom: Color32::from_rgb(40, 90, 180),
+    good: Color32::from_rgb(120, 210, 120),
+    warn: Color32::from_rgb(255, 190, 80),
+    bad: Color32::from_rgb(255, 110, 110),
+    button_radius: 4,
+    button_padding: egui::Vec2::new(8.0, 4.0),
+    tab_radius: 4,
+    control_height: 26.0,
+};
+
 pub fn skin() -> &'static Skin {
-    match SkinKind::default() {
+    match kind() {
         SkinKind::Haiku => &HAIKU,
+        SkinKind::EguiDefault => &EGUI_DEFAULT,
     }
+}
+
+/// Text color for custom-painted widgets, respecting the active style.
+fn text_color(ui: &egui::Ui) -> Color32 {
+    ui.visuals()
+        .override_text_color
+        .unwrap_or_else(|| ui.visuals().strong_text_color())
 }
 
 /// System font of the skin (Noto Sans = Haiku's UI font), mono for code.
@@ -109,6 +190,26 @@ fn install_fonts(ctx: &egui::Context) {
 }
 
 pub fn apply(ctx: &egui::Context) {
+    if kind() == SkinKind::EguiDefault {
+        // Stock egui: default fonts, default dark style.
+        ctx.set_fonts(egui::FontDefinitions::default());
+        ctx.set_style_of(
+            egui::Theme::Light,
+            egui::Style {
+                visuals: egui::Visuals::light(),
+                ..Default::default()
+            },
+        );
+        ctx.set_style_of(
+            egui::Theme::Dark,
+            egui::Style {
+                visuals: egui::Visuals::dark(),
+                ..Default::default()
+            },
+        );
+        ctx.set_theme(egui::Theme::Dark);
+        return;
+    }
     let s = skin();
     install_fonts(ctx);
     ctx.set_theme(egui::Theme::Light);
@@ -180,7 +281,7 @@ pub fn tab_bar<T: Copy + PartialEq>(
         .iter()
         .map(|(_, _, label)| {
             ui.painter()
-                .layout_no_wrap(label.to_string(), font.clone(), Color32::BLACK)
+                .layout_no_wrap(label.to_string(), font.clone(), text_color(ui))
         })
         .collect();
 
@@ -255,7 +356,7 @@ pub fn tab_bar<T: Copy + PartialEq>(
                 r.center().y - galleys[i].size().y / 2.0,
             ),
             galleys[i].clone(),
-            Color32::BLACK,
+            text_color(ui),
         );
     }
 }
@@ -268,7 +369,7 @@ pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Res
     let galley = ui.painter().layout_no_wrap(
         label.to_string(),
         egui::FontId::proportional(14.0),
-        Color32::BLACK,
+        text_color(ui),
     );
     let desired = egui::vec2(
         box_s + gap + galley.size().x,
@@ -292,7 +393,7 @@ pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Res
     p.rect(
         box_rect,
         CornerRadius::same(2),
-        Color32::WHITE,
+        ui.visuals().extreme_bg_color,
         Stroke::new(1.0, border),
         StrokeKind::Inside,
     );
@@ -308,7 +409,7 @@ pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Res
             rect.center().y - galley.size().y / 2.0,
         ),
         galley,
-        Color32::BLACK,
+        text_color(ui),
     );
     resp
 }
@@ -409,7 +510,7 @@ pub fn progress_bar(ui: &mut egui::Ui, frac: f32) {
     p.rect(
         rect,
         CornerRadius::same(1),
-        Color32::WHITE,
+        ui.visuals().extreme_bg_color,
         Stroke::new(1.0, s.control_border),
         StrokeKind::Inside,
     );

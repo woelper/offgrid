@@ -36,6 +36,8 @@ const ICON_CODE: egui::ImageSource<'static> =
 const ICON_FILE: egui::ImageSource<'static> = egui::include_image!("../assets/icons/File_Text.png");
 const ICON_FOLDER: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/Folder_generic.png");
+const ICON_SETTINGS: egui::ImageSource<'static> =
+    egui::include_image!("../assets/icons/Prefs_Appearance.png");
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -43,6 +45,7 @@ enum Tab {
     Chat,
     Code,
     Serve,
+    Settings,
 }
 
 fn tool_icon(name: &str) -> egui::ImageSource<'static> {
@@ -118,10 +121,13 @@ pub struct OffgridApp {
 
 impl OffgridApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let config = Config::load();
+        if let Some(skin) = &config.skin {
+            theme::set_kind(theme::SkinKind::from_id(skin));
+        }
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let hardware = HardwareProfile::detect();
-        let config = Config::load();
         let models_dir = models_dir();
         let _ = std::fs::create_dir_all(&models_dir);
         let (hub_tx, hub_rx) = std::sync::mpsc::channel();
@@ -455,8 +461,35 @@ impl OffgridApp {
                 (Tab::Chat, ICON_CHAT, "Chat"),
                 (Tab::Code, ICON_CODE, "Code"),
                 (Tab::Serve, ICON_SERVE, "Serve"),
+                (Tab::Settings, ICON_SETTINGS, "Settings"),
             ],
         );
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        theme::group(ui, "Appearance", Some(ICON_SETTINGS), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("UI style:");
+                let mut selected = theme::kind();
+                egui::ComboBox::from_id_salt("skin_select")
+                    .selected_text(selected.label())
+                    .show_ui(ui, |ui| {
+                        for kind in theme::SkinKind::ALL {
+                            ui.selectable_value(&mut selected, kind, kind.label());
+                        }
+                    });
+                if selected != theme::kind() {
+                    theme::set_kind(selected);
+                    theme::apply(ui.ctx());
+                    self.config.skin = Some(selected.id().to_string());
+                    self.config.save();
+                }
+            });
+            ui.weak(
+                "Haiku is offgrid's native look. \"egui default\" is the stock egui \
+                 dark theme with its default fonts.",
+            );
+        });
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
@@ -1135,6 +1168,7 @@ impl eframe::App for OffgridApp {
             Tab::Chat => self.chat_ui(ui),
             Tab::Code => self.code_ui(ui),
             Tab::Serve => self.serve_ui(ui),
+            Tab::Settings => self.settings_ui(ui),
         });
 
         let busy = self.generating
@@ -1462,6 +1496,7 @@ mod tests {
                         (Tab::Chat, ICON_CHAT, "Chat"),
                         (Tab::Code, ICON_CODE, "Code"),
                         (Tab::Serve, ICON_SERVE, "Serve"),
+                        (Tab::Settings, ICON_SETTINGS, "Settings"),
                     ],
                 );
             });
