@@ -37,7 +37,7 @@ const ICON_FILE: egui::ImageSource<'static> = egui::include_image!("../assets/ic
 const ICON_FOLDER: egui::ImageSource<'static> =
     egui::include_image!("../assets/icons/Folder_generic.png");
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Models,
     Chat,
@@ -436,7 +436,7 @@ impl OffgridApp {
                 ui.spinner();
                 ui.label("loading model…");
             } else if let Some(name) = &self.loaded_model {
-                ui.colored_label(theme::GOOD_GREEN, name);
+                ui.colored_label(theme::skin().good, name);
                 if ui.small_button("Unload").clicked() {
                     let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
                 }
@@ -445,21 +445,16 @@ impl OffgridApp {
             }
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if theme::tab(ui, ICON_DISK, "Models", self.tab == Tab::Models).clicked() {
-                self.tab = Tab::Models;
-            }
-            if theme::tab(ui, ICON_CHAT, "Chat", self.tab == Tab::Chat).clicked() {
-                self.tab = Tab::Chat;
-            }
-            if theme::tab(ui, ICON_CODE, "Code", self.tab == Tab::Code).clicked() {
-                self.tab = Tab::Code;
-            }
-            if theme::tab(ui, ICON_SERVE, "Serve", self.tab == Tab::Serve).clicked() {
-                self.tab = Tab::Serve;
-            }
-        });
+        theme::tab_bar(
+            ui,
+            &mut self.tab,
+            &[
+                (Tab::Models, ICON_DISK, "Models"),
+                (Tab::Chat, ICON_CHAT, "Chat"),
+                (Tab::Code, ICON_CODE, "Code"),
+                (Tab::Serve, ICON_SERVE, "Serve"),
+            ],
+        );
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
@@ -495,7 +490,7 @@ impl OffgridApp {
                             theme::icon(ui, ICON_DISK, 16.0);
                             ui.add(egui::Label::new(&model.name).truncate());
                             if loaded {
-                                ui.colored_label(theme::GOOD_GREEN, "•");
+                                ui.colored_label(theme::skin().good, "•");
                             }
                         },
                         model.size,
@@ -545,7 +540,7 @@ impl OffgridApp {
                             egui::ProgressBar::new(frac)
                                 .desired_width(340.0)
                                 .desired_height(14.0)
-                                .fill(theme::PROGRESS_BLUE)
+                                .fill(theme::skin().progress)
                                 .corner_radius(egui::CornerRadius::same(2))
                                 .text(format!(
                                     "{} / {} · {}/s · {}",
@@ -768,8 +763,8 @@ impl OffgridApp {
                 .show(ui, |ui| {
                     for msg in &self.messages {
                         let (label, color) = match msg.role {
-                            Role::User => ("You", theme::DESKTOP_BLUE),
-                            Role::Assistant => ("Model", theme::GOOD_GREEN),
+                            Role::User => ("You", theme::skin().accent),
+                            Role::Assistant => ("Model", theme::skin().good),
                             Role::System => ("System", egui::Color32::GRAY),
                         };
                         ui.colored_label(color, label);
@@ -845,7 +840,7 @@ impl OffgridApp {
                 }
                 match self.workspace_path() {
                     Some(ws) => {
-                        ui.colored_label(theme::GOOD_GREEN, "✔");
+                        ui.colored_label(theme::skin().good, "✔");
                         if !ws.join("AGENTS.md").exists()
                             && ui
                                 .button("Create AGENTS.md")
@@ -861,7 +856,7 @@ impl OffgridApp {
                     }
                     None => {
                         if !self.workspace_input.trim().is_empty() {
-                            ui.colored_label(theme::BAD_RED, "not a folder");
+                            ui.colored_label(theme::skin().bad, "not a folder");
                         }
                     }
                 }
@@ -920,7 +915,7 @@ impl OffgridApp {
                         ui.weak(format!("{:.1} tok/s", self.live_tokens as f32 / secs));
                     }
                 }
-                ui.checkbox(&mut self.agent_auto_approve, "auto-approve commands")
+                theme::checkbox(ui, &mut self.agent_auto_approve, "auto-approve commands")
                     .on_hover_text("Run shell commands without asking (applies to the next run)");
                 if ui
                     .checkbox(&mut self.config.web_tools, "allow web tools")
@@ -946,7 +941,7 @@ impl OffgridApp {
                 }
             });
             if self.loaded_model.is_none() {
-                ui.colored_label(theme::WARN_AMBER, "Load a model in the Models tab first.");
+                ui.colored_label(theme::skin().warn, "Load a model in the Models tab first.");
             }
         });
 
@@ -958,12 +953,12 @@ impl OffgridApp {
                 for (i, item) in self.agent_transcript.iter().enumerate() {
                     match item {
                         AgentItem::Task(t) => {
-                            ui.colored_label(theme::DESKTOP_BLUE, "Task");
+                            ui.colored_label(theme::skin().accent, "Task");
                             ui.label(t);
                             ui.add_space(6.0);
                         }
                         AgentItem::Assistant(text) => {
-                            ui.colored_label(theme::GOOD_GREEN, "Model");
+                            ui.colored_label(theme::skin().good, "Model");
                             render_message(ui, &mut self.md_cache, text);
                             ui.add_space(6.0);
                         }
@@ -998,12 +993,12 @@ impl OffgridApp {
                     }
                 }
                 if !self.agent_current.is_empty() {
-                    ui.colored_label(theme::GOOD_GREEN, "Model");
+                    ui.colored_label(theme::skin().good, "Model");
                     render_message(ui, &mut self.md_cache, &self.agent_current);
                 }
                 if let Some((command, _)) = &self.agent_approval {
                     egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, theme::WARN_AMBER))
+                        .stroke(egui::Stroke::new(1.0, theme::skin().warn))
                         .corner_radius(egui::CornerRadius::same(3))
                         .inner_margin(8.0)
                         .show(ui, |ui| {
@@ -1054,12 +1049,12 @@ impl OffgridApp {
 
             if self.api_server.is_some() {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::GOOD_GREEN, "• running");
+                    ui.colored_label(theme::skin().good, "• running");
                     ui.monospace(format!("http://127.0.0.1:{}/v1", self.server_port()));
                 });
                 if self.loaded_model.is_none() {
                     ui.colored_label(
-                        theme::WARN_AMBER,
+                        theme::skin().warn,
                         "No model loaded — requests will fail until you load one.",
                     );
                 }
@@ -1137,7 +1132,7 @@ impl eframe::App for OffgridApp {
         if let Some(err) = self.last_error.clone() {
             egui::Panel::bottom("error_bar").show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(theme::BAD_RED, &err);
+                    ui.colored_label(theme::skin().bad, &err);
                     if ui.small_button("✕").clicked() {
                         self.last_error = None;
                     }
@@ -1403,7 +1398,7 @@ mod tests {
             egui::pos2(win.min.x, win.min.y - tab_h + 1.0),
             egui::vec2(170.0, tab_h),
         );
-        let tab_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 90, 0));
+        let tab_stroke = egui::Stroke::new(1.0, theme::skin().title_border);
         ui.painter().rect(
             tab,
             egui::CornerRadius {
@@ -1412,7 +1407,7 @@ mod tests {
                 sw: 0,
                 se: 0,
             },
-            theme::TAB_YELLOW,
+            theme::skin().title,
             tab_stroke,
             egui::StrokeKind::Inside,
         );
@@ -1436,8 +1431,8 @@ mod tests {
         );
 
         let frame = egui::Frame::new()
-            .fill(theme::PANEL)
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80)))
+            .fill(theme::skin().panel)
+            .stroke(egui::Stroke::new(1.0, theme::skin().window_border))
             .shadow(egui::Shadow {
                 offset: [4, 6],
                 blur: 18,
@@ -1463,17 +1458,21 @@ mod tests {
                 ui.separator();
                 ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
                 ui.separator();
-                ui.colored_label(theme::GOOD_GREEN, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
+                ui.colored_label(theme::skin().good, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
                 let _ = ui.small_button("Unload");
             });
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let _ = theme::tab(ui, ICON_DISK, "Models", true);
-                let _ = theme::tab(ui, ICON_CHAT, "Chat", false);
-                let _ = theme::tab(ui, ICON_CODE, "Code", false);
-                let _ = theme::tab(ui, ICON_SERVE, "Serve", false);
-            });
+            let mut tab = Tab::Models;
+            theme::tab_bar(
+                ui,
+                &mut tab,
+                &[
+                    (Tab::Models, ICON_DISK, "Models"),
+                    (Tab::Chat, ICON_CHAT, "Chat"),
+                    (Tab::Code, ICON_CODE, "Code"),
+                    (Tab::Serve, ICON_SERVE, "Serve"),
+                ],
+            );
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1491,7 +1490,7 @@ mod tests {
                             theme::icon(ui, ICON_DISK, 16.0);
                             ui.add(egui::Label::new(name).truncate());
                             if loaded {
-                                ui.colored_label(theme::GOOD_GREEN, "•");
+                                ui.colored_label(theme::skin().good, "•");
                             }
                         },
                         size,

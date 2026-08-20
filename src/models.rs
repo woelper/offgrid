@@ -26,9 +26,9 @@ impl Fit {
 
     pub fn badge(self) -> (&'static str, egui::Color32) {
         match self {
-            Fit::Fits => ("fits", crate::theme::GOOD_GREEN),
-            Fit::Tight => ("tight", crate::theme::WARN_AMBER),
-            Fit::TooBig => ("too big", crate::theme::BAD_RED),
+            Fit::Fits => ("fits", crate::theme::skin().good),
+            Fit::Tight => ("tight", crate::theme::skin().warn),
+            Fit::TooBig => ("too big", crate::theme::skin().bad),
         }
     }
 }
@@ -66,28 +66,28 @@ pub fn quant_tag(name: &str) -> QuantTag {
     if has("IQ1") {
         QuantTag {
             label: "very low quality",
-            color: crate::theme::BAD_RED,
+            color: crate::theme::skin().bad,
             pref: 40,
             desc: "Severely degraded — expect broken output. Avoid unless nothing else fits.",
         }
     } else if has("IQ2") || has("Q2_") || n.ends_with("Q2") {
         QuantTag {
             label: "low quality",
-            color: crate::theme::WARN_AMBER,
+            color: crate::theme::skin().warn,
             pref: 30,
             desc: "Noticeably degraded. A last resort for RAM-starved machines.",
         }
     } else if has("IQ3") || has("Q3_") {
         QuantTag {
             label: "reduced quality",
-            color: crate::theme::WARN_AMBER,
+            color: crate::theme::skin().warn,
             pref: 12,
             desc: "A compromise when Q4 doesn't fit: quality dips but stays usable.",
         }
     } else if has("Q4_K_M") {
         QuantTag {
             label: "recommended",
-            color: crate::theme::GOOD_GREEN,
+            color: crate::theme::skin().good,
             pref: 0,
             desc: "The sweet spot: ~95% of full quality at about a third of the size. \
                    Take this one if it fits.",
@@ -95,14 +95,14 @@ pub fn quant_tag(name: &str) -> QuantTag {
     } else if has("IQ4") || has("Q4_") {
         QuantTag {
             label: "good",
-            color: crate::theme::GOOD_GREEN,
+            color: crate::theme::skin().good,
             pref: 2,
             desc: "Nearly as good as Q4_K_M — a fine choice if that variant is missing or too big.",
         }
     } else if has("Q5_") {
         QuantTag {
             label: "high quality",
-            color: crate::theme::GOOD_GREEN,
+            color: crate::theme::skin().good,
             pref: 5,
             desc: "Slightly better than Q4 for noticeably more RAM and slower generation. \
                    Only if you have room to spare.",
@@ -110,7 +110,7 @@ pub fn quant_tag(name: &str) -> QuantTag {
     } else if has("Q6_") || has("Q6K") {
         QuantTag {
             label: "near-lossless",
-            color: crate::theme::DESKTOP_BLUE,
+            color: crate::theme::skin().accent,
             pref: 8,
             desc: "Practically indistinguishable from the original — big and slow on CPU, \
                    rarely worth it.",
@@ -118,7 +118,7 @@ pub fn quant_tag(name: &str) -> QuantTag {
     } else if has("Q8_") {
         QuantTag {
             label: "near-lossless",
-            color: crate::theme::DESKTOP_BLUE,
+            color: crate::theme::skin().accent,
             pref: 10,
             desc: "Practically indistinguishable from the original — big and slow on CPU, \
                    rarely worth it.",
