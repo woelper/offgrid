@@ -40,6 +40,8 @@ pub struct Skin {
     pub button_radius: u8,
     pub button_padding: egui::Vec2,
     pub tab_radius: u8,
+    /// Height for single-line inputs so they line up with buttons.
+    pub control_height: f32,
 }
 
 pub const HAIKU: Skin = Skin {
@@ -51,7 +53,7 @@ pub const HAIKU: Skin = Skin {
     window_border: Color32::from_rgb(80, 80, 80),
     title: Color32::from_rgb(255, 203, 0),
     title_border: Color32::from_rgb(120, 90, 0),
-    tab_inactive: Color32::from_rgb(199, 199, 199),
+    tab_inactive: Color32::from_rgb(202, 202, 202),
     accent: Color32::from_rgb(51, 102, 152),
     selection: Color32::from_rgb(170, 200, 235),
     progress_top: Color32::from_rgb(158, 200, 250),
@@ -63,6 +65,7 @@ pub const HAIKU: Skin = Skin {
     button_radius: 2,
     button_padding: egui::Vec2::new(12.0, 6.0),
     tab_radius: 3,
+    control_height: 30.0,
 };
 
 pub fn skin() -> &'static Skin {
@@ -199,9 +202,19 @@ pub fn tab_bar<T: Copy + PartialEq>(
     };
     let border = Stroke::new(1.0, s.control_border);
     let p = ui.painter();
+    // The inactive area is a continuous full-width strip; inactive tabs are
+    // just segments of it, divided by vertical lines (like Haiku's BTabView).
+    let strip_h = bar_h - 7.0;
+    let strip = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.min.x, baseline - strip_h),
+        egui::pos2(bar_rect.max.x, baseline),
+    );
+    p.rect_filled(strip, 0.0, s.tab_inactive);
+    p.hline(strip.min.x..=strip.max.x, strip.min.y, border);
+    gloss(ui, strip);
     for (i, (value, _, _)) in items.iter().enumerate() {
         if *current != *value {
-            p.rect(rects[i], radius, s.tab_inactive, border, StrokeKind::Inside);
+            p.vline(rects[i].max.x, strip.min.y..=baseline, border);
         }
     }
     // Continuous baseline under the whole bar…
@@ -215,9 +228,7 @@ pub fn tab_bar<T: Copy + PartialEq>(
             r.max.y - 0.5,
             Stroke::new(1.5, s.panel),
         );
-    }
-    for r in &rects {
-        gloss(ui, *r);
+        gloss(ui, r);
     }
     for (i, _) in items.iter().enumerate() {
         let r = rects[i];

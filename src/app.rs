@@ -465,7 +465,7 @@ impl OffgridApp {
     }
 
     fn download_button(ui: &mut egui::Ui) -> bool {
-        theme::button(ui, Some((ICON_DOWNLOAD, 18.0)), "Download").clicked()
+        theme::button(ui, Some((ICON_DOWNLOAD, 22.0)), "Download").clicked()
     }
 
     fn models_ui(&mut self, ui: &mut egui::Ui) {
@@ -587,11 +587,22 @@ impl OffgridApp {
 
             theme::group(ui, "Search Hugging Face", Some(ICON_SEARCH), |ui| {
                 ui.horizontal(|ui| {
-                    let resp = ui.text_edit_singleline(&mut self.search_query);
+                    let h = theme::skin().control_height;
+                    let resp = ui.add_sized(
+                        [320.0, h],
+                        egui::TextEdit::singleline(&mut self.search_query),
+                    );
                     let submitted =
                         resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let search_clicked =
-                        theme::button(ui, Some((ICON_SEARCH, 14.0)), "Search").clicked();
+                    let search = ui.add_sized(
+                        [0.0, h],
+                        egui::Button::image_and_text(
+                            egui::Image::new(ICON_SEARCH).fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                            "Search",
+                        ),
+                    );
+                    theme::gloss(ui, search.rect);
+                    let search_clicked = search.clicked();
                     if (search_clicked || submitted) && !self.search_query.trim().is_empty() {
                         self.search_pending = true;
                         self.search_results.clear();
@@ -696,45 +707,51 @@ impl OffgridApp {
         egui::Panel::bottom("chat_input")
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(8.0))
             .show(ui, |ui| {
-                if self.generating {
-                    if let Some(start) = self.live_start {
-                        let secs = start.elapsed().as_secs_f32().max(0.001);
-                        ui.weak(format!(
-                            "generating… {:.1} tok/s · {} tokens",
-                            self.live_tokens as f32 / secs,
-                            self.live_tokens
-                        ));
+                ui.horizontal(|ui| {
+                    if self.generating {
+                        ui.spinner();
+                        if let Some(start) = self.live_start {
+                            let secs = start.elapsed().as_secs_f32().max(0.001);
+                            ui.weak(format!(
+                                "generating… {:.1} tok/s · {} tokens",
+                                self.live_tokens as f32 / secs,
+                                self.live_tokens
+                            ));
+                        }
+                    } else if let Some(stats) = &self.gen_stats {
+                        ui.weak(stats.clone());
                     }
-                } else if let Some(stats) = &self.gen_stats {
-                    ui.weak(stats.clone());
-                }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.generating
+                            && !self.messages.is_empty()
+                            && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
+                                .on_hover_text("Start a fresh conversation")
+                                .clicked()
+                        {
+                            self.messages.clear();
+                        }
+                    });
+                });
+                let input_h = 60.0;
                 ui.horizontal(|ui| {
                     let resp = ui.add_sized(
-                        [ui.available_width() - 80.0, 60.0],
+                        [ui.available_width() - 88.0, input_h],
                         egui::TextEdit::multiline(&mut self.input)
                             .hint_text("Type a message… (Enter to send, Shift+Enter for newline)"),
                     );
                     let send_key = resp.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                    ui.vertical(|ui| {
-                        if self.generating {
-                            if theme::button(ui, None, "Stop").clicked() {
-                                self.llm.stop.store(true, Ordering::Relaxed);
-                            }
-                            ui.spinner();
-                        } else {
-                            if theme::button(ui, None, "Send").clicked() || send_key {
-                                self.send_chat();
-                            }
-                            if !self.messages.is_empty()
-                                && theme::button(ui, Some((ICON_TRASH, 14.0)), "Clear history")
-                                    .on_hover_text("Start a fresh conversation")
-                                    .clicked()
-                            {
-                                self.messages.clear();
-                            }
+                    // The button matches the input's full height.
+                    let label = if self.generating { "Stop" } else { "Send" };
+                    let action = ui.add_sized([80.0, input_h], egui::Button::new(label));
+                    theme::gloss(ui, action.rect);
+                    if self.generating {
+                        if action.clicked() {
+                            self.llm.stop.store(true, Ordering::Relaxed);
                         }
-                    });
+                    } else if action.clicked() || send_key {
+                        self.send_chat();
+                    }
                 });
             });
 
@@ -1509,7 +1526,7 @@ mod tests {
                         size,
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
-                            let _ = theme::button(ui, Some((ICON_DOWNLOAD, 18.0)), "Download");
+                            let _ = theme::button(ui, Some((ICON_DOWNLOAD, 22.0)), "Download");
                         },
                     );
                 }
