@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev
+
+      - name: rustfmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --check
+
+      - name: clippy
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Debug profile: the release profile uses panic=abort, which the libtest
+      # harness cannot run. The snapshot test is skipped — its baseline is
+      # rendered on the dev machine's GPU and differs on CI rasterizers.
+      - name: tests
+        run: cargo test -- --skip main_screen_snapshot

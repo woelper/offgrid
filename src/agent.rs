@@ -964,20 +964,38 @@ mod tests {
     }
 
     #[test]
-    fn run_command_captures_output_and_exit_code() {
+    fn run_command_captures_output() {
         let ws = std::env::temp_dir();
         let out = run_command_with_timeout("echo hello", &ws, 10).unwrap();
         assert!(out.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_captures_stderr_and_exit_code() {
+        let ws = std::env::temp_dir();
         let out = run_command_with_timeout("echo oops >&2; exit 3", &ws, 10).unwrap();
         assert!(out.contains("[stderr]"));
         assert!(out.contains("oops"));
         assert!(out.contains("[exit code: 3]"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn run_command_captures_exit_code() {
+        let ws = std::env::temp_dir();
+        let out = run_command_with_timeout("exit /b 3", &ws, 10).unwrap();
+        assert!(out.contains("[exit code: 3]"));
+    }
+
     #[test]
     fn run_command_times_out() {
         let ws = std::env::temp_dir();
-        let err = run_command_with_timeout("sleep 30", &ws, 1).unwrap_err();
+        #[cfg(unix)]
+        let cmd = "sleep 30";
+        #[cfg(windows)]
+        let cmd = "ping -n 31 127.0.0.1 > nul";
+        let err = run_command_with_timeout(cmd, &ws, 1).unwrap_err();
         assert!(err.contains("timed out"));
     }
 
