@@ -937,6 +937,99 @@ mod tests {
         assert!(!compact_transcript(&mut messages)); // second pass: nothing left to trim
     }
 
+    /// End-to-end proof that the agent loop uses web tools: a scripted fake
+    /// LLM calls fetch_url against a local web server, and the page content
+    /// must flow back into the conversation. Loopback only — CI-safe.
+    #[test]
+    fn agent_loop_uses_web_tools() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // Tiny local server standing in for the internet.
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let served = Arc::new(AtomicBool::new(false));
+        let served_flag = served.clone();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                served_flag.store(true, Ordering::SeqCst);
+                let _ = req.respond(tiny_http::Response::from_string(
+                    "<html><body>hello from the fake web</body></html>",
+                ));
+            }
+        });
+
+        // Scripted "model": turn 1 calls fetch_url, turn 2 finishes — and
+        // records whether the tool result made it into its transcript.
+        let result_reached_model = Arc::new(AtomicBool::new(false));
+        let reached = result_reached_model.clone();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<LlmCmd>();
+        std::thread::spawn(move || {
+            let mut turn = 0;
+            for cmd in cmd_rx {
+                if let LlmCmd::Generate {
+                    messages, reply, ..
+                } = cmd
+                {
+                    turn += 1;
+                    let text = if turn == 1 {
+                        format!(
+                            "<tool_call>{{\"name\": \"fetch_url\", \"arguments\": \
+                             {{\"url\": \"http://127.0.0.1:{port}/\"}}}}</tool_call>"
+                        )
+                    } else {
+                        if messages
+                            .iter()
+                            .any(|m| m.content.contains("hello from the fake web"))
+                        {
+                            reached.store(true, Ordering::SeqCst);
+                        }
+                        "Done: the page says hello.".to_string()
+                    };
+                    let _ = reply.send(LlmEvent::Token(text));
+                    let _ = reply.send(LlmEvent::GenDone);
+                }
+            }
+        });
+
+        let run = start(
+            std::env::temp_dir(),
+            "check the fake web".into(),
+            cmd_tx,
+            true,
+            true, // web tools enabled
+        );
+        let mut saw_call = false;
+        let mut saw_result = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = run.rx.recv_timeout(remaining).expect("agent run timed out");
+            match event {
+                AgentEvent::ToolCall { name, .. } if name == "fetch_url" => saw_call = true,
+                AgentEvent::ToolResult { output } => {
+                    saw_result = output.contains("hello from the fake web");
+                }
+                AgentEvent::Done { .. } => break,
+                AgentEvent::Error(e) => panic!("agent error: {e}"),
+                _ => {}
+            }
+        }
+        assert!(saw_call, "the agent never called fetch_url");
+        assert!(
+            served.load(Ordering::SeqCst),
+            "the web server was never hit"
+        );
+        assert!(
+            saw_result,
+            "the page content did not appear in the tool result"
+        );
+        assert!(
+            result_reached_model.load(Ordering::SeqCst),
+            "the tool result was not fed back to the model"
+        );
+    }
+
     #[test]
     fn fetch_url_degrades_gracefully_offline() {
         // .invalid never resolves — DNS fails fast, like being offline.
