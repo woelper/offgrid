@@ -84,7 +84,7 @@ pub struct OffgridApp {
     search_pending: bool,
     last_search: Option<String>,
     search_results: Vec<RepoResult>,
-    repo_files: HashMap<String, Vec<RepoFile>>,
+    repo_files: HashMap<String, (Vec<RepoFile>, bool)>,
     files_pending: HashSet<String>,
     downloads: Vec<ActiveDownload>,
 
@@ -246,10 +246,14 @@ impl OffgridApp {
                     self.search_results = results;
                     self.search_pending = false;
                 }
-                Ok(HubEvent::Files { repo, mut files }) => {
+                Ok(HubEvent::Files {
+                    repo,
+                    mut files,
+                    only_multipart,
+                }) => {
                     self.files_pending.remove(&repo);
                     files.sort_by_key(|f| f.size);
-                    self.repo_files.insert(repo, files);
+                    self.repo_files.insert(repo, (files, only_multipart));
                 }
                 Ok(HubEvent::Error(e)) => {
                     self.search_pending = false;
@@ -674,15 +678,17 @@ impl OffgridApp {
                     ))
                     .show(ui, |ui| {
                         match self.repo_files.get(&repo.id).cloned() {
-                            Some(files) => {
+                            Some((files, only_multipart)) => {
                                 if files.is_empty() {
-                                    ui.weak("no .gguf files in this repo");
+                                    if only_multipart {
+                                        ui.weak(
+                                            "This repo only contains multi-part models                                              (too large to download as a single file) —                                              offgrid can't use them.",
+                                        );
+                                    } else {
+                                        ui.weak("No usable GGUF model files in this repo.");
+                                    }
                                 }
-                                let models: Vec<_> = files
-                                    .iter()
-                                    .filter(|f| models::is_model_file(&f.name))
-                                    .collect();
-                                let best = models
+                                let best = files
                                     .iter()
                                     .filter(|f| {
                                         Fit::of(f.size, self.hardware.total_ram) == Fit::Fits
@@ -694,7 +700,7 @@ impl OffgridApp {
                                     .spacing([16.0, 6.0])
                                     .striped(true)
                                     .show(ui, |ui| {
-                                        for f in &models {
+                                        for f in &files {
                                             let tip = models::quant_tooltip(&f.name);
                                             ui.label(&f.name).on_hover_text(&tip);
                                             ui.weak(fmt_bytes(f.size));

@@ -16,7 +16,12 @@ pub struct RepoFile {
 
 pub enum HubEvent {
     SearchResults(Vec<RepoResult>),
-    Files { repo: String, files: Vec<RepoFile> },
+    Files {
+        repo: String,
+        files: Vec<RepoFile>,
+        /// The repo has GGUFs, but only multi-part shards we can't use.
+        only_multipart: bool,
+    },
     Error(String),
 }
 
@@ -64,15 +69,24 @@ pub fn spawn_list_files(repo: String, tx: Sender<HubEvent>) {
         let url = format!("https://huggingface.co/api/models/{repo}/tree/main?recursive=true");
         let event = match get_json(&url) {
             Ok(json) => {
-                let files = json
+                let mut had_multipart = false;
+                let files: Vec<RepoFile> = json
                     .as_array()
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|f| {
                                 let name = f.get("path")?.as_str()?;
-                                // Skip multi-part shards (…-00001-of-00003.gguf):
-                                // they can't be used as a single download.
-                                if !name.ends_with(".gguf") || name.contains("-of-") {
+                                if !name.ends_with(".gguf") {
+                                    return None;
+                                }
+                                // Multi-part shards (…-00001-of-00003.gguf)
+                                // can't be used as a single download.
+                                if name.contains("-of-") {
+                                    had_multipart = true;
+                                    return None;
+                                }
+                                // Vision projectors etc. are not chat models.
+                                if !crate::models::is_model_file(name) {
                                     return None;
                                 }
                                 Some(RepoFile {
@@ -83,7 +97,12 @@ pub fn spawn_list_files(repo: String, tx: Sender<HubEvent>) {
                             .collect()
                     })
                     .unwrap_or_default();
-                HubEvent::Files { repo, files }
+                let only_multipart = files.is_empty() && had_multipart;
+                HubEvent::Files {
+                    repo,
+                    files,
+                    only_multipart,
+                }
             }
             Err(e) => HubEvent::Error(format!("listing files failed: {e}")),
         };
