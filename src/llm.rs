@@ -8,7 +8,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 const N_CTX: u32 = 8192;
@@ -152,9 +152,14 @@ fn generate(
         .map(|m| LlamaChatMessage::new(m.role.as_str().to_string(), m.content.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
-    let template = model
-        .chat_template(None)
-        .map_err(|e| format!("model has no chat template: {e}"))?;
+    // Old GGUF files (pre-2024) carry no embedded chat template. Fall back to
+    // ChatML — llama.cpp resolves the name to its built-in template. Not the
+    // format those models were trained on, but a workable degradation.
+    let template = match model.chat_template(None) {
+        Ok(t) => t,
+        Err(_) => LlamaChatTemplate::new("chatml")
+            .map_err(|e| format!("chat template fallback failed: {e}"))?,
+    };
     let prompt = model
         .apply_chat_template(&template, &chat, true)
         .map_err(|e| e.to_string())?;
