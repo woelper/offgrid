@@ -36,6 +36,47 @@ fn tool_icon(name: &str) -> egui::ImageSource<'static> {
     }
 }
 
+/// Cheap virtualization for long, variable-height lists: rows scrolled out
+/// of view are replaced by spacers of their last measured height, so
+/// markdown parsing and syntax highlighting only run for visible rows.
+#[derive(Default)]
+struct RowCuller {
+    heights: Vec<f32>,
+    width: f32,
+}
+
+impl RowCuller {
+    fn begin(&mut self, ui: &egui::Ui, len: usize) {
+        // Any width change re-wraps text, invalidating every height.
+        if (self.width - ui.available_width()).abs() > 1.0 {
+            self.heights.clear();
+            self.width = ui.available_width();
+        }
+        self.heights.resize(len, 0.0);
+    }
+
+    /// `hot` rows (recently changed, e.g. still streaming) always render.
+    fn row(&mut self, ui: &mut egui::Ui, i: usize, hot: bool, render: impl FnOnce(&mut egui::Ui)) {
+        let h = self.heights.get(i).copied().unwrap_or(0.0);
+        if !hot && h > 0.0 {
+            let clip = ui.clip_rect();
+            let top = ui.cursor().top();
+            if top + h < clip.min.y || top > clip.max.y {
+                ui.add_space(h);
+                return;
+            }
+        }
+        let resp = ui.scope(render);
+        if let Some(slot) = self.heights.get_mut(i) {
+            *slot = resp.response.rect.height();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.heights.clear();
+    }
+}
+
 enum AgentItem {
     Task(String),
     Assistant(String),
@@ -97,6 +138,8 @@ pub struct OffgridApp {
 
     confirm_delete: Option<LocalModel>,
     last_error: Option<String>,
+    chat_culler: RowCuller,
+    agent_culler: RowCuller,
 }
 
 impl OffgridApp {
@@ -165,6 +208,8 @@ impl OffgridApp {
             agent_approval: None,
             confirm_delete: None,
             last_error: None,
+            chat_culler: RowCuller::default(),
+            agent_culler: RowCuller::default(),
         };
         if app.config.server_enabled {
             app.start_server();
@@ -915,19 +960,27 @@ impl OffgridApp {
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for msg in &self.messages {
-                        let (label, color) = match msg.role {
-                            Role::User => ("You", theme::skin().accent),
-                            Role::Assistant => ("Model", theme::skin().good),
-                            Role::System => ("System", egui::Color32::GRAY),
-                        };
-                        ui.colored_label(color, label);
-                        if msg.content.is_empty() {
-                            ui.label("…");
-                        }
-                        render_message(ui, &mut self.md_cache, &msg.content);
-                        ui.add_space(8.0);
+                    let mut culler = std::mem::take(&mut self.chat_culler);
+                    culler.begin(ui, self.messages.len());
+                    let len = self.messages.len();
+                    for (i, msg) in self.messages.iter().enumerate() {
+                        // The last messages may still stream — always render.
+                        let hot = i + 2 >= len;
+                        culler.row(ui, i, hot, |ui| {
+                            let (label, color) = match msg.role {
+                                Role::User => ("You", theme::skin().accent),
+                                Role::Assistant => ("Model", theme::skin().good),
+                                Role::System => ("System", egui::Color32::GRAY),
+                            };
+                            ui.colored_label(color, label);
+                            if msg.content.is_empty() {
+                                ui.label("…");
+                            }
+                            render_message(ui, &mut self.md_cache, &msg.content);
+                            ui.add_space(8.0);
+                        });
                     }
+                    self.chat_culler = culler;
                 });
         });
     }
@@ -1087,6 +1140,7 @@ impl OffgridApp {
                     .clicked()
                 {
                     self.agent_transcript.clear();
+                    self.agent_culler.clear();
                 }
             });
             if self.loaded_model.is_none() {
@@ -1099,8 +1153,13 @@ impl OffgridApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut approve_clicked: Option<bool> = None;
+                let mut culler = std::mem::take(&mut self.agent_culler);
+                culler.begin(ui, self.agent_transcript.len());
+                let len = self.agent_transcript.len();
                 for (i, item) in self.agent_transcript.iter().enumerate() {
-                    match item {
+                    // Recent rows can still change (streaming, tool results).
+                    let hot = i + 3 >= len;
+                    culler.row(ui, i, hot, |ui| match item {
                         AgentItem::Task(t) => {
                             ui.colored_label(theme::skin().accent, "Task");
                             ui.label(t);
@@ -1149,8 +1208,9 @@ impl OffgridApp {
                             ui.weak(text);
                             ui.add_space(4.0);
                         }
-                    }
+                    });
                 }
+                self.agent_culler = culler;
                 if !self.agent_current.is_empty() {
                     ui.colored_label(theme::skin().good, "Model");
                     render_message(ui, &mut self.md_cache, &self.agent_current);
