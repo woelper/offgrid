@@ -140,6 +140,8 @@ pub struct OffgridApp {
     last_error: Option<String>,
     chat_culler: RowCuller,
     agent_culler: RowCuller,
+    chat_ctx_used: usize,
+    agent_ctx_used: usize,
 }
 
 impl OffgridApp {
@@ -210,6 +212,8 @@ impl OffgridApp {
             last_error: None,
             chat_culler: RowCuller::default(),
             agent_culler: RowCuller::default(),
+            chat_ctx_used: 0,
+            agent_ctx_used: 0,
         };
         if app.config.server_enabled {
             app.start_server();
@@ -359,6 +363,9 @@ impl OffgridApp {
                     AgentEvent::Info(text) => {
                         self.agent_transcript.push(AgentItem::Info(text));
                     }
+                    AgentEvent::Ctx(used) => {
+                        self.agent_ctx_used = used;
+                    }
                     AgentEvent::NeedsApproval { command, reply } => {
                         self.agent_approval = Some((command, reply));
                     }
@@ -396,6 +403,7 @@ impl OffgridApp {
                     gen_tokens,
                     gen_secs,
                 }) => {
+                    self.chat_ctx_used = prompt_tokens + gen_tokens;
                     self.gen_stats = Some(format!(
                         "{:.1} tok/s · {} tokens · prompt: {} tok in {:.1}s",
                         gen_tokens as f32 / gen_secs.max(0.001),
@@ -535,6 +543,9 @@ impl OffgridApp {
                     if selected != theme::kind() {
                         theme::set_kind(selected);
                         theme::apply(ui.ctx());
+                        // Fonts changed — cached row heights are stale.
+                        self.chat_culler.clear();
+                        self.agent_culler.clear();
                         self.config.skin = Some(selected.id().to_string());
                         self.config.save();
                     }
@@ -934,7 +945,10 @@ impl OffgridApp {
                             .clicked()
                         {
                             self.messages.clear();
+                            self.chat_culler.clear();
+                            self.chat_ctx_used = 0;
                         }
+                        theme::context_meter(ui, self.chat_ctx_used, self.n_ctx() as usize);
                     });
                 });
                 let input_h = 60.0;
@@ -1148,7 +1162,9 @@ impl OffgridApp {
                 {
                     self.agent_transcript.clear();
                     self.agent_culler.clear();
+                    self.agent_ctx_used = 0;
                 }
+                theme::context_meter(ui, self.agent_ctx_used, self.n_ctx() as usize);
             });
             if self.loaded_model.is_none() {
                 ui.colored_label(theme::skin().warn, "Load a model in the Models tab first.");

@@ -24,6 +24,8 @@ pub enum AgentEvent {
     Token(String),
     /// Status note for the transcript (e.g. context compaction).
     Info(String),
+    /// Tokens currently occupied in the context window (after a turn).
+    Ctx(usize),
     /// The model's turn finished; `content` is the full reply.
     TurnDone,
     ToolCall {
@@ -130,6 +132,13 @@ fn run_loop(
                 }
                 LlmEvent::GenDone => break,
                 LlmEvent::Error(e) => gen_error = Some(e),
+                LlmEvent::Stats {
+                    prompt_tokens,
+                    gen_tokens,
+                    ..
+                } => {
+                    let _ = tx.send(AgentEvent::Ctx(prompt_tokens + gen_tokens));
+                }
                 _ => {}
             }
         }

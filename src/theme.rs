@@ -652,6 +652,44 @@ pub fn gloss(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
+/// Small context-usage meter: fill shifts good -> warn -> bad as it fills.
+pub fn context_meter(ui: &mut egui::Ui, used: usize, capacity: usize) {
+    if used == 0 || capacity == 0 {
+        return;
+    }
+    let s = skin();
+    let frac = (used as f32 / capacity as f32).clamp(0.0, 1.0);
+    let color = if frac < 0.7 {
+        s.good
+    } else if frac < 0.9 {
+        s.warn
+    } else {
+        s.bad
+    };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 10.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect(
+        rect,
+        CornerRadius::same(1),
+        ui.visuals().extreme_bg_color,
+        Stroke::new(1.0, s.control_border),
+        StrokeKind::Inside,
+    );
+    let w = ((rect.width() - 2.0) * frac).max(1.0);
+    p.rect_filled(
+        egui::Rect::from_min_size(
+            rect.min + egui::vec2(1.0, 1.0),
+            egui::vec2(w, rect.height() - 2.0),
+        ),
+        0.0,
+        color,
+    );
+    resp.on_hover_text(format!(
+        "context: {used} of {capacity} tokens ({:.0}%)",
+        frac * 100.0
+    ));
+}
+
 /// A standard button with the skin's gloss gradient applied.
 pub fn button(
     ui: &mut egui::Ui,

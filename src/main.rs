@@ -86,6 +86,7 @@ fn smoke(agent_mode: bool) {
             match event {
                 agent::AgentEvent::Token(t) => print!("{t}"),
                 agent::AgentEvent::Info(t) => println!("[info] {t}"),
+                agent::AgentEvent::Ctx(used) => println!("[ctx] {used} tokens"),
                 agent::AgentEvent::TurnDone => println!("\n---"),
                 agent::AgentEvent::ToolCall { name, summary } => {
                     println!("[tool call] {name}: {summary}");
