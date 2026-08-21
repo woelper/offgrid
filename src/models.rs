@@ -220,6 +220,56 @@ pub struct LocalModel {
     pub size: u64,
 }
 
+/// Fraction of the model's weights read per token. Dense models read
+/// everything; MoE models named like "30B-A3B" only read the active experts.
+fn active_fraction(name: &str) -> f32 {
+    let n = name.to_ascii_uppercase();
+    // Look for "<total>B-A<active>B", e.g. "30B-A3B", "48B-A3B", "235B-A22B".
+    let Some(pos) = n.find("B-A") else { return 1.0 };
+    let total: f32 = n[..pos]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0);
+    let active: f32 = n[pos + 3..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0.0);
+    if total > 0.0 && active > 0.0 && active < total {
+        // A couple of extra points for always-active layers and routing.
+        (active / total + 0.02).min(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Estimated generation speed on this machine: CPU inference is memory-bound,
+/// so tok/s ≈ effective bandwidth / bytes read per token.
+pub fn est_tokens_per_sec(name: &str, size: u64, mem_bandwidth: u64) -> Option<f32> {
+    if size == 0 || mem_bandwidth == 0 {
+        return None;
+    }
+    let bytes_per_token = size as f32 * active_fraction(name);
+    // llama.cpp reaches roughly 80% of the raw streaming bandwidth.
+    Some(mem_bandwidth as f32 * 0.8 / bytes_per_token)
+}
+
+pub fn fmt_tok_s(est: Option<f32>) -> String {
+    match est {
+        Some(t) if t >= 10.0 => format!("~{t:.0} t/s"),
+        Some(t) if t >= 0.3 => format!("~{t:.1} t/s"),
+        Some(_) => "<0.3 t/s".into(),
+        None => "—".into(),
+    }
+}
+
 pub fn scan_local(dir: &Path) -> Vec<LocalModel> {
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -253,6 +303,18 @@ mod tests {
         assert!(pref("m-UD-Q4_K_XL.gguf") < pref("m-UD-IQ2_XXS.gguf"));
         assert!(pref("m-IQ2_XXS.gguf") < pref("m-IQ1_M.gguf"));
         assert_eq!(quant_tag("m-Q4_K_M.gguf").label, "recommended");
+    }
+
+    #[test]
+    fn moe_active_fraction_from_name() {
+        assert!((active_fraction("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf") - 0.12).abs() < 0.03);
+        assert!((active_fraction("Kimi-Linear-48B-A3B-Instruct") - 0.083).abs() < 0.03);
+        assert_eq!(active_fraction("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), 1.0);
+        // MoE model reads far fewer bytes per token -> much faster estimate
+        let bw = 20_000_000_000u64;
+        let dense = est_tokens_per_sec("x-7B", 4_400_000_000, bw).unwrap();
+        let moe = est_tokens_per_sec("x-30B-A3B", 18_600_000_000, bw).unwrap();
+        assert!(moe > dense * 1.5);
     }
 
     #[test]

@@ -534,6 +534,11 @@ impl OffgridApp {
                             }
                         },
                         model.size,
+                        models::fmt_tok_s(models::est_tokens_per_sec(
+                            &model.name,
+                            model.size,
+                            self.hardware.mem_bandwidth,
+                        )),
                         badge,
                         |ui| {
                             // right-to-left: first added sits at the right edge
@@ -690,6 +695,11 @@ impl OffgridApp {
                                 .on_hover_text(tooltip);
                         },
                         entry.size,
+                        models::fmt_tok_s(models::est_tokens_per_sec(
+                            entry.file,
+                            entry.size,
+                            self.hardware.mem_bandwidth,
+                        )),
                         badge,
                         |ui| {
                             if downloaded {
@@ -778,7 +788,7 @@ impl OffgridApp {
                                     .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
                                     .map(|f| f.name.clone());
                                 egui::Grid::new(("repo_files", &repo.id))
-                                    .num_columns(5)
+                                    .num_columns(6)
                                     .spacing([16.0, 6.0])
                                     .striped(true)
                                     .show(ui, |ui| {
@@ -786,6 +796,13 @@ impl OffgridApp {
                                             let tip = models::quant_tooltip(&f.name);
                                             ui.label(&f.name).on_hover_text(&tip);
                                             ui.weak(fmt_bytes(f.size));
+                                            ui.weak(models::fmt_tok_s(
+                                                models::est_tokens_per_sec(
+                                                    &f.name,
+                                                    f.size,
+                                                    self.hardware.mem_bandwidth,
+                                                ),
+                                            ));
                                             self.fit_badge(ui, f.size);
                                             ui.horizontal(|ui| {
                                                 let tag = models::quant_tag(&f.name);
@@ -1305,6 +1322,7 @@ impl eframe::App for OffgridApp {
 
 const COL_NAME: f32 = 340.0;
 const COL_SIZE: f32 = 80.0;
+const COL_TOKS: f32 = 70.0;
 const COL_BADGE: f32 = 60.0;
 const ROW_H: f32 = 26.0;
 
@@ -1315,6 +1333,7 @@ fn list_row(
     stripe: bool,
     name: impl FnOnce(&mut egui::Ui),
     size: u64,
+    est: String,
     badge: (&'static str, egui::Color32),
     actions: impl FnOnce(&mut egui::Ui),
 ) {
@@ -1337,6 +1356,13 @@ fn list_row(
                 ui.allocate_ui_with_layout(egui::vec2(COL_SIZE, ROW_H), cell, |ui| {
                     ui.set_width(COL_SIZE);
                     ui.weak(fmt_bytes(size));
+                });
+                ui.allocate_ui_with_layout(egui::vec2(COL_TOKS, ROW_H), cell, |ui| {
+                    ui.set_width(COL_TOKS);
+                    ui.weak(est).on_hover_text(
+                        "Estimated generation speed on this machine \
+                         (from measured memory bandwidth)",
+                    );
                 });
                 let (label, color) = badge;
                 ui.allocate_ui_with_layout(egui::vec2(COL_BADGE, ROW_H), cell, |ui| {
@@ -1530,6 +1556,7 @@ mod tests {
     use super::*;
 
     const DEMO_RAM: u64 = 32 * 1024 * 1024 * 1024;
+    const DEMO_BW: u64 = 22_000_000_000;
 
     /// Wrap the demo screen in a faked Haiku desktop: blue backdrop, a window
     /// with the yellow title tab, border and drop shadow — for a README
@@ -1655,6 +1682,7 @@ mod tests {
                             }
                         },
                         size,
+                        models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
                             let _ = theme::button(
@@ -1699,6 +1727,7 @@ mod tests {
                             ui.add(egui::Label::new(name).truncate());
                         },
                         size,
+                        models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
                         Fit::of(size, DEMO_RAM).badge(),
                         |ui| {
                             let _ = theme::button(
