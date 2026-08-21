@@ -440,11 +440,50 @@ pub fn parse_tool_call(response: &str) -> Option<ToolCall> {
     None
 }
 
+/// Models often emit literal newlines/tabs inside JSON strings (invalid
+/// JSON, especially in write_file content). Escape them so parsing succeeds.
+pub fn escape_control_chars_in_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_str = false;
+    let mut esc = false;
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                out.push(c);
+                esc = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    esc = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_str = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c => out.push(c),
+            }
+        } else {
+            if c == '"' {
+                in_str = true;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse a candidate JSON string into a tool call. `strict_names` restricts to
 /// known tools — used for the lenient fallbacks so ordinary JSON in a summary
 /// is not mistaken for a call.
 fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
-    let json: serde_json::Value = serde_json::from_str(s).ok()?;
+    let json: serde_json::Value = serde_json::from_str(s)
+        .or_else(|_| serde_json::from_str(&escape_control_chars_in_strings(s)))
+        .ok()?;
     let name = json.get("name")?.as_str()?.to_string();
     if strict_names && !KNOWN_TOOLS.contains(&name.as_str()) {
         return None;
@@ -919,6 +958,15 @@ mod tests {
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
         assert!(parse_tool_call(r).is_none());
+    }
+
+    #[test]
+    fn repairs_raw_newlines_inside_json_strings() {
+        // Models often emit real newlines inside the content string.
+        let r = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"main.rs\", \"content\": \"fn main() {\n    println!(\\\"hi\\\");\n}\"}}</tool_call>";
+        let call = parse_tool_call(r).expect("repaired parse");
+        assert_eq!(call.name, "write_file");
+        assert!(call.arg("content").unwrap().contains("println!"));
     }
 
     #[test]

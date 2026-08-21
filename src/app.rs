@@ -1551,11 +1551,25 @@ fn split_segments(s: &str) -> Vec<Segment<'_>> {
 
 /// Render one chat/agent message: markdown text, think blocks as quotes,
 /// tool calls as pretty-printed JSON code blocks.
+/// Heuristic for a tool call the model emitted as bare JSON, possibly still
+/// streaming in: a JSON object mentioning "name" and "arguments".
+fn looks_like_tool_json(t: &str) -> bool {
+    t.starts_with('{') && t.contains("\"name\"") && t.contains("\"arguments\"")
+}
+
 fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
     for segment in split_segments(text) {
         match segment {
             Segment::Text(t) => {
-                if !t.trim().is_empty() {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Bare tool-call JSON (no <tool_call> wrapper) must not go
+                // through markdown: it eats the escapes and mangles the code.
+                if looks_like_tool_json(trimmed) {
+                    render_tool_call_block(ui, cache, trimmed);
+                } else {
                     CommonMarkViewer::new().show(ui, cache, t);
                 }
             }
@@ -1579,7 +1593,10 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
 /// is pulled out of the JSON and shown as its own code block with real
 /// newlines, highlighted by the target file's extension.
 fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &str) {
-    match serde_json::from_str::<serde_json::Value>(t) {
+    let parsed = serde_json::from_str::<serde_json::Value>(t).or_else(|_| {
+        serde_json::from_str::<serde_json::Value>(&agent::escape_control_chars_in_strings(t))
+    });
+    match parsed {
         Ok(mut v) => {
             let lang = v["arguments"]["path"]
                 .as_str()
