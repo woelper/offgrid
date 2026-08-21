@@ -240,21 +240,23 @@ fn run_loop(
         }
         let ok = tool_output_ok(&output);
         // A successful write_file leaves a full copy of the file in the
-        // assistant's turn — the biggest context hog. Replace it with a stub;
-        // the content is on disk and can be re-read if needed.
+        // assistant's turn — the biggest context hog. Replace it with plain
+        // prose (NOT a syntactically valid tool call: the model imitates its
+        // own turns, and a placeholder-shaped call once got written to disk
+        // verbatim). The content is on disk and can be re-read if needed.
         if ok
             && call.name == "write_file"
             && let Some(last) = messages.last_mut()
             && last.role == Role::Assistant
             && let Some(pos) = last.content.find("<tool_call>")
         {
-            let stub = format!(
-                "<tool_call>{{\"name\": \"write_file\", \"arguments\": {{\"path\": \"{}\", \"content\": \"[{} bytes written to disk]\"}}}}</tool_call>",
-                call.arg("path").unwrap_or(""),
-                call.arg("content").map(str::len).unwrap_or(0)
+            let note = format!(
+                "(wrote {} bytes to {} with the write_file tool)",
+                call.arg("content").map(str::len).unwrap_or(0),
+                call.arg("path").unwrap_or("")
             );
             last.content.truncate(pos);
-            last.content.push_str(&stub);
+            last.content.push_str(&note);
         }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
@@ -546,6 +548,12 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
         }),
         "write_file" => resolve(workspace, call.arg("path").unwrap_or("")).and_then(|path| {
             let content = call.arg("content").unwrap_or("");
+            if looks_like_placeholder(content) {
+                return Err(format!(
+                    "content looks like a placeholder ({content:?}), not real file \
+                     content — send the actual file content"
+                ));
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
@@ -560,6 +568,25 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
         Ok(out) => out,
         Err(e) => format!("Error: {e}"),
     }
+}
+
+/// Catch the model writing a placeholder instead of real file content
+/// (e.g. "[3519 bytes written to disk]", "...", "(content omitted)").
+fn looks_like_placeholder(content: &str) -> bool {
+    let t = content.trim();
+    if t.len() > 120 {
+        return false;
+    }
+    let bracketed = (t.starts_with('[') && t.ends_with(']'))
+        || (t.starts_with('(') && t.ends_with(')'))
+        || (t.starts_with('<') && t.ends_with('>'));
+    bracketed
+        && (t.contains("bytes")
+            || t.contains("omitted")
+            || t.contains("written")
+            || t.contains("content")
+            || t.contains("unchanged")
+            || t.contains("same as"))
 }
 
 /// Resolve a path relative to the workspace and reject anything escaping it.
@@ -958,6 +985,21 @@ mod tests {
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
         assert!(parse_tool_call(r).is_none());
+    }
+
+    #[test]
+    fn write_file_rejects_placeholder_content() {
+        assert!(looks_like_placeholder("[3519 bytes written to disk]"));
+        assert!(looks_like_placeholder("(content unchanged)"));
+        assert!(looks_like_placeholder("<file content omitted>"));
+        assert!(!looks_like_placeholder("[package]\nname = \"demo\"")); // real TOML
+        assert!(!looks_like_placeholder("fn main() {}"));
+        let call = ToolCall {
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "x.txt", "content": "[10 bytes written to disk]"}),
+        };
+        let out = execute(&call, &std::env::temp_dir(), false);
+        assert!(out.contains("placeholder"));
     }
 
     #[test]
