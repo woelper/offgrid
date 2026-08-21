@@ -217,6 +217,10 @@ impl OffgridApp {
         app
     }
 
+    fn n_ctx(&self) -> u32 {
+        self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX)
+    }
+
     fn server_port(&self) -> u16 {
         self.config.server_port.unwrap_or(server::DEFAULT_PORT)
     }
@@ -230,6 +234,7 @@ impl OffgridApp {
             self.llm.cmd_tx.clone(),
             self.models_dir.clone(),
             self.loaded_model_shared.clone(),
+            self.n_ctx(),
         ) {
             Ok(s) => self.api_server = Some(s),
             Err(e) => {
@@ -454,6 +459,7 @@ impl OffgridApp {
             messages: self.messages.clone(),
             reply: self.llm.event_tx.clone(),
             temp: 0.7,
+            n_ctx: self.n_ctx(),
         });
         self.messages.push(ChatMessage {
             role: Role::Assistant,
@@ -1100,6 +1106,7 @@ impl OffgridApp {
                         self.llm.cmd_tx.clone(),
                         self.agent_auto_approve,
                         self.config.web_tools,
+                        self.n_ctx(),
                     ));
                 }
                 if running {

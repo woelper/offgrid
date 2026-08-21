@@ -11,7 +11,10 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-const N_CTX: u32 = 8192;
+/// Default context window; configurable in Settings. Prompt decoding is
+/// chunked, so a large window costs KV-cache memory but not batch memory.
+pub const DEFAULT_N_CTX: u32 = 16384;
+const N_BATCH: u32 = 2048;
 
 #[derive(Clone, PartialEq)]
 pub enum Role {
@@ -47,6 +50,8 @@ pub enum LlmCmd {
         /// Sampling temperature: ~0.7 for chat, lower (~0.25) for agent/tool
         /// use where malformed JSON and sloppy code are costly.
         temp: f32,
+        /// Context window size in tokens.
+        n_ctx: u32,
     },
 }
 
@@ -123,13 +128,15 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
                 messages,
                 reply,
                 temp,
+                n_ctx,
             } => {
                 let Some(model) = &model else {
                     let _ = reply.send(LlmEvent::Error("no model loaded".into()));
                     continue;
                 };
-                if let Err(e) = generate(&backend, model, &messages, &reply, &stop, n_threads, temp)
-                {
+                if let Err(e) = generate(
+                    &backend, model, &messages, &reply, &stop, n_threads, temp, n_ctx,
+                ) {
                     let _ = reply.send(LlmEvent::Error(e));
                 }
                 let _ = reply.send(LlmEvent::GenDone);
@@ -138,6 +145,7 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate(
     backend: &LlamaBackend,
     model: &LlamaModel,
@@ -146,7 +154,9 @@ fn generate(
     stop: &AtomicBool,
     n_threads: usize,
     temp: f32,
+    n_ctx: u32,
 ) -> Result<(), String> {
+    let n_ctx = n_ctx.max(2048);
     let chat: Vec<LlamaChatMessage> = messages
         .iter()
         .map(|m| LlamaChatMessage::new(m.role.as_str().to_string(), m.content.clone()))
@@ -167,33 +177,40 @@ fn generate(
     let tokens = model
         .str_to_token(&prompt, AddBos::Always)
         .map_err(|e| e.to_string())?;
-    if tokens.len() as u32 >= N_CTX - 256 {
+    if tokens.len() as u32 >= n_ctx - 256 {
         // Callers match on this prefix to offer their own remedy.
         return Err(format!(
             "context window full ({} tokens, limit {})",
             tokens.len(),
-            N_CTX
+            n_ctx
         ));
     }
 
     let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(N_CTX))
-        .with_n_batch(N_CTX)
+        .with_n_ctx(NonZeroU32::new(n_ctx))
+        .with_n_batch(N_BATCH)
         .with_n_threads(n_threads as i32)
         .with_n_threads_batch(n_threads as i32);
     let mut ctx = model
         .new_context(backend, ctx_params)
         .map_err(|e| e.to_string())?;
 
-    let mut batch = LlamaBatch::new(N_CTX as usize, 1);
-    let last_idx = tokens.len() - 1;
-    for (i, token) in tokens.iter().enumerate() {
-        batch
-            .add(*token, i as i32, &[0], i == last_idx)
-            .map_err(|e| e.to_string())?;
-    }
+    // Decode the prompt in chunks so batch memory stays bounded no matter
+    // how large the context window is.
+    let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
     let prompt_start = std::time::Instant::now();
-    ctx.decode(&mut batch).map_err(|e| e.to_string())?;
+    let last_idx = tokens.len() - 1;
+    let mut pos = 0usize;
+    for chunk in tokens.chunks(N_BATCH as usize) {
+        batch.clear();
+        for token in chunk {
+            batch
+                .add(*token, pos as i32, &[0], pos == last_idx)
+                .map_err(|e| e.to_string())?;
+            pos += 1;
+        }
+        ctx.decode(&mut batch).map_err(|e| e.to_string())?;
+    }
     let prompt_secs = prompt_start.elapsed().as_secs_f32();
 
     let seed = std::time::SystemTime::now()
@@ -211,7 +228,7 @@ fn generate(
     let mut pending: Vec<u8> = Vec::new();
     let gen_start = std::time::Instant::now();
     let mut gen_tokens = 0usize;
-    while (n_cur as u32) < N_CTX && !stop.load(Ordering::Relaxed) {
+    while (n_cur as u32) < n_ctx && !stop.load(Ordering::Relaxed) {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {

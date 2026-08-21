@@ -33,6 +33,7 @@ pub fn start(
     cmd_tx: Sender<LlmCmd>,
     models_dir: PathBuf,
     loaded_model: Arc<Mutex<Option<String>>>,
+    n_ctx: u32,
 ) -> Result<ApiServer, String> {
     let server =
         tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| format!("server: {e}"))?;
@@ -45,7 +46,9 @@ pub fn start(
                     let cmd_tx = cmd_tx.clone();
                     let models_dir = models_dir.clone();
                     let loaded_model = loaded_model.clone();
-                    std::thread::spawn(move || handle(request, cmd_tx, models_dir, loaded_model));
+                    std::thread::spawn(move || {
+                        handle(request, cmd_tx, models_dir, loaded_model, n_ctx)
+                    });
                 }
                 Ok(None) => {}
                 Err(_) => break,
@@ -71,6 +74,7 @@ fn handle(
     cmd_tx: Sender<LlmCmd>,
     models_dir: PathBuf,
     loaded_model: Arc<Mutex<Option<String>>>,
+    n_ctx: u32,
 ) {
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
@@ -154,6 +158,7 @@ fn handle(
                     messages,
                     reply: reply_tx,
                     temp,
+                    n_ctx,
                 })
                 .is_err()
             {

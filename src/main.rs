@@ -80,6 +80,7 @@ fn smoke(agent_mode: bool) {
             handle.cmd_tx.clone(),
             true,
             false,
+            llm::DEFAULT_N_CTX,
         );
         for event in run.rx {
             match event {
@@ -118,6 +119,7 @@ fn smoke(agent_mode: bool) {
             }],
             reply: reply_tx,
             temp: 0.7,
+            n_ctx: llm::DEFAULT_N_CTX,
         })
         .unwrap();
     print!("chat: ");
@@ -132,8 +134,14 @@ fn smoke(agent_mode: bool) {
     println!();
 
     let loaded = Arc::new(Mutex::new(Some(name)));
-    let _server = server::start(server::DEFAULT_PORT, handle.cmd_tx.clone(), dir, loaded)
-        .expect("server start");
+    let _server = server::start(
+        server::DEFAULT_PORT,
+        handle.cmd_tx.clone(),
+        dir,
+        loaded,
+        llm::DEFAULT_N_CTX,
+    )
+    .expect("server start");
     println!(
         "server on http://127.0.0.1:{} — press Ctrl+C to quit",
         server::DEFAULT_PORT

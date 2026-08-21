@@ -11,6 +11,7 @@ pub struct Config {
     pub workspace: Option<PathBuf>,
     pub web_tools: bool,
     pub skin: Option<String>,
+    pub n_ctx: Option<u32>,
 }
 
 fn config_path() -> Option<PathBuf> {

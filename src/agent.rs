@@ -57,6 +57,7 @@ pub fn start(
     cmd_tx: Sender<LlmCmd>,
     auto_approve: bool,
     web_tools: bool,
+    n_ctx: u32,
 ) -> AgentRun {
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -70,6 +71,7 @@ pub fn start(
             &stop_thread,
             auto_approve,
             web_tools,
+            n_ctx,
         ) {
             let _ = tx.send(AgentEvent::Error(e));
         }
@@ -77,6 +79,7 @@ pub fn start(
     AgentRun { rx, stop }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_loop(
     workspace: &Path,
     task: &str,
@@ -85,6 +88,7 @@ fn run_loop(
     stop: &AtomicBool,
     auto_approve: bool,
     web_tools: bool,
+    n_ctx: u32,
 ) -> Result<(), String> {
     let mut messages = vec![
         ChatMessage {
@@ -98,6 +102,7 @@ fn run_loop(
     ];
 
     let mut format_retries = 0usize;
+    let mut compact_level = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -111,6 +116,7 @@ fn run_loop(
                 // Low temperature: agent runs need valid JSON and careful
                 // code much more than they need creative variety.
                 temp: 0.25,
+                n_ctx,
             })
             .map_err(|_| "LLM worker unavailable".to_string())?;
 
@@ -128,17 +134,19 @@ fn run_loop(
             }
         }
         if let Some(e) = gen_error {
-            // On context overflow, trim old tool outputs and retry the turn
+            // On context overflow, compact progressively harder and retry
             // instead of aborting the run.
-            if e.starts_with("context window full") && compact_transcript(&mut messages) {
-                let _ = tx.send(AgentEvent::Info(
-                    "context window full — trimmed older tool outputs, retrying".into(),
-                ));
+            if e.starts_with("context window full") && compact_level < 2 {
+                compact_level += 1;
+                compact_transcript(&mut messages, compact_level);
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "context window full — compacting transcript (level {compact_level}) and retrying"
+                )));
                 continue;
             }
             return Err(if e.starts_with("context window full") {
                 format!(
-                    "{e} — the task transcript is too long even after trimming; try a smaller task"
+                    "{e} — the task transcript is too long even after compaction; try a smaller task"
                 )
             } else {
                 e
@@ -202,10 +210,43 @@ fn run_loop(
 
         let mut output = output;
         if output.len() > MAX_TOOL_OUTPUT {
-            output.truncate(MAX_TOOL_OUTPUT);
-            output.push_str("\n[output truncated]");
+            // Keep head AND tail: compilers put the errors at the end.
+            let head_end = output
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= MAX_TOOL_OUTPUT / 4)
+                .last()
+                .unwrap_or(0);
+            let tail_target = output.len() - (MAX_TOOL_OUTPUT - MAX_TOOL_OUTPUT / 4);
+            let tail_start = output
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| i >= tail_target)
+                .unwrap_or(output.len());
+            output = format!(
+                "{}\n[… middle of output omitted …]\n{}",
+                &output[..head_end],
+                &output[tail_start..]
+            );
         }
         let ok = tool_output_ok(&output);
+        // A successful write_file leaves a full copy of the file in the
+        // assistant's turn — the biggest context hog. Replace it with a stub;
+        // the content is on disk and can be re-read if needed.
+        if ok
+            && call.name == "write_file"
+            && let Some(last) = messages.last_mut()
+            && last.role == Role::Assistant
+            && let Some(pos) = last.content.find("<tool_call>")
+        {
+            let stub = format!(
+                "<tool_call>{{\"name\": \"write_file\", \"arguments\": {{\"path\": \"{}\", \"content\": \"[{} bytes written to disk]\"}}}}</tool_call>",
+                call.arg("path").unwrap_or(""),
+                call.arg("content").map(str::len).unwrap_or(0)
+            );
+            last.content.truncate(pos);
+            last.content.push_str(&stub);
+        }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
             // both the transcript and the model.
@@ -237,20 +278,28 @@ fn tool_output_ok(output: &str) -> bool {
         || output.starts_with("Web access is unavailable"))
 }
 
-/// Shrink old tool responses (all but the most recent messages) to free
-/// context. Returns whether anything was trimmed.
-fn compact_transcript(messages: &mut [ChatMessage]) -> bool {
-    let keep_from = messages.len().saturating_sub(4);
-    let mut changed = false;
-    for m in &mut messages[..keep_from] {
+/// Shrink the transcript to free context. Level 1 trims old tool responses;
+/// level 2 trims all tool responses and long assistant turns, keeping the
+/// system prompt and the task intact.
+fn compact_transcript(messages: &mut [ChatMessage], level: usize) {
+    let len = messages.len();
+    let keep_from = if level >= 2 {
+        len.saturating_sub(1)
+    } else {
+        len.saturating_sub(4)
+    };
+    // Never touch the system prompt (0) and the task (1).
+    for m in messages[..keep_from].iter_mut().skip(2) {
         if m.role == Role::User && m.content.starts_with("<tool_response>") && m.content.len() > 600
         {
             let head: String = m.content.chars().take(300).collect();
             m.content = format!("{head}\n[older tool output trimmed]\n</tool_response>");
-            changed = true;
+        }
+        if level >= 2 && m.role == Role::Assistant && m.content.len() > 1500 {
+            let head: String = m.content.chars().take(700).collect();
+            m.content = format!("{head}\n[rest of this turn trimmed]");
         }
     }
-    changed
 }
 
 fn system_prompt(workspace: &Path, web_tools: bool) -> String {
@@ -947,11 +996,15 @@ mod tests {
                 content: "task".into(),
             },
         ];
-        assert!(compact_transcript(&mut messages));
-        assert!(messages[1].content.contains("[older tool output trimmed]"));
-        assert!(messages[1].content.len() < 500);
-        assert_eq!(messages[3].content, long); // within the keep window
-        assert!(!compact_transcript(&mut messages)); // second pass: nothing left to trim
+        compact_transcript(&mut messages, 1);
+        // index 0/1 (system + task) are never touched; index 2+ within range is
+        assert!(messages[2].content == "a" || messages[2].content.len() <= 400);
+        assert_eq!(messages[3].content, long); // within the keep window at level 1
+        compact_transcript(&mut messages, 2);
+        assert!(messages[3].content.contains("[older tool output trimmed]"));
+        assert!(messages[3].content.len() < 500);
+        assert_eq!(messages[0].content, "sys"); // system prompt untouched
+        assert_eq!(messages[5].content, "task"); // last message untouched
     }
 
     /// End-to-end proof that the agent loop uses web tools: a scripted fake
@@ -1015,6 +1068,7 @@ mod tests {
             cmd_tx,
             true,
             true, // web tools enabled
+            8192,
         );
         let mut saw_call = false;
         let mut saw_result = false;
