@@ -65,6 +65,7 @@ pub struct OffgridApp {
     repo_files: HashMap<String, (Vec<RepoFile>, bool)>,
     files_pending: HashSet<String>,
     downloads: Vec<ActiveDownload>,
+    interrupted: Vec<hub::PartInfo>,
 
     // LLM
     llm: LlmHandle,
@@ -126,6 +127,7 @@ impl OffgridApp {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        let interrupted = hub::scan_parts(&models_dir);
         let mut app = Self {
             local_models: models::scan_local(&models_dir),
             hardware,
@@ -141,6 +143,7 @@ impl OffgridApp {
             repo_files: HashMap::new(),
             files_pending: HashSet::new(),
             downloads: Vec::new(),
+            interrupted,
             llm,
             loaded_model: None,
             loaded_model_shared,
@@ -199,6 +202,7 @@ impl OffgridApp {
 
     fn rescan(&mut self) {
         self.local_models = models::scan_local(&self.models_dir);
+        self.interrupted = hub::scan_parts(&self.models_dir);
     }
 
     /// End the current agent run and note why in the transcript.
@@ -254,9 +258,9 @@ impl OffgridApp {
                         finished = true;
                     }
                     Ok(DownloadEvent::Error(e)) => {
-                        dl.bytes = u64::MAX;
-                        finished = true;
-                        self.last_error = Some(format!("download of {} failed: {e}", dl.file));
+                        // Keep the row so the user can resume; the .part file
+                        // and its metadata are still on disk.
+                        dl.failed = Some(e);
                     }
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                 }
@@ -551,14 +555,41 @@ impl OffgridApp {
                     }
                 }
 
-                for dl in &self.downloads {
+                let mut resume: Option<(String, String, u64)> = None;
+                let mut discard: Option<usize> = None;
+                for (i, dl) in self.downloads.iter().enumerate() {
                     let frac = if dl.total > 0 {
                         dl.bytes as f32 / dl.total as f32
                     } else {
                         0.0
                     };
+                    if let Some(err) = &dl.failed {
+                        ui.horizontal(|ui| {
+                            theme::icon(ui, theme::icons().download.clone(), 16.0);
+                            ui.add(egui::Label::new(&dl.file).truncate());
+                            ui.colored_label(
+                                theme::skin().bad,
+                                format!("interrupted: {err}"),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, None, "Discard").clicked() {
+                                        discard = Some(i);
+                                    }
+                                    if theme::button(ui, None, "Resume").clicked() {
+                                        resume =
+                                            Some((dl.repo.clone(), dl.path.clone(), dl.total));
+                                    }
+                                },
+                            );
+                        });
+                        theme::progress_bar(ui, frac);
+                        ui.add_space(4.0);
+                        continue;
+                    }
                     let elapsed = dl.started.elapsed().as_secs_f32();
-                    let speed = dl.bytes as f32 / elapsed.max(0.1);
+                    let speed = dl.bytes.saturating_sub(dl.resumed_from) as f32 / elapsed.max(0.1);
                     let eta = if speed > 1.0 && dl.total > dl.bytes {
                         fmt_eta((dl.total - dl.bytes) as f32 / speed)
                     } else {
@@ -570,16 +601,69 @@ impl OffgridApp {
                         ui.add(egui::Label::new(&dl.file).truncate());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.weak(format!(
-                                "{} / {} · {}/s · {}",
+                                "{} / {} · {} · {}",
                                 fmt_bytes_precise(dl.bytes),
                                 fmt_bytes_precise(dl.total),
-                                fmt_bytes(speed as u64),
+                                fmt_bitrate(speed),
                                 eta
                             ));
                         });
                     });
                     theme::progress_bar(ui, frac);
                     ui.add_space(4.0);
+                }
+                if let Some(i) = discard {
+                    let dl = self.downloads.remove(i);
+                    hub::discard_part(&self.models_dir, &dl.file);
+                    self.rescan();
+                }
+                if let Some((repo, path, size)) = resume {
+                    self.downloads
+                        .retain(|d| file_basename(&d.path) != file_basename(&path));
+                    self.downloads
+                        .push(hub::start_download(&repo, &path, size, &self.models_dir));
+                }
+
+                // Partial downloads left over from earlier sessions.
+                let mut resume_part: Option<hub::PartMeta> = None;
+                let mut discard_part: Option<String> = None;
+                for part in &self.interrupted {
+                    if self.is_downloading(&part.file) {
+                        continue;
+                    }
+                    ui.horizontal(|ui| {
+                        theme::icon(ui, theme::icons().download.clone(), 16.0);
+                        ui.add(egui::Label::new(&part.file).truncate());
+                        ui.colored_label(
+                            theme::skin().warn,
+                            format!(
+                                "interrupted — {} of {} downloaded",
+                                fmt_bytes(part.bytes),
+                                fmt_bytes(part.meta.size)
+                            ),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, None, "Discard").clicked() {
+                                discard_part = Some(part.file.clone());
+                            }
+                            if theme::button(ui, None, "Resume").clicked() {
+                                resume_part = Some(part.meta.clone());
+                            }
+                        });
+                    });
+                }
+                if let Some(file) = discard_part {
+                    hub::discard_part(&self.models_dir, &file);
+                    self.rescan();
+                }
+                if let Some(meta) = resume_part {
+                    self.downloads.push(hub::start_download(
+                        &meta.repo,
+                        &meta.path,
+                        meta.size,
+                        &self.models_dir,
+                    ));
+                    self.rescan();
                 }
             });
 
@@ -1276,6 +1360,16 @@ fn fmt_eta(secs: f32) -> String {
     }
 }
 
+/// Bytes/second shown as a line rate.
+fn fmt_bitrate(bytes_per_sec: f32) -> String {
+    let mbit = bytes_per_sec * 8.0 / 1_000_000.0;
+    if mbit >= 1.0 {
+        format!("{mbit:.1} Mbit/s")
+    } else {
+        format!("{:.0} kbit/s", mbit * 1000.0)
+    }
+}
+
 /// Repo files may live in subfolders; local files are always flat.
 fn file_basename(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
@@ -1580,7 +1674,7 @@ mod tests {
                     theme::icon(ui, theme::icons().download.clone(), 16.0);
                     ui.add(egui::Label::new("Qwen3.8-27B-UD-Q4_K_M.gguf").truncate());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("9.87 GB / 15.30 GB · 8.2 MB/s · 11:04 left");
+                        ui.weak("9.87 GB / 15.30 GB · 65.6 Mbit/s · 11:04 left");
                     });
                 });
                 theme::progress_bar(ui, 0.645);
