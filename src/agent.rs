@@ -51,6 +51,9 @@ pub enum AgentEvent {
 pub struct AgentRun {
     pub rx: Receiver<AgentEvent>,
     pub stop: Arc<AtomicBool>,
+    /// Live-updatable: toggling auto-approve mid-run takes effect on the
+    /// next command instead of only on the next run.
+    pub auto_approve: Arc<AtomicBool>,
 }
 
 pub fn start(
@@ -64,6 +67,8 @@ pub fn start(
     let (tx, rx) = std::sync::mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let auto = Arc::new(AtomicBool::new(auto_approve));
+    let auto_thread = auto.clone();
     std::thread::spawn(move || {
         if let Err(e) = run_loop(
             &workspace,
@@ -71,14 +76,18 @@ pub fn start(
             &cmd_tx,
             &tx,
             &stop_thread,
-            auto_approve,
+            &auto_thread,
             web_tools,
             n_ctx,
         ) {
             let _ = tx.send(AgentEvent::Error(e));
         }
     });
-    AgentRun { rx, stop }
+    AgentRun {
+        rx,
+        stop,
+        auto_approve: auto,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -88,7 +97,7 @@ fn run_loop(
     cmd_tx: &Sender<LlmCmd>,
     tx: &Sender<AgentEvent>,
     stop: &AtomicBool,
-    auto_approve: bool,
+    auto_approve: &AtomicBool,
     web_tools: bool,
     n_ctx: u32,
 ) -> Result<(), String> {
@@ -198,7 +207,7 @@ fn run_loop(
             summary: call.summary(),
         });
 
-        let output = if call.name == "run_command" && !auto_approve {
+        let output = if call.name == "run_command" && !auto_approve.load(Ordering::Relaxed) {
             let command = call.arg("command").unwrap_or_default().to_string();
             let (approve_tx, approve_rx) = std::sync::mpsc::channel();
             let _ = tx.send(AgentEvent::NeedsApproval {

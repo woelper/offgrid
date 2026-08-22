@@ -59,9 +59,13 @@ impl RowCuller {
     fn row(&mut self, ui: &mut egui::Ui, i: usize, hot: bool, render: impl FnOnce(&mut egui::Ui)) {
         let h = self.heights.get(i).copied().unwrap_or(0.0);
         if !hot && h > 0.0 {
+            // Generous margin: rows near the viewport edge stay rendered, so
+            // small height corrections don't shift the list (bottom flicker),
+            // and scrolling has pre-laid-out content in both directions.
+            const MARGIN: f32 = 400.0;
             let clip = ui.clip_rect();
             let top = ui.cursor().top();
-            if top + h < clip.min.y || top > clip.max.y {
+            if top + h < clip.min.y - MARGIN || top > clip.max.y + MARGIN {
                 ui.add_space(h);
                 return;
             }
@@ -1195,8 +1199,21 @@ impl OffgridApp {
                         ui.weak(format!("{:.1} tok/s", self.live_tokens as f32 / secs));
                     }
                 }
-                theme::checkbox(ui, &mut self.agent_auto_approve, "auto-approve commands")
-                    .on_hover_text("Run shell commands without asking (applies to the next run)");
+                if theme::checkbox(ui, &mut self.agent_auto_approve, "auto-approve commands")
+                    .on_hover_text("Run shell commands without asking")
+                    .changed()
+                {
+                    if let Some(run) = &self.agent_run {
+                        run.auto_approve
+                            .store(self.agent_auto_approve, Ordering::Relaxed);
+                    }
+                    // Turning it on also answers a prompt that is already open.
+                    if self.agent_auto_approve
+                        && let Some((_, reply)) = self.agent_approval.take()
+                    {
+                        let _ = reply.send(true);
+                    }
+                }
                 if theme::checkbox(ui, &mut self.config.web_tools, "allow web tools")
                     .on_hover_text(
                         "Give the agent web_search and fetch_url. Fails gracefully when \
@@ -1666,8 +1683,28 @@ fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &st
             let head = serde_json::to_string_pretty(&v).unwrap_or_else(|_| t.to_string());
             CommonMarkViewer::new().show(ui, cache, &format!("```json\n{head}\n```"));
             if let Some(content) = content {
-                // Four-backtick fence so content containing ``` stays intact.
-                CommonMarkViewer::new().show(ui, cache, &format!("````{lang}\n{content}\n````"));
+                let lines = content.lines().count();
+                if lines > 30 {
+                    // Big blocks collapse: syntax highlighting is expensive
+                    // and re-runs every frame while a block is visible.
+                    egui::CollapsingHeader::new(format!("file content ({lines} lines)"))
+                        .id_salt(("tc_content", content.len(), lines))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            CommonMarkViewer::new().show(
+                                ui,
+                                cache,
+                                &format!("````{lang}\n{content}\n````"),
+                            );
+                        });
+                } else {
+                    // Four-backtick fence so content containing ``` stays intact.
+                    CommonMarkViewer::new().show(
+                        ui,
+                        cache,
+                        &format!("````{lang}\n{content}\n````"),
+                    );
+                }
             }
         }
         Err(_) => {
