@@ -146,6 +146,7 @@ pub struct OffgridApp {
     agent_culler: RowCuller,
     chat_ctx_used: usize,
     agent_ctx_used: usize,
+    hl_memo: HighlightMemo,
 }
 
 impl OffgridApp {
@@ -218,6 +219,7 @@ impl OffgridApp {
             agent_culler: RowCuller::default(),
             chat_ctx_used: 0,
             agent_ctx_used: 0,
+            hl_memo: HighlightMemo::default(),
         };
         if app.config.server_enabled {
             app.start_server();
@@ -1044,7 +1046,9 @@ impl OffgridApp {
                             if msg.content.is_empty() {
                                 ui.label("…");
                             }
-                            render_message(ui, &mut self.md_cache, &msg.content);
+                            let mut memo = std::mem::take(&mut self.hl_memo);
+                            render_message(ui, &mut self.md_cache, &mut memo, &msg.content);
+                            self.hl_memo = memo;
                             ui.add_space(8.0);
                         });
                     }
@@ -1263,7 +1267,9 @@ impl OffgridApp {
                         }
                         AgentItem::Assistant(text) => {
                             ui.colored_label(theme::skin().good, "Model");
-                            render_message(ui, &mut self.md_cache, text);
+                            let mut memo = std::mem::take(&mut self.hl_memo);
+                            render_message(ui, &mut self.md_cache, &mut memo, text);
+                            self.hl_memo = memo;
                             ui.add_space(6.0);
                         }
                         AgentItem::Tool {
@@ -1309,7 +1315,9 @@ impl OffgridApp {
                 self.agent_culler = culler;
                 if !self.agent_current.is_empty() {
                     ui.colored_label(theme::skin().good, "Model");
-                    render_message(ui, &mut self.md_cache, &self.agent_current);
+                    let mut memo = std::mem::take(&mut self.hl_memo);
+                    render_message(ui, &mut self.md_cache, &mut memo, &self.agent_current);
+                    self.hl_memo = memo;
                 }
                 if let Some((command, _)) = &self.agent_approval {
                     egui::Frame::new()
@@ -1624,13 +1632,74 @@ fn split_segments(s: &str) -> Vec<Segment<'_>> {
 
 /// Render one chat/agent message: markdown text, think blocks as quotes,
 /// tool calls as pretty-printed JSON code blocks.
+/// Session-lifetime cache of highlighted code. egui's FrameCache evicts
+/// entries as soon as a block scrolls out of view, so scrolling back would
+/// re-run syntect from scratch (brutal in debug builds). This memo keeps
+/// every block highlighted exactly once.
+#[derive(Default)]
+struct HighlightMemo {
+    map: HashMap<u64, std::sync::Arc<egui::text::LayoutJob>>,
+}
+
+impl HighlightMemo {
+    fn job(
+        &mut self,
+        ui: &egui::Ui,
+        code: &str,
+        lang: &str,
+    ) -> std::sync::Arc<egui::text::LayoutJob> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        theme::kind().id().hash(&mut h);
+        lang.hash(&mut h);
+        code.hash(&mut h);
+        let key = h.finish();
+        if self.map.len() > 512 {
+            self.map.clear();
+        }
+        self.map
+            .entry(key)
+            .or_insert_with(|| {
+                let theme = egui_extras::syntax_highlighting::CodeTheme::from_style(ui.style());
+                std::sync::Arc::new(egui_extras::syntax_highlighting::highlight(
+                    ui.ctx(),
+                    ui.style(),
+                    &theme,
+                    code,
+                    lang,
+                ))
+            })
+            .clone()
+    }
+}
+
+/// Code block rendered from the persistent highlight memo.
+fn cached_code_block(ui: &mut egui::Ui, memo: &mut HighlightMemo, code: &str, lang: &str) {
+    let job = memo.job(ui, code, lang);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(8.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut job = (*job).clone();
+            job.wrap.max_width = ui.available_width();
+            ui.add(egui::Label::new(job));
+        });
+}
+
 /// Heuristic for a tool call the model emitted as bare JSON, possibly still
 /// streaming in: a JSON object mentioning "name" and "arguments".
 fn looks_like_tool_json(t: &str) -> bool {
     t.starts_with('{') && t.contains("\"name\"") && t.contains("\"arguments\"")
 }
 
-fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
+fn render_message(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    memo: &mut HighlightMemo,
+    text: &str,
+) {
     for segment in split_segments(text) {
         match segment {
             Segment::Text(t) => {
@@ -1641,7 +1710,7 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
                 // Bare tool-call JSON (no <tool_call> wrapper) must not go
                 // through markdown: it eats the escapes and mangles the code.
                 if looks_like_tool_json(trimmed) {
-                    render_tool_call_block(ui, cache, trimmed);
+                    render_tool_call_block(ui, cache, memo, trimmed);
                 } else {
                     CommonMarkViewer::new().show(ui, cache, t);
                 }
@@ -1655,7 +1724,7 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
             Segment::ToolCall(t) => {
                 let t = t.trim();
                 if !t.is_empty() {
-                    render_tool_call_block(ui, cache, t);
+                    render_tool_call_block(ui, cache, memo, t);
                 }
             }
         }
@@ -1665,7 +1734,12 @@ fn render_message(ui: &mut egui::Ui, cache: &mut CommonMarkCache, text: &str) {
 /// Render a `<tool_call>` for humans: a long `content` argument (write_file)
 /// is pulled out of the JSON and shown as its own code block with real
 /// newlines, highlighted by the target file's extension.
-fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &str) {
+fn render_tool_call_block(
+    ui: &mut egui::Ui,
+    cache: &mut CommonMarkCache,
+    memo: &mut HighlightMemo,
+    t: &str,
+) {
     let parsed = serde_json::from_str::<serde_json::Value>(t).or_else(|_| {
         serde_json::from_str::<serde_json::Value>(&agent::escape_control_chars_in_strings(t))
     });
@@ -1691,19 +1765,10 @@ fn render_tool_call_block(ui: &mut egui::Ui, cache: &mut CommonMarkCache, t: &st
                         .id_salt(("tc_content", content.len(), lines))
                         .default_open(false)
                         .show(ui, |ui| {
-                            CommonMarkViewer::new().show(
-                                ui,
-                                cache,
-                                &format!("````{lang}\n{content}\n````"),
-                            );
+                            cached_code_block(ui, memo, &content, &lang);
                         });
                 } else {
-                    // Four-backtick fence so content containing ``` stays intact.
-                    CommonMarkViewer::new().show(
-                        ui,
-                        cache,
-                        &format!("````{lang}\n{content}\n````"),
-                    );
+                    cached_code_block(ui, memo, &content, &lang);
                 }
             }
         }
