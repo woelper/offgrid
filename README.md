@@ -2,77 +2,89 @@
 
 ![offgrid](assets/screenshot.png)
 
-A self-contained, fully local LLM prepper tool. One binary: browse and download
-GGUF models from Hugging Face, see which ones fit your hardware, chat with them
-offline, and expose them to other tools over an OpenAI-compatible API.
+Your personal LLM bunker. One portable binary that downloads language models,
+runs them, chats with them, codes with them, and serves them to other tools.
+All of it on your own machine, all of it offline once the models are on disk.
 
-No model server, no cloud, no accounts. Once a model is downloaded, everything
-works without internet.
+No external dependencies. No model server to install, no Python environment to
+ruin, no cloud, no accounts, no telemetry. llama.cpp is compiled straight into
+the executable, the fonts and icons are baked in, and the whole thing fits in
+a single file you can copy onto a USB stick next to your canned beans. When
+the internet goes away, offgrid keeps working. Frankly, it barely noticed the
+internet was there in the first place.
 
-## Features
+## What it does
 
-- **Models tab** — curated starter catalog (verified known-good chat models)
-  plus full Hugging Face GGUF search. Every model gets a fit badge
-  (`fits` / `tight` / `too big`) based on your RAM, and the app recommends the
-  best model for your hardware. Download with progress, load, delete.
-- **Chat tab** — streaming chat with the loaded model, runs on llama.cpp
-  (statically linked via `llama-cpp-2`), CPU inference.
-- **Code tab** — a simple local coding agent: point it at a workspace folder,
-  give it a task, and the loaded model works with tools (`list_files`,
-  `read_file`, `write_file`, `run_command`) in a Claude Code-like loop. File
-  access is sandboxed to the workspace; shell commands need per-command
-  approval unless auto-approve is enabled. Drop an `AGENTS.md` in the
-  workspace root to give the agent project instructions. Optional web tools
-  (`web_search` via DuckDuckGo Lite with a Wikipedia fallback, plus
-  `fetch_url`) are off by default and degrade gracefully offline: failures
-  come back to the model as a short "web unavailable" note so the run
-  continues on local knowledge instead of hanging. Works best with
-  Qwen3 4B or larger; run `offgrid --smoke-agent` for a headless check.
-- **Serve tab** — optional OpenAI-compatible server on `127.0.0.1:11633`
-  (`/v1/models`, `/v1/chat/completions` with SSE streaming) so tools like
-  opencode, aider, or editor plugins can use your local models. Includes a
-  ready-to-copy `opencode.json` provider snippet.
+- **Models**: a curated catalog of known-good models plus full Hugging Face
+  search. Every model shows its size, an estimated tok/s for your actual
+  hardware (measured, not guessed from vibes), and a fit badge so you know
+  whether it fits in RAM before you commit to an 18 GB download. Downloads
+  survive network drops and app restarts, and resume where they stopped.
+- **Chat**: streaming markdown chat with whatever model you loaded. Reasoning
+  models get their thinking rendered as a quiet little quote block instead of
+  raw tags all over your screen.
+- **Code**: a small coding agent in the spirit of Claude Code, just with a
+  model that fits in your laptop. Point it at a folder, give it a task, and it
+  reads, writes, and runs things in a tool loop. File access is sandboxed to
+  the workspace, shell commands wait for your approval unless you tell it to
+  stop asking. Drop an `AGENTS.md` into the workspace for project
+  instructions. Optional web tools (search and page fetch) are off by default
+  and fail politely when offline, which is the entire point of this app.
+- **Serve**: an OpenAI-compatible API on `127.0.0.1:11633`, so opencode,
+  aider, editors, and scripts can use your local models while believing they
+  are talking to something much more expensive.
+- **Settings**: three UI styles (a loving Haiku OS recreation as default, a
+  clean Material look, and stock egui for the purists), context window size,
+  and a summary of what your hardware can actually do.
 
-Models are stored in `~/.local/share/offgrid/models/`, config in
-`~/.config/offgrid/`.
+Models live in `~/.local/share/offgrid/models/`, config in
+`~/.config/offgrid/`. Delete those two folders and it is like we never met.
+
+## Portability
+
+The release binary is self-contained: statically linked inference, embedded
+fonts (Noto Sans, IBM Plex), embedded icons, no runtime downloads except the
+models you explicitly ask for. Copy it to another machine of the same OS and
+architecture and it just runs. Prebuilt Linux, macOS, and Windows builds are
+on the releases page.
 
 ## Build
 
-Requires a C/C++ toolchain and CMake (llama.cpp is compiled in):
+You need a C/C++ toolchain and CMake, because llama.cpp gets compiled into
+the binary. That is the price of having no dependencies later.
 
 ```sh
 sudo apt install build-essential cmake   # debian/ubuntu
 cargo run --release
 ```
 
-Use `--release` — CPU inference in debug builds is much slower.
+Use `--release`. Debug-build inference is not "slower", it is a form of
+meditation.
 
 ## macOS releases
 
-The `.app` in the releases is ad-hoc signed but not notarized (no Apple
-developer account). On first launch, right-click the app and choose "Open"
-instead of double-clicking. If macOS still refuses, clear the download
-quarantine flag:
+The `.app` is ad-hoc signed but not notarized, because Apple charges rent for
+the privilege. On first launch, right-click the app and choose "Open". If
+macOS still sulks:
 
 ```sh
 xattr -cr /Applications/offgrid.app
 ```
 
-## Headless smoke test
+## Headless checks
 
 ```sh
-cargo run --release -- --smoke
+cargo run --release -- --smoke         # download tiny model, generate, serve
+cargo run --release -- --smoke-agent   # run the coding agent end to end
 ```
-
-Downloads the smallest catalog model if needed, runs one generation, then
-serves the API until Ctrl+C.
 
 ## UI snapshot test
 
-The screenshot above is generated by an [egui_kittest](https://crates.io/crates/egui_kittest)
-snapshot test that renders the main screen offscreen and compares it against
-`tests/snapshots/offgrid.png`. After intentional UI changes, refresh the
-baseline (and the README image) with:
+The screenshot above is not a screenshot. It is rendered by an
+[egui_kittest](https://crates.io/crates/egui_kittest) snapshot test, complete
+with a fake Haiku desktop and a fake window shadow, and compared pixel by
+pixel against `tests/snapshots/offgrid.png` on every test run. After
+intentional UI changes, refresh the baseline and the image in one go:
 
 ```sh
 UPDATE_SNAPSHOTS=1 cargo test main_screen_snapshot
@@ -81,12 +93,16 @@ cp tests/snapshots/offgrid.png assets/screenshot.png
 
 ## Notes
 
-- Reasoning models (e.g. Qwen3) may show raw `<think>…</think>` blocks in
-  responses; append `/no_think` to your message to disable that on Qwen3.
-- The context window is fixed at 4096 tokens; clear the chat if it fills up.
+- The context window defaults to 16384 tokens and is adjustable in Settings.
+  The Chat and Code tabs show a small meter so you can watch it fill up in
+  real time, like a fuel gauge but for regret.
+- Qwen3 reasoning models accept `/no_think` in a message if you want answers
+  without the inner monologue.
+- Multi-part GGUF repos (the 500 GB kind) are listed but not downloadable.
+  This is a feature. You do not have 500 GB of RAM.
 
 ## Roadmap
 
-- GPU offload (`llama-cpp-2` vulkan/cuda features + VRAM-aware recommendations)
+- GPU offload (vulkan/cuda features plus VRAM-aware recommendations)
 - Persistent conversations
 - Agent: edit/patch tool, diff view, multi-task memory
