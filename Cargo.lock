@@ -1080,7 +1080,6 @@ dependencies = [
  "egui",
  "egui_extras",
  "pulldown-cmark",
- "syntect",
 ]
 
 [[package]]
@@ -1097,6 +1096,7 @@ dependencies = [
  "log",
  "mime_guess2",
  "profiling",
+ "syntect",
 ]
 
 [[package]]
