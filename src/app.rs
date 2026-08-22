@@ -480,7 +480,7 @@ impl OffgridApp {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         // Plain grey strip above the tabs, like Haiku's window layouts.
-        ui.add_space(6.0);
+        ui.add_space(14.0);
         theme::tab_bar(
             ui,
             &mut self.tab,
@@ -1781,7 +1781,7 @@ mod tests {
         egui::Panel::top("top")
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.add_space(6.0);
+                ui.add_space(14.0);
                 let mut tab = Tab::Models;
                 theme::tab_bar(
                     ui,

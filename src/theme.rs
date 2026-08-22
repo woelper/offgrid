@@ -83,6 +83,8 @@ pub struct Skin {
     pub tab_active_top: Color32,
     /// Faint vertical divider between inactive tabs.
     pub tab_divider: Color32,
+    /// Faint outline for tabs/strip edges (embossed look).
+    pub tab_border: Color32,
     /// Primary accent (links, checkbox marks, selection stroke).
     pub accent: Color32,
     pub selection: Color32,
@@ -111,10 +113,11 @@ pub const HAIKU: Skin = Skin {
     window_border: Color32::from_rgb(80, 80, 80),
     title: Color32::from_rgb(255, 203, 0),
     title_border: Color32::from_rgb(120, 90, 0),
-    tab_strip_top: Color32::from_rgb(211, 211, 211),
-    tab_strip_bottom: Color32::from_rgb(201, 201, 201),
+    tab_strip_top: Color32::from_rgb(197, 197, 197),
+    tab_strip_bottom: Color32::from_rgb(209, 209, 209),
     tab_active_top: Color32::from_rgb(228, 228, 228),
     tab_divider: Color32::from_rgb(183, 183, 183),
+    tab_border: Color32::from_rgb(172, 172, 172),
     accent: Color32::from_rgb(51, 102, 152),
     selection: Color32::from_rgb(170, 200, 235),
     progress_top: Color32::from_rgb(158, 200, 250),
@@ -141,10 +144,11 @@ pub const EGUI_DEFAULT: Skin = Skin {
     window_border: Color32::from_gray(60),
     title: Color32::from_gray(60),
     title_border: Color32::from_gray(90),
-    tab_strip_top: Color32::from_gray(34),
-    tab_strip_bottom: Color32::from_gray(22),
+    tab_strip_top: Color32::from_gray(20),
+    tab_strip_bottom: Color32::from_gray(32),
     tab_active_top: Color32::from_gray(40),
     tab_divider: Color32::from_gray(55),
+    tab_border: Color32::from_gray(60),
     accent: Color32::from_rgb(110, 170, 255),
     selection: Color32::from_rgb(0, 92, 128),
     progress_top: Color32::from_rgb(110, 170, 255),
@@ -170,10 +174,11 @@ pub const MATERIAL: Skin = Skin {
     window_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
     title: Color32::from_rgb(0xe9, 0xed, 0xf3),
     title_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
-    tab_strip_top: Color32::from_rgb(0xee, 0xf1, 0xf6),
-    tab_strip_bottom: Color32::from_rgb(0xe4, 0xe8, 0xef),
+    tab_strip_top: Color32::from_rgb(0xe4, 0xe8, 0xef),
+    tab_strip_bottom: Color32::from_rgb(0xee, 0xf1, 0xf6),
     tab_active_top: Color32::WHITE,
     tab_divider: Color32::from_rgb(0xd5, 0xda, 0xe2),
+    tab_border: Color32::from_rgb(0xd0, 0xd6, 0xde),
     accent: Color32::from_rgb(0x11, 0x72, 0xdc),
     selection: Color32::from_rgb(0xc4, 0xe1, 0xfb),
     progress_top: Color32::from_rgb(0x5a, 0xa2, 0xee),
@@ -474,7 +479,8 @@ pub fn tab_bar<T: Copy + PartialEq>(
         sw: 0,
         se: 0,
     };
-    let border = Stroke::new(1.0, s.control_border);
+    let border = Stroke::new(1.0, s.tab_border);
+    let emboss = Stroke::new(1.0, Color32::from_white_alpha(90));
     let p = ui.painter();
     // The inactive area is a continuous strip running from window edge to
     // window edge (past the panel's inner margin); inactive tabs are just
@@ -485,15 +491,18 @@ pub fn tab_bar<T: Copy + PartialEq>(
     let strip =
         egui::Rect::from_min_max(egui::pos2(x0, baseline - strip_h), egui::pos2(x1, baseline));
     vertical_gradient(p, strip, s.tab_strip_top, s.tab_strip_bottom);
+    // Embossed top edge: faint dark line with a light line beneath.
     p.hline(x0..=x1, strip.min.y, border);
+    p.hline(x0..=x1, strip.min.y + 1.0, emboss);
     let divider = Stroke::new(1.0, s.tab_divider);
     for (i, (value, _, _)) in items.iter().enumerate() {
         if *current != *value {
             p.vline(rects[i].max.x, strip.min.y..=baseline, divider);
         }
     }
-    // Continuous baseline under the whole bar…
+    // Continuous baseline under the whole bar, embossed like the top edge…
     p.hline(x0..=x1, baseline, border);
+    p.hline(x0..=x1, baseline + 1.0, emboss);
     // …then the active tab painted over it, borderless at the bottom.
     if let Some(i) = items.iter().position(|(v, _, _)| *v == *current) {
         let r = rects[i];
