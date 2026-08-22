@@ -1080,54 +1080,66 @@ impl OffgridApp {
         path.is_dir().then_some(path)
     }
 
-    fn code_ui(&mut self, ui: &mut egui::Ui) {
-        theme::group(ui, "Workspace", Some(theme::icons().code.clone()), |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Folder:");
-                match &self.config.workspace {
-                    Some(p) => {
-                        ui.monospace(p.display().to_string());
-                    }
-                    None => {
-                        ui.weak("no folder selected");
+    fn workspace_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Folder:");
+            match &self.config.workspace {
+                Some(p) => {
+                    ui.monospace(p.display().to_string());
+                }
+                None => {
+                    ui.weak("no folder selected");
+                }
+            }
+            if theme::button(ui, Some((theme::icons().folder.clone(), 16.0)), "Browse…").clicked()
+            {
+                let start = self
+                    .workspace_path()
+                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                if let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() {
+                    self.workspace_input = dir.display().to_string();
+                    self.config.workspace = Some(dir);
+                    self.config.save();
+                }
+            }
+            match self.workspace_path() {
+                Some(ws) => {
+                    ui.colored_label(theme::skin().good, "✔");
+                    if !ws.join("AGENTS.md").exists()
+                        && theme::button(ui, None, "Create AGENTS.md")
+                            .on_hover_text(
+                                "A project instructions file the agent reads before every task",
+                            )
+                            .clicked()
+                        && let Err(e) =
+                            std::fs::write(ws.join("AGENTS.md"), agent::AGENTS_MD_TEMPLATE)
+                    {
+                        self.last_error = Some(format!("could not create AGENTS.md: {e}"));
                     }
                 }
-                if theme::button(ui, Some((theme::icons().folder.clone(), 16.0)), "Browse…")
-                    .clicked()
-                {
-                    let start = self
-                        .workspace_path()
-                        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    if let Some(dir) = rfd::FileDialog::new().set_directory(start).pick_folder() {
-                        self.workspace_input = dir.display().to_string();
-                        self.config.workspace = Some(dir);
-                        self.config.save();
+                None => {
+                    if !self.workspace_input.trim().is_empty() {
+                        ui.colored_label(theme::skin().bad, "not a folder");
                     }
                 }
-                match self.workspace_path() {
-                    Some(ws) => {
-                        ui.colored_label(theme::skin().good, "✔");
-                        if !ws.join("AGENTS.md").exists()
-                            && theme::button(ui, None, "Create AGENTS.md")
-                                .on_hover_text(
-                                    "A project instructions file the agent reads before every task",
-                                )
-                                .clicked()
-                            && let Err(e) =
-                                std::fs::write(ws.join("AGENTS.md"), agent::AGENTS_MD_TEMPLATE)
-                        {
-                            self.last_error = Some(format!("could not create AGENTS.md: {e}"));
-                        }
-                    }
-                    None => {
-                        if !self.workspace_input.trim().is_empty() {
-                            ui.colored_label(theme::skin().bad, "not a folder");
-                        }
-                    }
-                }
-            });
+            }
         });
+    }
+
+    fn code_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(ws) = self.workspace_path() {
+            // A valid workspace collapses to a single line; expand to change.
+            egui::CollapsingHeader::new(format!("Workspace: {}", ws.display()))
+                .id_salt("workspace_section")
+                .default_open(false)
+                .show(ui, |ui| self.workspace_controls(ui));
+            ui.add_space(4.0);
+        } else {
+            theme::group(ui, "Workspace", Some(theme::icons().code.clone()), |ui| {
+                self.workspace_controls(ui);
+            });
+        }
 
         theme::group(ui, "Task", None, |ui| {
             let task_resp = ui.add(
