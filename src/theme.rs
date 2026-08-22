@@ -199,7 +199,6 @@ pub fn skin() -> &'static Skin {
 /// The icon set is part of the skin: Haiku uses the original Haiku artwork,
 /// the other styles use a neutral line-icon set.
 pub struct IconSet {
-    pub logo: egui::ImageSource<'static>,
     pub disk: egui::ImageSource<'static>,
     pub chat: egui::ImageSource<'static>,
     pub serve: egui::ImageSource<'static>,
@@ -214,7 +213,6 @@ pub struct IconSet {
 }
 
 pub static HAIKU_ICONS: IconSet = IconSet {
-    logo: egui::include_image!("../assets/icons/Alert_Idea.png"),
     disk: egui::include_image!("../assets/icons/Device_Harddisk.png"),
     chat: egui::include_image!("../assets/icons/App_Chat.png"),
     serve: egui::include_image!("../assets/icons/Server_Net.png"),
@@ -229,7 +227,6 @@ pub static HAIKU_ICONS: IconSet = IconSet {
 };
 
 pub static NEUTRAL_ICONS: IconSet = IconSet {
-    logo: egui::include_image!("../assets/icons/neutral/logo.png"),
     disk: egui::include_image!("../assets/icons/neutral/disk.png"),
     chat: egui::include_image!("../assets/icons/neutral/chat.png"),
     serve: egui::include_image!("../assets/icons/neutral/serve.png"),

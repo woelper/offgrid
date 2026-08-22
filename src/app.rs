@@ -479,33 +479,8 @@ impl OffgridApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            theme::icon(ui, theme::icons().logo.clone(), 22.0);
-            ui.heading(egui::RichText::new("offgrid").strong());
-            ui.separator();
-            ui.label(format!(
-                "{} · {} cores · {} RAM",
-                self.hardware.cpu_brand,
-                self.hardware.cores,
-                fmt_bytes(self.hardware.total_ram)
-            ));
-            ui.separator();
-            if self.model_loading {
-                ui.spinner();
-                ui.label("loading model…");
-            } else if let Some(name) = &self.loaded_model {
-                ui.colored_label(theme::skin().good, name);
-                let unload = ui.small_button("Unload");
-                theme::gloss(ui, unload.rect);
-                if unload.clicked() {
-                    let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
-                }
-            } else {
-                ui.weak("no model loaded");
-            }
-        });
-        ui.add_space(4.0);
+        // Plain grey strip above the tabs, like Haiku's window layouts.
+        ui.add_space(6.0);
         theme::tab_bar(
             ui,
             &mut self.tab,
@@ -556,6 +531,48 @@ impl OffgridApp {
                 );
             },
         );
+
+        theme::group(ui, "Model", Some(theme::icons().chat.clone()), |ui| {
+            let row_h = theme::skin().control_height;
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(70.0, row_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| ui.label("Context:"),
+                );
+                let mut n_ctx = self.n_ctx();
+                egui::ComboBox::from_id_salt("n_ctx_select")
+                    .selected_text(format!("{n_ctx} tokens"))
+                    .show_ui(ui, |ui| {
+                        for v in [4096u32, 8192, 16384, 32768] {
+                            ui.selectable_value(&mut n_ctx, v, format!("{v} tokens"));
+                        }
+                    });
+                if n_ctx != self.n_ctx() {
+                    self.config.n_ctx = Some(n_ctx);
+                    self.config.save();
+                }
+            });
+            ui.weak(
+                "Larger context windows let agent tasks run longer before compaction, \
+                 at the cost of RAM (KV cache) and slower long-context generation.",
+            );
+        });
+
+        theme::group(ui, "System", Some(theme::icons().disk.clone()), |ui| {
+            ui.label(format!(
+                "{} · {} cores ({} physical) · {} RAM",
+                self.hardware.cpu_brand,
+                self.hardware.cores,
+                self.hardware.physical_cores,
+                fmt_bytes(self.hardware.total_ram)
+            ));
+            ui.weak(format!(
+                "Measured memory bandwidth: {}/s — this drives the tok/s estimates \
+                 in the model lists.",
+                fmt_bytes(self.hardware.mem_bandwidth)
+            ));
+        });
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
@@ -574,6 +591,33 @@ impl OffgridApp {
 
     fn models_ui(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            theme::group(
+                ui,
+                "Current model",
+                Some(theme::icons().chat.clone()),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        if self.model_loading {
+                            ui.spinner();
+                            ui.label("loading model…");
+                        } else if let Some(name) = self.loaded_model.clone() {
+                            ui.colored_label(theme::skin().good, "•");
+                            ui.label(&name);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, None, "Unload").clicked() {
+                                        let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
+                                    }
+                                },
+                            );
+                        } else {
+                            ui.weak("No model loaded — pick one below.");
+                        }
+                    });
+                },
+            );
+
             theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
                 if self.local_models.is_empty() {
                     ui.weak("No models yet — download one below.");
@@ -1737,18 +1781,7 @@ mod tests {
         egui::Panel::top("top")
             .show_separator_line(false)
             .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    theme::icon(ui, theme::icons().logo.clone(), 22.0);
-                    ui.heading(egui::RichText::new("offgrid").strong());
-                    ui.separator();
-                    ui.label("AMD Ryzen 7 4800H · 16 cores · 32.0 GB RAM");
-                    ui.separator();
-                    ui.colored_label(theme::skin().good, "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
-                    let unload = ui.small_button("Unload");
-                    theme::gloss(ui, unload.rect);
-                });
-                ui.add_space(4.0);
+                ui.add_space(6.0);
                 let mut tab = Tab::Models;
                 theme::tab_bar(
                     ui,
@@ -1764,6 +1797,20 @@ mod tests {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            theme::group(
+                ui,
+                "Current model",
+                Some(theme::icons().chat.clone()),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(theme::skin().good, "•");
+                        ui.label("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let _ = theme::button(ui, None, "Unload");
+                        });
+                    });
+                },
+            );
             theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
                 let rows: [(&str, u64, bool); 3] = [
                     ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
@@ -1845,7 +1892,7 @@ mod tests {
     #[test]
     fn main_screen_snapshot() {
         let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1000.0, 640.0))
+            .with_size(egui::vec2(1000.0, 700.0))
             .build_ui(desktop_ui);
         harness.run();
         harness.snapshot("offgrid");
