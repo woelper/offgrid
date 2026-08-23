@@ -148,6 +148,12 @@ fn run_loop(
     ];
     log.log("SYSTEM PROMPT", &messages[0].content);
     log.log("TASK", task);
+    if recent_history(workspace).is_some() {
+        let _ = tx.send(AgentEvent::Info(
+            "project history from earlier sessions injected into context".into(),
+        ));
+    }
+    let mut files_touched: Vec<String> = Vec::new();
 
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
@@ -242,6 +248,9 @@ fn run_loop(
                 });
                 continue;
             }
+            if !response.trim().is_empty() {
+                append_history(workspace, task, &response, &files_touched);
+            }
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
             });
@@ -295,6 +304,13 @@ fn run_loop(
             );
         }
         let ok = tool_output_ok(&output);
+        if ok
+            && call.name == "write_file"
+            && let Some(path) = call.arg("path")
+            && !files_touched.iter().any(|f| f == path)
+        {
+            files_touched.push(path.to_string());
+        }
         // A successful write_file leaves a full copy of the file in the
         // assistant's turn — the biggest context hog. Replace it with plain
         // prose (NOT a syntactically valid tool call: the model imitates its
@@ -370,10 +386,98 @@ fn compact_transcript(messages: &mut [ChatMessage], level: usize) {
     }
 }
 
+const HISTORY_RECENT: usize = 5;
+const HISTORY_MAX_CHARS: usize = 2000;
+
+fn history_path(workspace: &Path) -> PathBuf {
+    workspace.join(".offgrid").join("history.md")
+}
+
+fn strip_think_blocks(s: &str) -> String {
+    let mut out = s.to_string();
+    while let Some(start) = out.find("<think>") {
+        let end = out[start..]
+            .find("</think>")
+            .map(|e| start + e + "</think>".len())
+            .unwrap_or(out.len());
+        out.replace_range(start..end, "");
+    }
+    out
+}
+
+/// Append a finished task to the workspace's rolling history. The file is a
+/// plain, user-editable markdown file in `.offgrid/history.md`.
+fn append_history(workspace: &Path, task: &str, summary: &str, files: &[String]) {
+    let path = history_path(workspace);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let task_line: String = task
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(120)
+        .collect();
+    let mut summary = strip_think_blocks(summary).trim().to_string();
+    if summary.chars().count() > 600 {
+        summary = summary.chars().take(600).collect::<String>() + "…";
+    }
+    let files_line = if files.is_empty() {
+        String::new()
+    } else {
+        format!("\nFiles touched: {}", files.join(", "))
+    };
+    let entry = format!("\n## Task: {task_line}\n{summary}{files_line}\n");
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
+
+/// The most recent history entries, capped so they can't crowd the prompt.
+fn recent_history(workspace: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(history_path(workspace)).ok()?;
+    let mut entries: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in text.lines() {
+        if line.starts_with("## ") && !cur.trim().is_empty() {
+            entries.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    if !cur.trim().is_empty() {
+        entries.push(cur);
+    }
+    let start = entries.len().saturating_sub(HISTORY_RECENT);
+    let recent = entries[start..].join("\n");
+    let recent: String = if recent.chars().count() > HISTORY_MAX_CHARS {
+        // Keep the tail: newest entries win.
+        let skip = recent.chars().count() - HISTORY_MAX_CHARS;
+        recent.chars().skip(skip).collect()
+    } else {
+        recent
+    };
+    (!recent.trim().is_empty()).then_some(recent)
+}
+
 fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let listing = list_files_impl(workspace, workspace, 1).unwrap_or_default();
     let agents_md = std::fs::read_to_string(workspace.join("AGENTS.md"))
         .map(|s| format!("\nProject instructions (AGENTS.md):\n{s}\n"))
+        .unwrap_or_default();
+    let history = recent_history(workspace)
+        .map(|h| {
+            format!(
+                "\nWhat happened in this workspace in earlier sessions (newest last):\n{h}\n\
+                 Trust this history: do not redo or rewrite work it describes as done.\n"
+            )
+        })
         .unwrap_or_default();
     let web = if web_tools {
         "- web_search: arguments {\"query\": \"...\"} — search the web\n\
@@ -415,10 +519,12 @@ and NEVER rewrite an existing file from scratch unless the task explicitly \
 asks for a rewrite.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
+{history}\
 \n\
 Top-level files in the workspace:\n{listing}",
         ws = workspace.display(),
         agents = agents_md,
+        history = history,
         web = web,
     )
 }
@@ -711,7 +817,10 @@ fn list_files_impl(dir: &Path, workspace: &Path, max_depth: usize) -> Result<Str
                 return Ok(lines.join("\n"));
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if matches!(name.as_str(), ".git" | "target" | "node_modules" | ".venv") {
+            if matches!(
+                name.as_str(),
+                ".git" | "target" | "node_modules" | ".venv" | ".offgrid"
+            ) {
                 continue;
             }
             let path = entry.path();
@@ -1046,6 +1155,32 @@ mod tests {
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
         assert!(parse_tool_call(r).is_none());
+    }
+
+    #[test]
+    fn history_roundtrip_keeps_newest_entries() {
+        let ws = std::env::temp_dir().join("offgrid-history-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        for i in 0..7 {
+            append_history(
+                &ws,
+                &format!("task number {i}"),
+                "<think>internal</think>Built the thing successfully.",
+                &[format!("src/file{i}.rs")],
+            );
+        }
+        let recent = recent_history(&ws).unwrap();
+        // capped at the newest 5 entries
+        assert!(!recent.contains("task number 0"));
+        assert!(!recent.contains("task number 1"));
+        assert!(recent.contains("task number 2"));
+        assert!(recent.contains("task number 6"));
+        // think blocks are stripped, summary and files are present
+        assert!(!recent.contains("<think>"));
+        assert!(recent.contains("Built the thing successfully."));
+        assert!(recent.contains("src/file6.rs"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
