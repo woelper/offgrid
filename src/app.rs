@@ -66,7 +66,11 @@ impl RowCuller {
             let clip = ui.clip_rect();
             let top = ui.cursor().top();
             if top + h < clip.min.y - MARGIN || top > clip.max.y + MARGIN {
-                ui.add_space(h);
+                // A rendered widget advances the cursor by height PLUS
+                // item_spacing; add_space advances by exactly the amount.
+                // Without the compensation, total content height changes with
+                // the culled-row count, which made scrolling jump and flicker.
+                ui.add_space(h + ui.spacing().item_spacing.y);
                 return;
             }
         }
