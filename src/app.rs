@@ -673,14 +673,14 @@ impl OffgridApp {
             theme::group(
                 ui,
                 "Current model",
-                Some(theme::icons().chat.clone()),
+                Some(theme::icons().model.clone()),
                 |ui| {
                     ui.horizontal(|ui| {
                         if self.model_loading {
                             ui.spinner();
                             ui.label("loading model…");
                         } else if let Some(name) = self.loaded_model.clone() {
-                            ui.colored_label(theme::skin().good, "•");
+                            theme::icon(ui, theme::icons().model.clone(), 18.0);
                             ui.label(&name);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1987,10 +1987,10 @@ mod tests {
             theme::group(
                 ui,
                 "Current model",
-                Some(theme::icons().chat.clone()),
+                Some(theme::icons().model.clone()),
                 |ui| {
                     ui.horizontal(|ui| {
-                        ui.colored_label(theme::skin().good, "•");
+                        theme::icon(ui, theme::icons().model.clone(), 18.0);
                         ui.label("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let _ = theme::button(ui, None, "Unload");
