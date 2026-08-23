@@ -38,6 +38,12 @@ impl Config {
     }
 }
 
+pub fn logs_dir() -> PathBuf {
+    directories::ProjectDirs::from("", "", "offgrid")
+        .map(|d| d.data_dir().join("logs"))
+        .unwrap_or_else(|| PathBuf::from("./logs"))
+}
+
 pub fn models_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "offgrid")
         .map(|d| d.data_dir().join("models"))

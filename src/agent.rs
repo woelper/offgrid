@@ -48,6 +48,36 @@ pub enum AgentEvent {
     Error(String),
 }
 
+/// Verbatim session log for post-mortem debugging: raw model output, parse
+/// results, full tool I/O. One file per run under the data dir.
+struct SessionLog {
+    file: Option<std::fs::File>,
+    pub path: std::path::PathBuf,
+}
+
+impl SessionLog {
+    fn new() -> Self {
+        let dir = crate::config::logs_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        // Seconds since epoch keeps names unique enough per machine.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("agent-{stamp}.log"));
+        let file = std::fs::File::create(&path).ok();
+        Self { file, path }
+    }
+
+    fn log(&mut self, tag: &str, text: &str) {
+        if let Some(f) = &mut self.file {
+            use std::io::Write as _;
+            let _ = writeln!(f, "\n===== {tag} =====\n{text}");
+            let _ = f.flush();
+        }
+    }
+}
+
 pub struct AgentRun {
     pub rx: Receiver<AgentEvent>,
     pub stop: Arc<AtomicBool>,
@@ -101,6 +131,11 @@ fn run_loop(
     web_tools: bool,
     n_ctx: u32,
 ) -> Result<(), String> {
+    let mut log = SessionLog::new();
+    let _ = tx.send(AgentEvent::Info(format!(
+        "session log: {}",
+        log.path.display()
+    )));
     let mut messages = vec![
         ChatMessage {
             role: Role::System,
@@ -111,6 +146,8 @@ fn run_loop(
             content: task.to_string(),
         },
     ];
+    log.log("SYSTEM PROMPT", &messages[0].content);
+    log.log("TASK", task);
 
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
@@ -156,6 +193,7 @@ fn run_loop(
             // instead of aborting the run.
             if e.starts_with("context window full") && compact_level < 2 {
                 compact_level += 1;
+                log.log("COMPACTION", &format!("level {}", compact_level));
                 compact_transcript(&mut messages, compact_level);
                 let _ = tx.send(AgentEvent::Info(format!(
                     "context window full — compacting transcript (level {compact_level}) and retrying"
@@ -171,6 +209,10 @@ fn run_loop(
             });
         }
         let _ = tx.send(AgentEvent::TurnDone);
+        log.log(
+            &format!("MODEL RESPONSE (turn {iteration}, raw)"),
+            &response,
+        );
         messages.push(ChatMessage {
             role: Role::Assistant,
             content: response.clone(),
@@ -183,6 +225,10 @@ fn run_loop(
                 || (response.contains("\"name\"") && response.contains("\"arguments\""));
             if attempted && format_retries < 2 {
                 format_retries += 1;
+                log.log(
+                    "PARSE FAILURE",
+                    "response looked like a tool call but did not parse; nudging model",
+                );
                 let _ = tx.send(AgentEvent::Info(
                     "tool call could not be parsed — asking the model to retry".into(),
                 ));
@@ -202,6 +248,7 @@ fn run_loop(
             return Ok(());
         };
 
+        log.log("TOOL CALL", &format!("{}: {}", call.name, call.arguments));
         let _ = tx.send(AgentEvent::ToolCall {
             name: call.name.clone(),
             summary: call.summary(),
@@ -272,6 +319,7 @@ fn run_loop(
             // both the transcript and the model.
             output = "(no output — completed successfully)".to_string();
         }
+        log.log(&format!("TOOL RESULT (ok={ok})"), &output);
         let _ = tx.send(AgentEvent::ToolResult {
             output: output.clone(),
             ok,
@@ -361,6 +409,10 @@ Example turn:\n\
 After writing or changing code, ALWAYS run it or the project's tests with \
 run_command and fix any errors until it succeeds — never declare code done \
 without running it.\n\
+The workspace may already contain a working project from earlier tasks. Read \
+files before changing them, make the smallest change that fulfils the task, \
+and NEVER rewrite an existing file from scratch unless the task explicitly \
+asks for a rewrite.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 \n\
