@@ -30,6 +30,16 @@ wait-timeout = "0.2.1"
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
 
+# Debug builds: light optimization for our code (fast incremental compiles),
+# full optimization for dependencies — that's where the hot paths live
+# (syntect, inference glue), and it makes the cmake-built llama.cpp compile
+# as Release instead of Debug.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 # min-sized-rust settings (https://github.com/johnthagen/min-sized-rust).
 # Deliberate deviation: opt-level stays 3 instead of "z" — the cmake crate
 # maps s/z to a MinSizeRel (-Os) build of llama.cpp, which slows inference.
