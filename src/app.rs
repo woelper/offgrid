@@ -579,6 +579,75 @@ impl OffgridApp {
                 fmt_bytes(self.hardware.mem_bandwidth)
             ));
         });
+
+        // Debug builds only: quick access to agent session logs.
+        if cfg!(debug_assertions) {
+            theme::group(
+                ui,
+                "Session logs (debug)",
+                Some(theme::icons().file.clone()),
+                |ui| {
+                    let dir = crate::config::logs_dir();
+                    ui.horizontal(|ui| {
+                        ui.monospace(dir.display().to_string());
+                        if theme::button(
+                            ui,
+                            Some((theme::icons().folder.clone(), 16.0)),
+                            "Open folder",
+                        )
+                        .clicked()
+                            && let Err(e) = open::that_detached(&dir)
+                        {
+                            self.last_error = Some(format!("could not open folder: {e}"));
+                        }
+                    });
+                    let mut logs: Vec<(String, std::path::PathBuf, u64, std::time::SystemTime)> =
+                        std::fs::read_dir(&dir)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter_map(|e| {
+                                let meta = e.metadata().ok()?;
+                                Some((
+                                    e.file_name().to_string_lossy().to_string(),
+                                    e.path(),
+                                    meta.len(),
+                                    meta.modified().ok()?,
+                                ))
+                            })
+                            .collect();
+                    logs.sort_by(|a, b| b.3.cmp(&a.3));
+                    if logs.is_empty() {
+                        ui.weak("No session logs yet — run an agent task first.");
+                    }
+                    for (name, path, size, _) in logs.iter().take(10) {
+                        ui.horizontal(|ui| {
+                            ui.monospace(name);
+                            ui.weak(fmt_bytes(*size));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if theme::button(ui, None, "Open").clicked()
+                                        && let Err(e) = open::that_detached(path)
+                                    {
+                                        self.last_error = Some(format!("could not open log: {e}"));
+                                    }
+                                    if theme::button(ui, None, "Copy contents").clicked() {
+                                        match std::fs::read_to_string(path) {
+                                            Ok(text) => ui.ctx().copy_text(text),
+                                            Err(e) => {
+                                                self.last_error =
+                                                    Some(format!("could not read log: {e}"));
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    }
+                },
+            );
+        }
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {

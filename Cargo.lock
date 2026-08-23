@@ -2695,6 +2695,7 @@ dependencies = [
  "egui_kittest",
  "image",
  "llama-cpp-2",
+ "open",
  "rfd",
  "serde",
  "serde_json",
