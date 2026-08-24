@@ -604,6 +604,26 @@ impl OffgridApp {
                         {
                             self.last_error = Some(format!("could not open folder: {e}"));
                         }
+                        if theme::button(
+                            ui,
+                            Some((theme::icons().trash.clone(), 16.0)),
+                            "Clear logs",
+                        )
+                        .clicked()
+                        {
+                            // Only remove our own agent logs, nothing else
+                            // that might live in the directory.
+                            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.starts_with("agent-")
+                                    && name.ends_with(".log")
+                                    && let Err(e) = std::fs::remove_file(entry.path())
+                                {
+                                    self.last_error =
+                                        Some(format!("could not delete {name}: {e}"));
+                                }
+                            }
+                        }
                     });
                     let mut logs: Vec<(String, std::path::PathBuf, u64, std::time::SystemTime)> =
                         std::fs::read_dir(&dir)
