@@ -154,6 +154,13 @@ fn run_loop(
         ));
     }
     let mut files_touched: Vec<String> = Vec::new();
+    // Paths the model has read since their last write. Overwriting a file
+    // that is not in here is rejected (see write_gate).
+    let mut fresh_reads: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // False while file changes have not been followed by a successful
+    // run_command — finishing in that state gets one corrective nudge.
+    let mut verified_since_write = true;
+    let mut verify_nudged = false;
 
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
@@ -248,6 +255,52 @@ fn run_loop(
                 });
                 continue;
             }
+            // The model sometimes imitates the transcript stub that replaces
+            // its earlier write_file turns — narrating a write instead of
+            // calling the tool. Left alone this silently ends the run with
+            // nothing written (observed in the wild).
+            if claims_fake_write(&response) && format_retries < 2 {
+                format_retries += 1;
+                log.log(
+                    "FAKE WRITE",
+                    "response narrates a write but no tool was called; nudging model",
+                );
+                let _ = tx.send(AgentEvent::Info(
+                    "model claimed a write without calling a tool — asking it to really write"
+                        .into(),
+                ));
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: "You described writing a file, but no tool call was made and \
+                              nothing was written to disk. Emit a real <tool_call> for \
+                              write_file with the complete file content — or, if the task \
+                              is truly finished and verified, reply with only a summary."
+                        .into(),
+                });
+                continue;
+            }
+            // Finishing with unverified changes: files were written but no
+            // run_command has succeeded since. One nudge, then let it end.
+            if !verified_since_write && !verify_nudged {
+                verify_nudged = true;
+                log.log(
+                    "UNVERIFIED FINISH",
+                    "model tried to finish with unverified file changes; nudging model",
+                );
+                let _ = tx.send(AgentEvent::Info(
+                    "files were changed but never verified — asking the model to run a check"
+                        .into(),
+                ));
+                messages.push(ChatMessage {
+                    role: Role::User,
+                    content: "You have written files since the last successful run_command, \
+                              so the changes are unverified. Run the project's check, build, \
+                              or tests with run_command now and fix any errors. Only finish \
+                              after the command succeeds."
+                        .into(),
+                });
+                continue;
+            }
             if !response.trim().is_empty() {
                 append_history(workspace, task, &response, &files_touched);
             }
@@ -263,7 +316,9 @@ fn run_loop(
             summary: call.summary(),
         });
 
-        let output = if call.name == "run_command" && !auto_approve.load(Ordering::Relaxed) {
+        let output = if let Some(gate) = write_gate(&call, workspace, &fresh_reads) {
+            gate
+        } else if call.name == "run_command" && !auto_approve.load(Ordering::Relaxed) {
             let command = call.arg("command").unwrap_or_default().to_string();
             let (approve_tx, approve_rx) = std::sync::mpsc::channel();
             let _ = tx.send(AgentEvent::NeedsApproval {
@@ -311,11 +366,32 @@ fn run_loop(
         {
             files_touched.push(path.to_string());
         }
+        // Freshness/verification bookkeeping for the write gate and the
+        // unverified-finish guard.
+        if ok {
+            match call.name.as_str() {
+                "read_file" => {
+                    if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
+                        fresh_reads.insert(p);
+                    }
+                }
+                "write_file" => {
+                    if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
+                        fresh_reads.remove(&p);
+                    }
+                    verified_since_write = false;
+                }
+                "run_command" => verified_since_write = true,
+                _ => {}
+            }
+        }
         // A successful write_file leaves a full copy of the file in the
-        // assistant's turn — the biggest context hog. Replace it with plain
-        // prose (NOT a syntactically valid tool call: the model imitates its
-        // own turns, and a placeholder-shaped call once got written to disk
-        // verbatim). The content is on disk and can be re-read if needed.
+        // assistant's turn — the biggest context hog. Replace it with a
+        // bracketed editor-style note (NOT a syntactically valid tool call,
+        // and NOT first-person prose: the model imitates its own turns —
+        // a placeholder-shaped call once got written to disk verbatim, and
+        // prose like "(wrote N bytes …)" once got narrated instead of an
+        // actual call). claims_fake_write() catches imitations of this note.
         if ok
             && call.name == "write_file"
             && let Some(last) = messages.last_mut()
@@ -323,7 +399,8 @@ fn run_loop(
             && let Some(pos) = last.content.find("<tool_call>")
         {
             let note = format!(
-                "(wrote {} bytes to {} with the write_file tool)",
+                "[transcript note: the full write_file call ({} bytes to {}) was removed \
+                 here to save context — the file is on disk; read_file shows it]",
                 call.arg("content").map(str::len).unwrap_or(0),
                 call.arg("path").unwrap_or("")
             );
@@ -350,6 +427,39 @@ fn run_loop(
         iterations: MAX_ITERATIONS,
     });
     Ok(())
+}
+
+/// Does a reply with no parsable tool call *narrate* a file write? Models
+/// imitate the transcript stubs that replace their earlier write_file turns
+/// ("(wrote 2211 bytes to … with the write_file tool)" was generated verbatim
+/// by a model in a real run, ending the run with nothing written). Matches
+/// both the old prose stub shape and the current bracketed note.
+fn claims_fake_write(response: &str) -> bool {
+    response.contains("transcript note")
+        || (response.contains("(wrote ") && response.contains(" bytes"))
+        || (response.contains("write_file tool") && !response.contains("<tool_call>"))
+}
+
+/// Reject overwriting an existing file the model has not read since the run
+/// began or since it last wrote it. The stubbed transcript means the model
+/// cannot see the file's current content, so an unread overwrite is a
+/// from-memory regeneration — which is how correct code regresses.
+fn write_gate(
+    call: &ToolCall,
+    workspace: &Path,
+    fresh_reads: &std::collections::HashSet<PathBuf>,
+) -> Option<String> {
+    if call.name != "write_file" {
+        return None;
+    }
+    let path = resolve(workspace, call.arg("path").unwrap_or("")).ok()?;
+    (path.is_file() && !fresh_reads.contains(&path)).then(|| {
+        format!(
+            "Error: {} already exists and you have not read its current content — call \
+             read_file on it first, then write the smallest change that fixes the problem.",
+            call.arg("path").unwrap_or("")
+        )
+    })
 }
 
 /// Did a tool call succeed? All failure paths in this crate mark the output:
@@ -512,11 +622,16 @@ Example turn:\n\
 \n\
 After writing or changing code, ALWAYS run it or the project's tests with \
 run_command and fix any errors until it succeeds — never declare code done \
-without running it.\n\
-The workspace may already contain a working project from earlier tasks. Read \
-files before changing them, make the smallest change that fulfils the task, \
-and NEVER rewrite an existing file from scratch unless the task explicitly \
-asks for a rewrite.\n\
+without running it. Writing a file ONLY happens through a write_file tool \
+call — never just describe or claim a write in prose.\n\
+Every run_command starts in the workspace root: `cd` does not persist between \
+commands, so use `cd subdir && command` when you need another directory.\n\
+The workspace may already contain a working project from earlier tasks. To \
+change an existing file you MUST read_file it first — overwrites of unread \
+files are rejected. Make the smallest change that fulfils the task; when a \
+compiler or tool suggests an exact fix, apply exactly that fix instead of \
+rewriting other parts. NEVER rewrite an existing file from scratch unless \
+the task explicitly asks for a rewrite.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 {history}\
@@ -741,6 +856,9 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
 /// (e.g. "[3519 bytes written to disk]", "...", "(content omitted)").
 fn looks_like_placeholder(content: &str) -> bool {
     let t = content.trim();
+    if t.contains("transcript note") {
+        return true;
+    }
     if t.len() > 120 {
         return false;
     }
@@ -1196,6 +1314,62 @@ mod tests {
         };
         let out = execute(&call, &std::env::temp_dir(), false);
         assert!(out.contains("placeholder"));
+    }
+
+    #[test]
+    fn detects_narrated_writes_without_tool_call() {
+        // Verbatim from a real session log: the model imitated its own
+        // stubbed turn instead of calling write_file.
+        assert!(claims_fake_write(
+            "Let me fix the main.rs file:\n\n(wrote 2211 bytes to sysmon/src/main.rs with the write_file tool)"
+        ));
+        // Imitation of the current bracketed note shape.
+        assert!(claims_fake_write(
+            "[transcript note: the full write_file call (500 bytes to a.rs) was removed]"
+        ));
+        // Ordinary summaries and answers stay untouched.
+        assert!(!claims_fake_write("All done, cargo check passes cleanly."));
+        assert!(!claims_fake_write(
+            "I added the function and the tests pass."
+        ));
+    }
+
+    #[test]
+    fn write_gate_requires_read_before_overwrite() {
+        let ws = std::env::temp_dir().join("offgrid-write-gate-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("existing.rs"), "fn main() {}").unwrap();
+        let call = |path: &str| ToolCall {
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": path, "content": "new"}),
+        };
+        let mut fresh = std::collections::HashSet::new();
+        // Overwriting an unread existing file is rejected…
+        assert!(
+            write_gate(&call("existing.rs"), &ws, &fresh)
+                .is_some_and(|e| e.contains("read_file"))
+        );
+        // …creating a new file is fine…
+        assert!(write_gate(&call("new.rs"), &ws, &fresh).is_none());
+        // …and once the file was read, the overwrite passes.
+        fresh.insert(resolve(&ws, "existing.rs").unwrap());
+        assert!(write_gate(&call("existing.rs"), &ws, &fresh).is_none());
+        // Non-write tools are never gated.
+        let read = ToolCall {
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "existing.rs"}),
+        };
+        assert!(write_gate(&read, &ws, &fresh).is_none());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn placeholder_guard_catches_transcript_note() {
+        assert!(looks_like_placeholder(
+            "[transcript note: the full write_file call (2211 bytes to src/main.rs) was \
+             removed here to save context — the file is on disk; read_file shows it]"
+        ));
     }
 
     #[test]
