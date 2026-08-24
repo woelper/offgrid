@@ -1140,7 +1140,7 @@ impl OffgridApp {
                                 ui.label("…");
                             }
                             let mut memo = std::mem::take(&mut self.hl_memo);
-                            render_message(ui, &mut self.md_cache, &mut memo, &msg.content);
+                            render_message(ui, &mut self.md_cache, &mut memo, &msg.content, i);
                             self.hl_memo = memo;
                             ui.add_space(8.0);
                         });
@@ -1361,7 +1361,7 @@ impl OffgridApp {
                         AgentItem::Assistant(text) => {
                             ui.colored_label(theme::skin().good, "Model");
                             let mut memo = std::mem::take(&mut self.hl_memo);
-                            render_message(ui, &mut self.md_cache, &mut memo, text);
+                            render_message(ui, &mut self.md_cache, &mut memo, text, i);
                             self.hl_memo = memo;
                             ui.add_space(6.0);
                         }
@@ -1409,7 +1409,13 @@ impl OffgridApp {
                 if !self.agent_current.is_empty() {
                     ui.colored_label(theme::skin().good, "Model");
                     let mut memo = std::mem::take(&mut self.hl_memo);
-                    render_message(ui, &mut self.md_cache, &mut memo, &self.agent_current);
+                    render_message(
+                        ui,
+                        &mut self.md_cache,
+                        &mut memo,
+                        &self.agent_current,
+                        usize::MAX,
+                    );
                     self.hl_memo = memo;
                 }
                 if let Some((command, _)) = &self.agent_approval {
@@ -1792,7 +1798,11 @@ fn render_message(
     cache: &mut CommonMarkCache,
     memo: &mut HighlightMemo,
     text: &str,
+    seed: usize,
 ) {
+    // Position-based salt: identical tool calls (e.g. the same write_file
+    // resent after a rejected overwrite) must still get distinct widget IDs.
+    let mut block = 0usize;
     for segment in split_segments(text) {
         match segment {
             Segment::Text(t) => {
@@ -1803,7 +1813,8 @@ fn render_message(
                 // Bare tool-call JSON (no <tool_call> wrapper) must not go
                 // through markdown: it eats the escapes and mangles the code.
                 if looks_like_tool_json(trimmed) {
-                    render_tool_call_block(ui, cache, memo, trimmed);
+                    render_tool_call_block(ui, cache, memo, trimmed, (seed, block));
+                    block += 1;
                 } else {
                     CommonMarkViewer::new().show(ui, cache, t);
                 }
@@ -1817,7 +1828,8 @@ fn render_message(
             Segment::ToolCall(t) => {
                 let t = t.trim();
                 if !t.is_empty() {
-                    render_tool_call_block(ui, cache, memo, t);
+                    render_tool_call_block(ui, cache, memo, t, (seed, block));
+                    block += 1;
                 }
             }
         }
@@ -1832,6 +1844,7 @@ fn render_tool_call_block(
     cache: &mut CommonMarkCache,
     memo: &mut HighlightMemo,
     t: &str,
+    salt: (usize, usize),
 ) {
     let parsed = serde_json::from_str::<serde_json::Value>(t).or_else(|_| {
         serde_json::from_str::<serde_json::Value>(&agent::escape_control_chars_in_strings(t))
@@ -1855,7 +1868,7 @@ fn render_tool_call_block(
                     // Big blocks collapse: syntax highlighting is expensive
                     // and re-runs every frame while a block is visible.
                     egui::CollapsingHeader::new(format!("file content ({lines} lines)"))
-                        .id_salt(("tc_content", content.len(), lines))
+                        .id_salt(("tc_content", salt))
                         .default_open(false)
                         .show(ui, |ui| {
                             cached_code_block(ui, memo, &content, &lang);
