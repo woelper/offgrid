@@ -10,7 +10,10 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::llm::{ChatMessage, LlmCmd, LlmEvent, Role};
 
-const MAX_ITERATIONS: usize = 25;
+// Generous: with the write gate, a single fix cycle legitimately costs
+// three turns (gated write -> write -> check); 25 proved too tight in
+// practice.
+const MAX_ITERATIONS: usize = 40;
 const MAX_FILE_READ: u64 = 50 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
@@ -317,6 +320,11 @@ fn run_loop(
         });
 
         let output = if let Some(gate) = write_gate(&call, workspace, &fresh_reads) {
+            // The gate served the file's content — that counts as a read,
+            // so the model's immediate retry of the write goes through.
+            if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
+                fresh_reads.insert(p);
+            }
             gate
         } else if call.name == "run_command" && !auto_approve.load(Ordering::Relaxed) {
             let command = call.arg("command").unwrap_or_default().to_string();
@@ -444,6 +452,12 @@ fn claims_fake_write(response: &str) -> bool {
 /// began or since it last wrote it. The stubbed transcript means the model
 /// cannot see the file's current content, so an unread overwrite is a
 /// from-memory regeneration — which is how correct code regresses.
+///
+/// The rejection SERVES the current content instead of demanding a separate
+/// read_file round trip: a real run showed a model responding to the bare
+/// rejection with blind retries and random commands until it hit the
+/// iteration cap. The caller marks the path as fresh, so the immediate
+/// retry goes through.
 fn write_gate(
     call: &ToolCall,
     workspace: &Path,
@@ -453,13 +467,23 @@ fn write_gate(
         return None;
     }
     let path = resolve(workspace, call.arg("path").unwrap_or("")).ok()?;
-    (path.is_file() && !fresh_reads.contains(&path)).then(|| {
-        format!(
-            "Error: {} already exists and you have not read its current content — call \
-             read_file on it first, then write the smallest change that fixes the problem.",
-            call.arg("path").unwrap_or("")
-        )
-    })
+    if !path.is_file() || fresh_reads.contains(&path) {
+        return None;
+    }
+    // Unreadable or oversized files can never be served (read_file caps at
+    // the same limit), so gating them would block writes forever — waive.
+    let current = match std::fs::metadata(&path).map(|m| m.len()) {
+        Ok(len) if len <= MAX_FILE_READ => std::fs::read_to_string(&path).ok()?,
+        _ => return None,
+    };
+    let p = call.arg("path").unwrap_or("");
+    Some(format!(
+        "Error: {p} already exists and you have not seen its current content. \
+         This write was NOT applied. Here is what is on disk right now:\n\
+         ---\n{current}\n---\n\
+         Resend the write_file call for {p}, using this as the base and \
+         changing only what is needed."
+    ))
 }
 
 /// Did a tool call succeed? All failure paths in this crate mark the output:
@@ -627,11 +651,12 @@ call — never just describe or claim a write in prose.\n\
 Every run_command starts in the workspace root: `cd` does not persist between \
 commands, so use `cd subdir && command` when you need another directory.\n\
 The workspace may already contain a working project from earlier tasks. To \
-change an existing file you MUST read_file it first — overwrites of unread \
-files are rejected. Make the smallest change that fulfils the task; when a \
-compiler or tool suggests an exact fix, apply exactly that fix instead of \
-rewriting other parts. NEVER rewrite an existing file from scratch unless \
-the task explicitly asks for a rewrite.\n\
+change an existing file you must know its current content: read_file it \
+first. A blind overwrite is rejected once and shows you the file — resend \
+the write based on that content. Make the smallest change that fulfils the \
+task; when a compiler or tool suggests an exact fix, apply exactly that fix \
+instead of rewriting other parts. NEVER rewrite an existing file from \
+scratch unless the task explicitly asks for a rewrite.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 {history}\
@@ -1345,10 +1370,11 @@ mod tests {
             arguments: serde_json::json!({"path": path, "content": "new"}),
         };
         let mut fresh = std::collections::HashSet::new();
-        // Overwriting an unread existing file is rejected…
+        // Overwriting an unread existing file is rejected, and the
+        // rejection serves the file's current content.
         assert!(
             write_gate(&call("existing.rs"), &ws, &fresh)
-                .is_some_and(|e| e.contains("read_file"))
+                .is_some_and(|e| e.starts_with("Error:") && e.contains("fn main() {}"))
         );
         // …creating a new file is fine…
         assert!(write_gate(&call("new.rs"), &ws, &fresh).is_none());
