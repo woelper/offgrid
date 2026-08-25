@@ -662,6 +662,42 @@ pub fn gloss(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
+/// Caret for collapsible sections. Haiku's outline views use a bold chevron
+/// latch (a thick "›" that rotates to point down); the other skins keep the
+/// stock egui triangle. Pass to `CollapsingHeader::icon`.
+pub fn caret_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
+    if kind() != SkinKind::Haiku {
+        egui::collapsing_header::paint_default_icon(ui, openness, response);
+        return;
+    }
+    let visuals = ui.style().interact(response);
+    let rect = egui::Rect::from_center_size(
+        response.rect.center(),
+        egui::Vec2::splat(response.rect.height() * 0.75),
+    )
+    .expand(visuals.expansion);
+    let c = rect.center();
+    let s = rect.height() * 0.5;
+    // Chevron pointing right; rotates 90° clockwise as the section opens.
+    let mut points = vec![
+        egui::pos2(c.x - 0.35 * s, c.y - 0.8 * s),
+        egui::pos2(c.x + 0.45 * s, c.y),
+        egui::pos2(c.x - 0.35 * s, c.y + 0.8 * s),
+    ];
+    let rotation = egui::emath::Rot2::from_angle(egui::remap(
+        openness,
+        0.0..=1.0,
+        0.0..=std::f32::consts::TAU / 4.0,
+    ));
+    for p in &mut points {
+        *p = c + rotation * (*p - c);
+    }
+    ui.painter().add(egui::Shape::line(
+        points,
+        Stroke::new((0.45 * s).clamp(2.0, 3.5), visuals.fg_stroke.color),
+    ));
+}
+
 /// Small context-usage meter: fill shifts good -> warn -> bad as it fills.
 pub fn context_meter(ui: &mut egui::Ui, used: usize, capacity: usize) {
     if used == 0 || capacity == 0 {

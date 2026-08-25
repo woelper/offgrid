@@ -973,6 +973,7 @@ impl OffgridApp {
                         repo.id,
                         fmt_count(repo.downloads)
                     ))
+                    .icon(theme::caret_icon)
                     .show(ui, |ui| {
                         match self.repo_files.get(&repo.id).cloned() {
                             Some((files, only_multipart)) => {
@@ -1233,6 +1234,7 @@ impl OffgridApp {
             // A valid workspace collapses to a single line; expand to change.
             egui::CollapsingHeader::new(format!("Workspace: {}", ws.display()))
                 .id_salt("workspace_section")
+                .icon(theme::caret_icon)
                 .default_open(false)
                 .show(ui, |ui| self.workspace_controls(ui));
             ui.add_space(4.0);
@@ -1389,6 +1391,7 @@ impl OffgridApp {
                                 if out.lines().count() > 5 {
                                     egui::CollapsingHeader::new("output")
                                         .id_salt(("tool_output", i))
+                                        .icon(theme::caret_icon)
                                         .default_open(false)
                                         .show(ui, |ui| {
                                             ui.monospace(out);
@@ -1869,6 +1872,7 @@ fn render_tool_call_block(
                     // and re-runs every frame while a block is visible.
                     egui::CollapsingHeader::new(format!("file content ({lines} lines)"))
                         .id_salt(("tc_content", salt))
+                        .icon(theme::caret_icon)
                         .default_open(false)
                         .show(ui, |ui| {
                             cached_code_block(ui, memo, &content, &lang);
