@@ -68,6 +68,14 @@ pub struct Skin {
     pub control: Color32,
     pub control_border: Color32,
     pub control_border_hover: Color32,
+    /// General UI border: group frames, separators, noninteractive strokes.
+    pub border: Color32,
+    pub border_width: f32,
+    /// Corner radius of group frames.
+    pub border_radius: u8,
+    /// Etched highlight painted one pixel down-right of the border line
+    /// (the BeOS/Haiku engraved-box look). None = flat border.
+    pub border_emboss: Option<Color32>,
     // Window chrome colors — drawn by the OS at runtime; used by the faked
     // window in the snapshot test / README screenshot.
     #[allow(dead_code)]
@@ -110,6 +118,11 @@ pub const HAIKU: Skin = Skin {
     control: Color32::from_rgb(245, 245, 245),
     control_border: Color32::from_rgb(140, 140, 140),
     control_border_hover: Color32::from_rgb(90, 90, 90),
+    border: Color32::from_rgb(160, 160, 160),
+    border_width: 1.0,
+    border_radius: 3,
+    // == from_white_alpha(130), spelled const-compatibly.
+    border_emboss: Some(Color32::from_rgba_premultiplied(130, 130, 130, 130)),
     window_border: Color32::from_rgb(80, 80, 80),
     title: Color32::from_rgb(255, 203, 0),
     title_border: Color32::from_rgb(120, 90, 0),
@@ -133,30 +146,34 @@ pub const HAIKU: Skin = Skin {
     gloss: true,
 };
 
-/// Skin values matching egui's stock dark theme, so the custom widgets
+/// Skin values matching egui's stock light theme, so the custom widgets
 /// (tabs, checkboxes, progress bar) blend in when the Haiku look is off.
 pub const EGUI_DEFAULT: Skin = Skin {
-    panel: Color32::from_gray(27),
-    faint: Color32::from_gray(36),
-    control: Color32::from_gray(60),
-    control_border: Color32::from_gray(85),
-    control_border_hover: Color32::from_gray(150),
-    window_border: Color32::from_gray(60),
-    title: Color32::from_gray(60),
-    title_border: Color32::from_gray(90),
-    tab_strip_top: Color32::from_gray(20),
-    tab_strip_bottom: Color32::from_gray(32),
-    tab_active_top: Color32::from_gray(40),
-    tab_divider: Color32::from_gray(55),
-    tab_border: Color32::from_gray(60),
-    accent: Color32::from_rgb(110, 170, 255),
-    selection: Color32::from_rgb(0, 92, 128),
-    progress_top: Color32::from_rgb(110, 170, 255),
-    progress_bottom: Color32::from_rgb(40, 90, 180),
-    good: Color32::from_rgb(120, 210, 120),
-    warn: Color32::from_rgb(255, 190, 80),
-    bad: Color32::from_rgb(255, 110, 110),
-    button_radius: 4,
+    panel: Color32::from_gray(248),
+    faint: Color32::from_gray(242),
+    control: Color32::from_gray(230),
+    control_border: Color32::from_gray(160),
+    control_border_hover: Color32::from_gray(105),
+    border: Color32::from_gray(190),
+    border_width: 1.0,
+    border_radius: 2,
+    border_emboss: None,
+    window_border: Color32::from_gray(190),
+    title: Color32::from_gray(230),
+    title_border: Color32::from_gray(190),
+    tab_strip_top: Color32::from_gray(236),
+    tab_strip_bottom: Color32::from_gray(244),
+    tab_active_top: Color32::from_gray(248),
+    tab_divider: Color32::from_gray(215),
+    tab_border: Color32::from_gray(190),
+    accent: Color32::from_rgb(0, 155, 255),
+    selection: Color32::from_rgb(144, 209, 255),
+    progress_top: Color32::from_rgb(144, 209, 255),
+    progress_bottom: Color32::from_rgb(0, 110, 180),
+    good: Color32::from_rgb(30, 130, 60),
+    warn: Color32::from_rgb(178, 106, 0),
+    bad: Color32::from_rgb(200, 40, 40),
+    button_radius: 2,
     button_padding: egui::Vec2::new(8.0, 4.0),
     tab_radius: 4,
     control_height: 26.0,
@@ -171,6 +188,10 @@ pub const MATERIAL: Skin = Skin {
     control: Color32::from_rgb(0xe9, 0xed, 0xf3),
     control_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
     control_border_hover: Color32::from_rgb(0xb0, 0xb8, 0xc4),
+    border: Color32::from_rgb(0xdf, 0xe3, 0xea),
+    border_width: 1.0,
+    border_radius: 10,
+    border_emboss: None,
     window_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
     title: Color32::from_rgb(0xe9, 0xed, 0xf3),
     title_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
@@ -342,7 +363,7 @@ fn apply_material(ctx: &egui::Context) {
         w.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
     }
     v.widgets.noninteractive.corner_radius = CornerRadius::same(s.button_radius);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, s.control_border);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
     v.widgets.inactive.bg_fill = s.control;
     v.widgets.inactive.weak_bg_fill = s.control;
@@ -365,7 +386,7 @@ pub fn apply(ctx: &egui::Context) {
         return;
     }
     if kind() == SkinKind::EguiDefault {
-        // Stock egui: default fonts, default dark style.
+        // Stock egui: default fonts, default style, light theme.
         ctx.set_fonts(egui::FontDefinitions::default());
         ctx.set_style_of(
             egui::Theme::Light,
@@ -381,7 +402,7 @@ pub fn apply(ctx: &egui::Context) {
                 ..Default::default()
             },
         );
-        ctx.set_theme(egui::Theme::Dark);
+        ctx.set_theme(egui::Theme::Light);
         return;
     }
     let s = skin();
@@ -413,7 +434,7 @@ pub fn apply(ctx: &egui::Context) {
         w.fg_stroke = Stroke::new(1.0, Color32::BLACK);
     }
     v.widgets.noninteractive.bg_fill = s.panel;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(160, 160, 160));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
     v.widgets.inactive.bg_fill = s.control;
     v.widgets.inactive.weak_bg_fill = s.control;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, s.control_border);
@@ -605,18 +626,32 @@ pub fn group<R>(
         }
         ui.label(egui::RichText::new(title).strong());
     });
+    let s = skin();
+    let outer_bottom = 10.0;
     let result = egui::Frame::new()
-        .stroke(Stroke::new(1.0, Color32::from_rgb(160, 160, 160)))
-        .corner_radius(CornerRadius::same(3))
+        .stroke(Stroke::new(s.border_width, s.border))
+        .corner_radius(CornerRadius::same(s.border_radius))
         .inner_margin(8.0)
         .outer_margin(egui::Margin {
-            bottom: 10,
+            bottom: outer_bottom as i8,
             ..Default::default()
         })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add_contents(ui)
         });
+    if let Some(highlight) = s.border_emboss {
+        // Etched box (BeOS/Haiku): a light line one pixel down-right of the
+        // border line makes the frame look engraved into the panel.
+        let mut rect = result.response.rect;
+        rect.max.y -= outer_bottom;
+        ui.painter().rect_stroke(
+            rect.translate(egui::vec2(1.0, 1.0)),
+            CornerRadius::same(s.border_radius),
+            Stroke::new(s.border_width, highlight),
+            StrokeKind::Inside,
+        );
+    }
     result.inner
 }
 
