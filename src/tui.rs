@@ -63,6 +63,10 @@ struct Tui {
     loaded: Option<String>,
     loading: bool,
     generating: bool,
+    /// Context fill, in tokens, for the Chat and Code conversations — shown as
+    /// a percentage in the header. The desktop app tracks the same two.
+    chat_ctx_used: usize,
+    agent_ctx_used: usize,
     status: String,
     scroll: usize,
     chat: Conversation,
@@ -85,6 +89,19 @@ struct Tui {
     hardware: HardwareProfile,
     /// A local model armed for deletion, awaiting a confirming second `d`.
     confirm_delete: Option<String>,
+}
+
+/// Compact token count for the header: 512 → "512", 6912 → "6.9k", 16384 → "16k".
+fn fmt_tokens(n: usize) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let k = n as f32 / 1000.0;
+    if k < 10.0 {
+        format!("{k:.1}k")
+    } else {
+        format!("{k:.0}k")
+    }
 }
 
 /// Wrap text to the terminal width, keeping existing newlines.
@@ -202,6 +219,27 @@ impl Tui {
     /// guards all read it from here.
     fn n_ctx(&self) -> u32 {
         self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX)
+    }
+
+    /// What a message would actually do right now. The Code tab always routes
+    /// to the agent regardless of `self.mode`, so this — not `self.mode` — is
+    /// what the hint line and `/help` should reflect.
+    fn effective_mode(&self) -> Mode {
+        if self.tab == Tab::Code {
+            Mode::Code
+        } else {
+            self.mode
+        }
+    }
+
+    /// Context fill (tokens) to display for the current tab. Chat and Code each
+    /// carry their own conversation; Models and Serve have none.
+    fn ctx_used_for_tab(&self) -> Option<usize> {
+        match self.tab {
+            Tab::Chat => Some(self.chat_ctx_used),
+            Tab::Code => Some(self.agent_ctx_used),
+            _ => None,
+        }
     }
 
     /// The same verdict the desktop app shows as badges: RAM fit and
@@ -335,16 +373,43 @@ impl Tui {
             cursor::MoveTo(0, 0)
         )?;
 
-        // Header: model and context, like the desktop title area.
-        let header = format!(
+        // Header: model on the left, context fill on the right, like the
+        // desktop title area.
+        let left = format!(
             " offgrid — {} ",
             self.loaded.clone().unwrap_or_else(|| "no model".into())
         );
+        let right = match self.ctx_used_for_tab() {
+            Some(used) if self.loaded.is_some() => {
+                let n = self.n_ctx().max(1) as usize;
+                let pct = (used * 100 / n).min(100);
+                // Prefer the detailed form; drop the counts if the header is
+                // too narrow to hold both it and the model name.
+                let full = format!("ctx {pct}% ({}/{}) ", fmt_tokens(used), fmt_tokens(n));
+                if left.chars().count() + full.chars().count() <= cols {
+                    full
+                } else {
+                    format!("ctx {pct}% ")
+                }
+            }
+            _ => String::new(),
+        };
+        // The context indicator wins the space race: truncate the (long) model
+        // name rather than letting the model name push the percentage off-screen.
+        let rw = right.chars().count();
+        // Keep at least one space between a truncated name and the indicator.
+        let keep = cols.saturating_sub(rw + usize::from(rw > 0));
+        let left: String = left.chars().take(keep).collect();
+        let gap = cols.saturating_sub(left.chars().count() + rw);
+        let header: String = format!("{left}{}{right}", " ".repeat(gap))
+            .chars()
+            .take(cols)
+            .collect();
         writeln!(
             out,
             "{}\r",
             style::Attribute::Reverse.to_string()
-                + &format!("{header:<cols$}")
+                + &header
                 + &style::Attribute::Reset.to_string()
         )?;
 
@@ -386,7 +451,10 @@ impl Tui {
         } else if self.generating {
             "generating… (esc stops)".to_string()
         } else {
-            format!("{} mode · tab switches · ctrl-c quits", self.mode.label())
+            format!(
+                "{} mode · tab switches · ctrl-c quits",
+                self.effective_mode().label()
+            )
         };
         writeln!(
             out,
@@ -436,7 +504,11 @@ impl Tui {
                     }
                     self.status = format!("error: {e}");
                 }
-                LlmEvent::Stats { .. } => {}
+                LlmEvent::Stats {
+                    prompt_tokens,
+                    gen_tokens,
+                    ..
+                } => self.chat_ctx_used = prompt_tokens + gen_tokens,
             }
         }
         let mut finished = None;
@@ -452,6 +524,7 @@ impl Tui {
                         let first = output.lines().next().unwrap_or_default();
                         self.transcript.push(format!("  ✗ {first}"));
                     }
+                    AgentEvent::Ctx(used) => self.agent_ctx_used = used,
                     AgentEvent::TurnDone => agent::note_turn(&self.active),
                     AgentEvent::Info(note) => self.transcript.push(format!("· {note}")),
                     AgentEvent::Error(e) => finished = Some(format!("error: {e}")),
@@ -563,14 +636,10 @@ impl Tui {
         }
 
         let run_active = self.active.lock().unwrap().is_some();
-        let mode = if self.tab == Tab::Code {
-            Mode::Code
-        } else {
-            self.mode
-        };
+        let mode = self.effective_mode();
         match session::parse(text, mode, run_active, true) {
             Command::Empty => {}
-            Command::Help => self.status = session::help(self.mode, true).replace('\n', " · "),
+            Command::Help => self.status = session::help(mode, true).replace('\n', " · "),
             Command::SwitchMode(m) => {
                 self.mode = m;
                 self.tab = if m == Mode::Code {
@@ -642,6 +711,9 @@ impl Tui {
         if let Some(summary) = agent::run_summary(&self.active) {
             self.status = format!("busy — {summary}");
             return;
+        }
+        if !resuming {
+            self.agent_ctx_used = 0;
         }
         let n_ctx = self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX);
         let run = if resuming {
@@ -975,6 +1047,8 @@ pub fn run() -> Result<(), String> {
         loaded: None,
         loading: autoload.is_some(),
         generating: false,
+        chat_ctx_used: 0,
+        agent_ctx_used: 0,
         status: startup_status,
         scroll: 0,
         chat: session::conversation(),
@@ -1064,5 +1138,13 @@ mod tests {
         let long = wrap(&"x".repeat(45), 20);
         assert_eq!(long.len(), 3);
         assert_eq!(long.concat(), "x".repeat(45));
+    }
+
+    #[test]
+    fn tokens_are_formatted_compactly() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(512), "512");
+        assert_eq!(fmt_tokens(6912), "6.9k");
+        assert_eq!(fmt_tokens(16384), "16k");
     }
 }
