@@ -89,6 +89,9 @@ struct Tui {
     hardware: HardwareProfile,
     /// A local model armed for deletion, awaiting a confirming second `d`.
     confirm_delete: Option<String>,
+    /// Chat may search the web before answering (`/web on`). Off by default —
+    /// a query leaves the machine.
+    chat_web: bool,
 }
 
 /// Compact token count for the header: 512 → "512", 6912 → "6.9k", 16384 → "16k".
@@ -490,6 +493,7 @@ impl Tui {
                     self.status = "model unloaded".into();
                 }
                 LlmEvent::Token(t) => session::append_assistant(&self.chat, &t),
+                LlmEvent::Info(note) => self.status = note,
                 LlmEvent::GenDone => {
                     self.generating = false;
                     self.busy.release();
@@ -627,6 +631,23 @@ impl Tui {
             self.get_proposal(rest.trim());
             return;
         }
+        if let Some(rest) = text.strip_prefix("/web") {
+            self.chat_web = match rest.trim() {
+                "on" => true,
+                "off" => false,
+                "" => !self.chat_web, // bare /web toggles
+                other => {
+                    self.status = format!("usage: /web on|off (got \"{other}\")");
+                    return;
+                }
+            };
+            self.status = if self.chat_web {
+                "web search in chat: on — queries leave this machine".into()
+            } else {
+                "web search in chat: off".into()
+            };
+            return;
+        }
         if text == "/quit" || text == "/exit" {
             self.status = "quit".into();
             self.tab = Tab::Models;
@@ -689,12 +710,25 @@ impl Tui {
         }
         self.tab = Tab::Chat;
         session::push_user(&self.chat, text);
-        let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
-            messages: session::snapshot(&self.chat),
-            reply: self.llm.event_tx.clone(),
-            temp: 0.7,
-            n_ctx: self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX),
-        });
+        let n_ctx = self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX);
+        if self.chat_web {
+            self.status = "searching the web…".into();
+            crate::webchat::spawn(
+                session::snapshot(&self.chat),
+                self.llm.cmd_tx.clone(),
+                self.llm.event_tx.clone(),
+                self.llm.stop.clone(),
+                0.7,
+                n_ctx,
+            );
+        } else {
+            let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
+                messages: session::snapshot(&self.chat),
+                reply: self.llm.event_tx.clone(),
+                temp: 0.7,
+                n_ctx,
+            });
+        }
         session::push_assistant(&self.chat);
         self.generating = true;
     }
@@ -1070,6 +1104,7 @@ pub fn run() -> Result<(), String> {
         downloads: Vec::new(),
         hardware,
         confirm_delete: None,
+        chat_web: false,
     };
     // Pick up where the desktop app left off — but only if it fits.
     if let Some(path) = autoload {

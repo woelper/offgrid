@@ -22,7 +22,13 @@ internet was there in the first place.
   survive network drops and app restarts, and resume where they stopped.
 - **Chat**: streaming markdown chat with whatever model you loaded. Reasoning
   models get their thinking rendered as a quiet little quote block instead of
-  raw tags all over your screen.
+  raw tags all over your screen. An optional **🌐 Web** toggle lets the model
+  search the web before answering — the same `web_search`/`fetch_url` tools the
+  coding agent uses, run as a quick pre-pass whose results are folded into the
+  answer, so a small local model can ground itself in current facts instead of
+  guessing. Off by default, because a search query is the one thing that leaves
+  your machine; when the model can answer from memory it simply does, and when
+  the web is unreachable it falls back to answering offline.
 - **Code**: a small coding agent in the spirit of Claude Code, just with a
   model that fits in your laptop. Point it at a folder, give it a task, and it
   reads, writes, and runs things in a tool loop. File access is sandboxed to
@@ -87,7 +93,9 @@ is refused rather than crashing the process. The Models tab also proposes
 the best chat and coding models your hardware can comfortably run;
 `/get chat` and `/get code` download them without typing a search. `d`
 deletes the selected local model — press it once to arm, again to confirm,
-and any other key cancels; a loaded model is unloaded first. It starts automatically on Linux when
+and any other key cancels; a loaded model is unloaded first. `/web on|off`
+(bare `/web` toggles) turns on web-augmented chat, the same search-before-you-answer
+pre-pass as the desktop app's 🌐 Web toggle. It starts automatically on Linux when
 there is no display, so an SSH session gets a usable app instead of a
 winit error.
 

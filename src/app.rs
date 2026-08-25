@@ -17,6 +17,7 @@ use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
 use crate::session;
 use crate::theme;
+use crate::webchat;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
@@ -165,6 +166,12 @@ pub struct OffgridApp {
     agent_culler: RowCuller,
     chat_ctx_used: usize,
     agent_ctx_used: usize,
+    /// Chat may search the web before answering. Off by default — a query
+    /// leaves the machine.
+    chat_web: bool,
+    /// Latest web-chat progress note ("searching the web…"), shown while the
+    /// pre-pass runs and no tokens are streaming yet.
+    web_note: Option<String>,
     hl_memo: HighlightMemo,
 }
 
@@ -254,6 +261,8 @@ impl OffgridApp {
             agent_culler: RowCuller::default(),
             chat_ctx_used: 0,
             agent_ctx_used: 0,
+            chat_web: false,
+            web_note: None,
             hl_memo: HighlightMemo::default(),
         };
         if app.config.server_enabled {
@@ -447,8 +456,13 @@ impl OffgridApp {
                     self.set_loaded(None);
                 }
                 Ok(LlmEvent::Token(text)) => {
+                    // The grounded answer is now streaming; drop the pre-pass note.
+                    self.web_note = None;
                     self.note_token();
                     session::append_assistant(&self.chat, &text);
+                }
+                Ok(LlmEvent::Info(note)) => {
+                    self.web_note = Some(note);
                 }
                 Ok(LlmEvent::Stats {
                     prompt_tokens,
@@ -467,11 +481,13 @@ impl OffgridApp {
                 }
                 Ok(LlmEvent::GenDone) => {
                     self.generating = false;
+                    self.web_note = None;
                     self.chat_busy.release();
                     self.llm.stop.store(false, Ordering::Relaxed);
                 }
                 Ok(LlmEvent::Error(e)) => {
                     self.model_loading = false;
+                    self.web_note = None;
                     if self.generating {
                         self.generating = false;
                         self.chat_busy.release();
@@ -523,12 +539,24 @@ impl OffgridApp {
         }
         self.input.clear();
         session::push_user(&self.chat, &text);
-        let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
-            messages: session::snapshot(&self.chat),
-            reply: self.llm.event_tx.clone(),
-            temp: 0.7,
-            n_ctx: self.n_ctx(),
-        });
+        if self.chat_web {
+            self.web_note = Some("searching the web…".into());
+            webchat::spawn(
+                session::snapshot(&self.chat),
+                self.llm.cmd_tx.clone(),
+                self.llm.event_tx.clone(),
+                self.llm.stop.clone(),
+                0.7,
+                self.n_ctx(),
+            );
+        } else {
+            let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
+                messages: session::snapshot(&self.chat),
+                reply: self.llm.event_tx.clone(),
+                temp: 0.7,
+                n_ctx: self.n_ctx(),
+            });
+        }
         session::push_assistant(&self.chat);
         self.generating = true;
         self.live_tokens = 0;
@@ -1133,7 +1161,11 @@ impl OffgridApp {
                 ui.horizontal(|ui| {
                     if self.generating {
                         ui.spinner();
-                        if let Some(start) = self.live_start {
+                        if let Some(note) = &self.web_note {
+                            // Pre-pass in flight: no tokens yet, so report the
+                            // web activity instead of a misleading 0 tok/s.
+                            ui.weak(note.clone());
+                        } else if let Some(start) = self.live_start {
                             let secs = start.elapsed().as_secs_f32().max(0.001);
                             ui.weak(format!(
                                 "generating… {:.1} tok/s · {} tokens",
@@ -1160,6 +1192,11 @@ impl OffgridApp {
                             self.chat_ctx_used = 0;
                         }
                         theme::context_meter(ui, self.chat_ctx_used, self.n_ctx() as usize);
+                        ui.checkbox(&mut self.chat_web, "🌐 Web")
+                            .on_hover_text(
+                                "Let the model search the web before answering. \
+                                 Your query leaves this machine.",
+                            );
                     });
                 });
                 let input_h = 60.0;

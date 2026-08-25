@@ -59,6 +59,10 @@ pub enum LlmEvent {
     Loaded(String),
     Unloaded,
     Token(String),
+    /// A human-readable progress note that is not part of the answer — e.g.
+    /// web-augmented chat reporting "searching the web…" during its pre-pass,
+    /// when no tokens are streaming and the UI would otherwise look frozen.
+    Info(String),
     Stats {
         prompt_tokens: usize,
         prompt_secs: f32,

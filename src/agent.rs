@@ -1636,7 +1636,7 @@ fn stackoverflow_search(query: &str) -> Option<String> {
     (!results.is_empty()).then(|| results.join("\n\n"))
 }
 
-fn web_search(query: &str) -> Result<String, String> {
+pub(crate) fn web_search(query: &str) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
     }
@@ -1687,7 +1687,7 @@ fn web_search(query: &str) -> Result<String, String> {
     }
 }
 
-fn fetch_url(url: &str) -> Result<String, String> {
+pub(crate) fn fetch_url(url: &str) -> Result<String, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http(s) URLs are supported".into());
     }

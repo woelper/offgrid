@@ -10,6 +10,7 @@ mod server;
 mod session;
 mod theme;
 mod tui;
+mod webchat;
 
 /// Terminate the process immediately, skipping C/C++ static destructors.
 ///
