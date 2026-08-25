@@ -197,12 +197,19 @@ impl Tui {
         }
     }
 
+    /// The context length that will actually be used to load models — the
+    /// configured value or the default. Fit depends on it, so the badges and
+    /// guards all read it from here.
+    fn n_ctx(&self) -> u32 {
+        self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX)
+    }
+
     /// The same verdict the desktop app shows as badges: RAM fit and
     /// estimated speed, e.g. "fits · ~12 t/s".
     fn gauge(&self, name: &str, size: u64) -> String {
         format!(
             "{} · {}",
-            Fit::of(size, self.hardware.total_ram).label(),
+            Fit::of(size, self.hardware.total_ram, self.n_ctx()).label(),
             models::fmt_tok_s(models::est_tokens_per_sec(
                 name,
                 size,
@@ -238,7 +245,7 @@ impl Tui {
             ModelsView::Local => {
                 lines.push("↑/↓ select · Enter load · u unload · d delete · /search <query> for Hugging Face".into());
                 // Dynamic proposals: what this machine can comfortably run.
-                let p = models::propose(self.hardware.total_ram);
+                let p = models::propose(self.hardware.total_ram, self.n_ctx());
                 if p.chat.is_some() || p.code.is_some() {
                     lines.push(String::new());
                     lines.push("Recommended for your hardware (/get chat · /get code):".into());
@@ -374,6 +381,8 @@ impl Tui {
         writeln!(out, "{}\r", "─".repeat(cols))?;
         let hint = if self.loading {
             "loading model…".to_string()
+        } else if self.run.is_some() {
+            "agent running… (esc stops)".to_string()
         } else if self.generating {
             "generating… (esc stops)".to_string()
         } else {
@@ -455,6 +464,9 @@ impl Tui {
         }
         if let Some(note) = finished {
             self.transcript.push(format!("· {note}"));
+            // The run has truly ended now — reflect it in the status bar,
+            // which until this point read "stopping…" or "agent running…".
+            self.status = note;
             agent::release(&self.active);
             self.run = None;
         }
@@ -546,7 +558,8 @@ impl Tui {
             self.status = "quit".into();
             self.tab = Tab::Models;
             let _ = execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
-            std::process::exit(0);
+            let _ = terminal::disable_raw_mode();
+            crate::hard_exit(0);
         }
 
         let run_active = self.active.lock().unwrap().is_some();
@@ -663,7 +676,7 @@ impl Tui {
 
     /// Download the proposed chat or coding model for this hardware.
     fn get_proposal(&mut self, kind: &str) {
-        let p = models::propose(self.hardware.total_ram);
+        let p = models::propose(self.hardware.total_ram, self.n_ctx());
         let entry = match kind {
             "chat" => p.chat,
             "code" | "coding" => p.code,
@@ -823,11 +836,23 @@ impl Tui {
                 if self.tab == Tab::Models && self.view != ModelsView::Local {
                     self.pop_view();
                 } else {
+                    // Signal both the chat worker and any agent run. The stop
+                    // flag is only checked between tokens/turns, so a run does
+                    // not end the instant Esc is pressed — say "stopping…" and
+                    // let pump() report the actual finish, rather than claiming
+                    // "stopped" while the model is still grinding out a turn.
                     self.llm.stop.store(true, Ordering::Relaxed);
-                    if let Some(state) = self.active.lock().unwrap().as_ref() {
-                        state.stop.store(true, Ordering::Relaxed);
-                    }
-                    self.status = "stopped".into();
+                    let run_active = self.active.lock().unwrap().as_ref().is_some_and(|s| {
+                        s.stop.store(true, Ordering::Relaxed);
+                        true
+                    });
+                    self.status = if run_active || self.run.is_some() {
+                        "stopping the run… (it halts at the next step)".into()
+                    } else if self.generating {
+                        "stopping…".into()
+                    } else {
+                        "stopped".into()
+                    };
                 }
             }
             (KeyCode::Up, _) if self.tab == Tab::Models => {
@@ -899,7 +924,7 @@ impl Tui {
         if let Some(m) = self.models.get(self.selected) {
             // Loading past physical RAM kills the whole process (llama.cpp
             // aborts), so refuse instead of terminating a headless session.
-            if Fit::of(m.size, self.hardware.total_ram) == Fit::TooBig {
+            if Fit::of(m.size, self.hardware.total_ram, self.n_ctx()) == Fit::TooBig {
                 self.status = format!(
                     "{} won't fit: needs more than the {} of RAM here",
                     m.name,
@@ -927,10 +952,11 @@ pub fn run() -> Result<(), String> {
 
     // Only auto-load the last model if it still fits — re-loading a too-big
     // one is what got the process OOM-killed ("Killed") on the last run.
+    let n_ctx = config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX);
     let autoload = config
         .last_model
         .clone()
-        .filter(|p| p.exists() && models::safe_to_load(p, hardware.total_ram));
+        .filter(|p| p.exists() && models::safe_to_load(p, hardware.total_ram, n_ctx));
     let startup_status = match &config.last_model {
         Some(p) if autoload.is_none() && p.exists() => format!(
             "{} won't fit the {} of RAM here — not auto-loaded; pick another in Models.",

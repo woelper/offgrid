@@ -11,11 +11,32 @@ mod session;
 mod theme;
 mod tui;
 
+/// Terminate the process immediately, skipping C/C++ static destructors.
+///
+/// llama.cpp / ggml register global teardown that libc's `exit()` runs via
+/// `__cxa_finalize`. On macOS the ggml-metal backend's static destructor
+/// aborts (SIGABRT) while a ggml worker thread is still alive, so a perfectly
+/// clean session crashes on the way out, *after* the window has closed and all
+/// our real work is done. `_exit()` ends the process without running any of
+/// that, which is exactly what we want at the very end of `main`. Anything that
+/// needs flushing (stdout/stderr) is flushed here first.
+pub fn hard_exit(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 fn main() -> eframe::Result {
     // Headless check of the core plumbing (download → load → generate → serve).
     if std::env::args().any(|a| a == "--smoke") {
         smoke(false);
-        return Ok(());
+        hard_exit(0);
     }
     // Same, but exercises the coding-agent loop instead of serving.
     // Headless: no display, or asked for explicitly.
@@ -25,14 +46,14 @@ fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--tui") || headless {
         if let Err(e) = tui::run() {
             eprintln!("tui: {e}");
-            std::process::exit(1);
+            hard_exit(1);
         }
-        return Ok(());
+        hard_exit(0);
     }
 
     if std::env::args().any(|a| a == "--smoke-agent") {
         smoke(true);
-        return Ok(());
+        hard_exit(0);
     }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/Alert_Idea.png"))
         .unwrap_or_default();
@@ -43,11 +64,16 @@ fn main() -> eframe::Result {
             .with_icon(icon),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "offgrid",
         options,
         Box::new(|cc| Ok(Box::new(app::OffgridApp::new(cc)))),
-    )
+    );
+    if let Err(e) = &result {
+        eprintln!("offgrid: {e}");
+    }
+    // Bypass ggml/llama.cpp static destructors, which abort on exit (macOS).
+    hard_exit(if result.is_ok() { 0 } else { 1 });
 }
 
 fn smoke(agent_mode: bool) {

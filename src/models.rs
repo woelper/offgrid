@@ -2,10 +2,23 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-/// Rough memory needed on top of the model file itself (KV cache, activations).
-const OVERHEAD: u64 = 3 * 1024 * 1024 * 1024 / 2; // 1.5 GB
+/// Working memory needed beyond the weights themselves: fixed compute and
+/// activation buffers, plus the KV cache. The cache grows with the context
+/// length, and — as a rough stand-in for a model's layer count and width,
+/// which we can't read here — with the model's own size.
+///
+/// Calibrated against a real thrash: a 10 GB 30B model at the default 16k
+/// context used ~14.7 GB on a 16 GB box (KV cache + buffers ≈ 4.5 GB over the
+/// weights) and ground to a halt in swap — but the old fixed 1.5 GB overhead
+/// called it merely "tight". The factors below put that case just over the
+/// "too big" line, while a short context or a small model stays comfortable.
+fn overhead(model_size: u64, n_ctx: u32) -> u64 {
+    const BASE: u64 = 1024 * 1024 * 1024; // ~1 GB compute/activation buffers
+    let kv = (model_size / 12) * (n_ctx as u64) / 4096;
+    BASE + kv
+}
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Fit {
     Fits,
     Tight,
@@ -13,8 +26,11 @@ pub enum Fit {
 }
 
 impl Fit {
-    pub fn of(model_size: u64, total_ram: u64) -> Self {
-        let needed = model_size + OVERHEAD;
+    /// Verdict for loading `model_size` bytes of weights with an `n_ctx`-token
+    /// context on a machine with `total_ram` bytes. `n_ctx` matters: the same
+    /// model can fit at a short context and thrash swap at a long one.
+    pub fn of(model_size: u64, total_ram: u64, n_ctx: u32) -> Self {
+        let needed = model_size + overhead(model_size, n_ctx);
         if needed <= total_ram * 7 / 10 {
             Fit::Fits
         } else if needed <= total_ram * 9 / 10 {
@@ -244,9 +260,9 @@ pub fn catalog() -> Vec<CatalogEntry> {
 /// Used to guard auto-load on startup: loading a too-big model makes
 /// llama.cpp abort and takes the whole process down with it (the dreaded
 /// "Killed"), which on the last-model auto-load turns into a crash loop.
-pub fn safe_to_load(path: &Path, total_ram: u64) -> bool {
+pub fn safe_to_load(path: &Path, total_ram: u64, n_ctx: u32) -> bool {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    size > 0 && Fit::of(size, total_ram) != Fit::TooBig
+    size > 0 && Fit::of(size, total_ram, n_ctx) != Fit::TooBig
 }
 
 /// The best chat and coding models this machine can comfortably run. Each is
@@ -257,8 +273,8 @@ pub struct Proposals {
     pub code: Option<CatalogEntry>,
 }
 
-pub fn propose(total_ram: u64) -> Proposals {
-    let fits = |e: &CatalogEntry| Fit::of(e.size, total_ram) == Fit::Fits;
+pub fn propose(total_ram: u64, n_ctx: u32) -> Proposals {
+    let fits = |e: &CatalogEntry| Fit::of(e.size, total_ram, n_ctx) == Fit::Fits;
     Proposals {
         chat: catalog()
             .into_iter()
@@ -377,9 +393,10 @@ mod tests {
 
     #[test]
     fn proposals_scale_with_ram() {
+        let ctx = 16384;
         // A tiny box: chat gets the largest fitting small model, and nothing
         // big enough to code comfortably may be available.
-        let small = propose(4 * 1024 * 1024 * 1024);
+        let small = propose(4 * 1024 * 1024 * 1024, ctx);
         assert!(small.chat.is_some());
         assert!(
             small.chat.as_ref().unwrap().size <= 3_000_000_000,
@@ -388,14 +405,28 @@ mod tests {
 
         // A large box: chat and code both resolve, and each is the biggest
         // fitting entry of its kind — here the 30B coder for both.
-        let big = propose(64 * 1024 * 1024 * 1024);
+        let big = propose(64 * 1024 * 1024 * 1024, ctx);
         assert_eq!(big.chat.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
         assert_eq!(big.code.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
 
         // The coding pick, when present, is always a code-capable entry.
-        if let Some(code) = propose(8 * 1024 * 1024 * 1024).code {
+        if let Some(code) = propose(8 * 1024 * 1024 * 1024, ctx).code {
             assert!(code.use_.codes());
         }
+    }
+
+    #[test]
+    fn fit_tightens_with_context() {
+        // The run that started all this: an 11 GB model on a 16 GB box. At a
+        // short context it loads; at the default 16k it should read too big,
+        // because the KV cache no longer fits alongside the weights.
+        let model = 11 * 1024 * 1024 * 1024;
+        let ram = 16 * 1024 * 1024 * 1024;
+        assert_eq!(Fit::of(model, ram, 4096), Fit::Tight);
+        assert_eq!(Fit::of(model, ram, 16384), Fit::TooBig);
+        // A small model is unaffected by context at this scale.
+        let small = 4 * 1024 * 1024 * 1024;
+        assert_eq!(Fit::of(small, ram, 16384), Fit::Fits);
     }
 
     #[test]

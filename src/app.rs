@@ -187,7 +187,7 @@ impl OffgridApp {
         if let Some(last) = &config.last_model
             && last.exists()
         {
-            if models::safe_to_load(last, hardware.total_ram) {
+            if models::safe_to_load(last, hardware.total_ram, config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX)) {
                 let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
                 model_loading = true;
             } else {
@@ -721,7 +721,7 @@ impl OffgridApp {
     }
 
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
-        let (label, color) = Fit::of(size, self.hardware.total_ram).badge();
+        let (label, color) = Fit::of(size, self.hardware.total_ram, self.n_ctx()).badge();
         ui.colored_label(color, label);
     }
 
@@ -775,7 +775,7 @@ impl OffgridApp {
                 for (i, model) in locals.iter().enumerate() {
                     let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
                     let can_load = !loaded && !self.model_loading;
-                    let badge = Fit::of(model.size, self.hardware.total_ram).badge();
+                    let badge = Fit::of(model.size, self.hardware.total_ram, self.n_ctx()).badge();
                     let mut clicked_load = false;
                     let mut clicked_delete = false;
                     list_row(
@@ -928,7 +928,7 @@ impl OffgridApp {
             });
 
             theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
-                let proposals = models::propose(self.hardware.total_ram);
+                let proposals = models::propose(self.hardware.total_ram, self.n_ctx());
                 if proposals.chat.is_some() || proposals.code.is_some() {
                     ui.label("Recommended for your hardware:");
                     if let Some(chat) = &proposals.chat {
@@ -947,7 +947,7 @@ impl OffgridApp {
                 }
                 let catalog = models::catalog();
                 for (i, entry) in catalog.iter().enumerate() {
-                    let badge = Fit::of(entry.size, self.hardware.total_ram).badge();
+                    let badge = Fit::of(entry.size, self.hardware.total_ram, self.n_ctx()).badge();
                     let downloaded = self.is_downloaded(entry.file);
                     let downloading = self.is_downloading(entry.file);
                     let tooltip = models::quant_tooltip(entry.file);
@@ -1049,7 +1049,7 @@ impl OffgridApp {
                                 let best = files
                                     .iter()
                                     .filter(|f| {
-                                        Fit::of(f.size, self.hardware.total_ram) == Fit::Fits
+                                        Fit::of(f.size, self.hardware.total_ram, self.n_ctx()) == Fit::Fits
                                     })
                                     .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
                                     .map(|f| f.name.clone());
@@ -2367,7 +2367,7 @@ mod tests {
                             },
                             size,
                             models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
-                            Fit::of(size, DEMO_RAM).badge(),
+                            Fit::of(size, DEMO_RAM, llm::DEFAULT_N_CTX).badge(),
                             |ui| {
                                 let _ = theme::button(
                                     ui,
@@ -2413,7 +2413,7 @@ mod tests {
                         },
                         size,
                         models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
-                        Fit::of(size, DEMO_RAM).badge(),
+                        Fit::of(size, DEMO_RAM, llm::DEFAULT_N_CTX).badge(),
                         |ui| {
                             let _ = theme::button(
                                 ui,
