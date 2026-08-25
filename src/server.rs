@@ -530,8 +530,30 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 .get("temperature")
                 .and_then(|t| t.as_f64())
                 .unwrap_or(0.7) as f32;
+            // Opt-in web search, matching the desktop/TUI toggle. OpenAI has no
+            // field for this, so it is a custom extension: pass `"web": true`
+            // (alias `"web_search"`). The model searches before answering; the
+            // tool round-trips stay server-side and only the answer streams back.
+            // Clients that cannot add custom fields (opencode, aider, …) can
+            // instead start offgrid with OFFGRID_WEB=1 to default it on for
+            // every chat completion; such a client may still send `"web": false`
+            // to override per request.
+            let web = payload
+                .get("web")
+                .or_else(|| payload.get("web_search"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| std::env::var_os("OFFGRID_WEB").is_some());
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            if cmd_tx
+            if web {
+                crate::webchat::spawn(
+                    messages,
+                    cmd_tx.clone(),
+                    reply_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    temp,
+                    n_ctx,
+                );
+            } else if cmd_tx
                 .send(LlmCmd::Generate {
                     messages,
                     reply: reply_tx,

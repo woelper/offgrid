@@ -40,7 +40,12 @@ internet was there in the first place.
   button picks it up where it left off instead of starting over.
 - **Serve**: an OpenAI-compatible API on `127.0.0.1:11633`, so opencode,
   aider, editors, and scripts can use your local models while believing they
-  are talking to something much more expensive. An opt-in "Allow LAN access"
+  are talking to something much more expensive. `POST /v1/chat/completions`
+  accepts an offgrid-specific `"web": true` field (streamed or not) that runs
+  the same search-before-you-answer pre-pass as the Chat tab; a client that
+  cannot add custom fields can instead start offgrid with `OFFGRID_WEB=1` to
+  default it on for every completion (and still send `"web": false` to opt a
+  request out). An opt-in "Allow LAN access"
   mode binds 0.0.0.0 and adds remote-control endpoints: `GET /logs` +
   `GET /logs/latest` (agent session logs), `POST /agent` (start a run:
   `{"task": "...", "workspace": "...", "web_tools": true}`, always
