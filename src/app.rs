@@ -183,11 +183,22 @@ impl OffgridApp {
         let llm = llm::spawn_worker(hardware.physical_cores);
 
         let mut model_loading = false;
+        let mut startup_error = None;
         if let Some(last) = &config.last_model
             && last.exists()
         {
-            let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
-            model_loading = true;
+            if models::safe_to_load(last, hardware.total_ram) {
+                let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
+                model_loading = true;
+            } else {
+                // Don't re-load a model that won't fit — that is what crashed
+                // us last time. Leave it selectable; just don't auto-load it.
+                startup_error = Some(format!(
+                    "{} needs more than the {} of RAM here — not auto-loaded.",
+                    last.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    hardware::fmt_bytes(hardware.total_ram)
+                ));
+            }
         }
 
         let loaded_model_shared = Arc::new(Mutex::new(None));
@@ -238,7 +249,7 @@ impl OffgridApp {
             agent_auto_approve: false,
             agent_approval: None,
             confirm_delete: None,
-            last_error: None,
+            last_error: startup_error,
             chat_culler: RowCuller::default(),
             agent_culler: RowCuller::default(),
             chat_ctx_used: 0,
@@ -917,11 +928,21 @@ impl OffgridApp {
             });
 
             theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
-                if let Some(rec) = models::recommended(self.hardware.total_ram) {
-                    ui.horizontal(|ui| {
-                        ui.label("Recommended for your hardware:");
-                        ui.strong(rec.name);
-                    });
+                let proposals = models::propose(self.hardware.total_ram);
+                if proposals.chat.is_some() || proposals.code.is_some() {
+                    ui.label("Recommended for your hardware:");
+                    if let Some(chat) = &proposals.chat {
+                        ui.horizontal(|ui| {
+                            ui.label("Chat:");
+                            ui.strong(chat.name);
+                        });
+                    }
+                    if let Some(code) = &proposals.code {
+                        ui.horizontal(|ui| {
+                            ui.label("Coding:");
+                            ui.strong(code.name);
+                        });
+                    }
                     ui.separator();
                 }
                 let catalog = models::catalog();

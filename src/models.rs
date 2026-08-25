@@ -24,12 +24,21 @@ impl Fit {
         }
     }
 
-    pub fn badge(self) -> (&'static str, egui::Color32) {
+    pub fn label(self) -> &'static str {
         match self {
-            Fit::Fits => ("fits", crate::theme::skin().good),
-            Fit::Tight => ("tight", crate::theme::skin().warn),
-            Fit::TooBig => ("too big", crate::theme::skin().bad),
+            Fit::Fits => "fits",
+            Fit::Tight => "tight",
+            Fit::TooBig => "too big",
         }
+    }
+
+    pub fn badge(self) -> (&'static str, egui::Color32) {
+        let color = match self {
+            Fit::Fits => crate::theme::skin().good,
+            Fit::Tight => crate::theme::skin().warn,
+            Fit::TooBig => crate::theme::skin().bad,
+        };
+        (self.label(), color)
     }
 }
 
@@ -141,58 +150,83 @@ pub fn quant_tag(name: &str) -> QuantTag {
     }
 }
 
+/// What a catalog model is worth running for. Tiny models chat but can't
+/// code usefully; the coder-tuned ones are the pick for the agent.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Use {
+    /// Good enough to chat with, too small to drive the coding agent.
+    Chat,
+    /// Instruct model that both chats and codes acceptably.
+    ChatCode,
+}
+
+impl Use {
+    fn codes(self) -> bool {
+        self == Use::ChatCode
+    }
+}
+
 #[derive(Clone)]
 pub struct CatalogEntry {
     pub name: &'static str,
     pub repo: &'static str,
     pub file: &'static str,
     pub size: u64,
+    pub use_: Use,
 }
 
 /// Known-good chat models (file names and sizes verified against the HF API).
 pub fn catalog() -> Vec<CatalogEntry> {
+    use Use::{Chat, ChatCode};
     vec![
         CatalogEntry {
             name: "Qwen3 0.6B (Q4_K_M)",
             repo: "unsloth/Qwen3-0.6B-GGUF",
             file: "Qwen3-0.6B-Q4_K_M.gguf",
             size: 396_705_472,
+            use_: Chat,
         },
         CatalogEntry {
             name: "Qwen3 1.7B (Q4_K_M)",
             repo: "unsloth/Qwen3-1.7B-GGUF",
             file: "Qwen3-1.7B-Q4_K_M.gguf",
             size: 1_107_409_472,
+            use_: Chat,
         },
         CatalogEntry {
             name: "Llama 3.2 1B Instruct (Q4_K_M)",
             repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
             file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
             size: 807_694_464,
+            use_: Chat,
         },
         CatalogEntry {
             name: "Llama 3.2 3B Instruct (Q4_K_M)",
             repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
             file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
             size: 2_019_377_696,
+            use_: ChatCode,
         },
         CatalogEntry {
             name: "Gemma 3 4B Instruct (Q4_K_M)",
             repo: "bartowski/google_gemma-3-4b-it-GGUF",
             file: "google_gemma-3-4b-it-Q4_K_M.gguf",
             size: 2_489_758_112,
+            use_: ChatCode,
         },
         CatalogEntry {
             name: "Qwen3 4B Instruct 2507 (Q4_K_M)",
             repo: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF",
             file: "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
             size: 2_497_280_736,
+            use_: ChatCode,
         },
         CatalogEntry {
             name: "Mistral 7B Instruct v0.3 (Q4_K_M)",
             repo: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
             file: "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
             size: 4_372_812_000,
+            use_: ChatCode,
         },
         // MoE: ~3.3B active params, so it generates at roughly 4B-dense speed
         // while coding far above anything else that fits in 32 GB of RAM.
@@ -201,16 +235,40 @@ pub fn catalog() -> Vec<CatalogEntry> {
             repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
             file: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
             size: 18_556_689_568,
+            use_: ChatCode,
         },
     ]
 }
 
-/// The largest curated model that comfortably fits in RAM.
-pub fn recommended(total_ram: u64) -> Option<CatalogEntry> {
-    catalog()
-        .into_iter()
-        .filter(|e| Fit::of(e.size, total_ram) == Fit::Fits)
-        .max_by_key(|e| e.size)
+/// Whether the model at `path` can be loaded without blowing past RAM.
+/// Used to guard auto-load on startup: loading a too-big model makes
+/// llama.cpp abort and takes the whole process down with it (the dreaded
+/// "Killed"), which on the last-model auto-load turns into a crash loop.
+pub fn safe_to_load(path: &Path, total_ram: u64) -> bool {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    size > 0 && Fit::of(size, total_ram) != Fit::TooBig
+}
+
+/// The best chat and coding models this machine can comfortably run. Each is
+/// the largest catalog entry of that kind that still fits — size stands in for
+/// quality within the curated list. Either may be None on a very small box.
+pub struct Proposals {
+    pub chat: Option<CatalogEntry>,
+    pub code: Option<CatalogEntry>,
+}
+
+pub fn propose(total_ram: u64) -> Proposals {
+    let fits = |e: &CatalogEntry| Fit::of(e.size, total_ram) == Fit::Fits;
+    Proposals {
+        chat: catalog()
+            .into_iter()
+            .filter(fits)
+            .max_by_key(|e| e.size),
+        code: catalog()
+            .into_iter()
+            .filter(|e| e.use_.codes() && fits(e))
+            .max_by_key(|e| e.size),
+    }
 }
 
 #[derive(Clone)]
@@ -315,6 +373,29 @@ mod tests {
         let dense = est_tokens_per_sec("x-7B", 4_400_000_000, bw).unwrap();
         let moe = est_tokens_per_sec("x-30B-A3B", 18_600_000_000, bw).unwrap();
         assert!(moe > dense * 1.5);
+    }
+
+    #[test]
+    fn proposals_scale_with_ram() {
+        // A tiny box: chat gets the largest fitting small model, and nothing
+        // big enough to code comfortably may be available.
+        let small = propose(4 * 1024 * 1024 * 1024);
+        assert!(small.chat.is_some());
+        assert!(
+            small.chat.as_ref().unwrap().size <= 3_000_000_000,
+            "chat pick must actually fit 4 GB"
+        );
+
+        // A large box: chat and code both resolve, and each is the biggest
+        // fitting entry of its kind — here the 30B coder for both.
+        let big = propose(64 * 1024 * 1024 * 1024);
+        assert_eq!(big.chat.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
+        assert_eq!(big.code.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
+
+        // The coding pick, when present, is always a code-capable entry.
+        if let Some(code) = propose(8 * 1024 * 1024 * 1024).code {
+            assert!(code.use_.codes());
+        }
     }
 
     #[test]

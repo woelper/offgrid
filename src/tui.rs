@@ -15,8 +15,10 @@ use crossterm::{cursor, execute, style, terminal};
 
 use crate::agent::{self, AgentEvent, AgentRun};
 use crate::config::{Config, models_dir};
+use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, LlmCmd, LlmEvent, Role};
-use crate::models::{self, LocalModel};
+use crate::hardware::HardwareProfile;
+use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
 use crate::session::{self, ChatBusy, Command, Conversation, Mode};
 
@@ -41,6 +43,15 @@ impl Tab {
     }
 }
 
+/// What the Models tab is currently showing: the local list, Hugging Face
+/// search results, or the GGUF files of one repo.
+#[derive(Clone, Copy, PartialEq)]
+enum ModelsView {
+    Local,
+    Search,
+    Files,
+}
+
 struct Tui {
     tab: Tab,
     mode: Mode,
@@ -62,6 +73,18 @@ struct Tui {
     loaded_shared: Arc<Mutex<Option<String>>>,
     server: Option<ApiServer>,
     config: Config,
+    view: ModelsView,
+    search_query: String,
+    search_results: Vec<RepoResult>,
+    search_pending: bool,
+    /// Files of the repo picked from the search results.
+    repo_files: Option<(String, Vec<RepoFile>, bool)>,
+    hub_tx: std::sync::mpsc::Sender<HubEvent>,
+    hub_rx: std::sync::mpsc::Receiver<HubEvent>,
+    downloads: Vec<ActiveDownload>,
+    hardware: HardwareProfile,
+    /// A local model armed for deletion, awaiting a confirming second `d`.
+    confirm_delete: Option<String>,
 }
 
 /// Wrap text to the terminal width, keeping existing newlines.
@@ -108,30 +131,7 @@ impl Tui {
     /// Everything the content pane should show for the current tab.
     fn body(&self, width: usize) -> Vec<String> {
         match self.tab {
-            Tab::Models => {
-                let mut lines = vec![
-                    "↑/↓ select · Enter load · u unload".to_string(),
-                    String::new(),
-                ];
-                if self.models.is_empty() {
-                    lines.push("No models on disk — download one in the desktop app.".into());
-                }
-                for (i, m) in self.models.iter().enumerate() {
-                    let marker = if self.loaded.as_deref() == Some(m.name.as_str()) {
-                        "●"
-                    } else if i == self.selected {
-                        "›"
-                    } else {
-                        " "
-                    };
-                    lines.push(format!(
-                        "{marker} {:<48} {}",
-                        m.name.chars().take(48).collect::<String>(),
-                        crate::hardware::fmt_bytes(m.size)
-                    ));
-                }
-                lines
-            }
+            Tab::Models => self.models_body(),
             Tab::Chat => {
                 let mut lines = Vec::new();
                 for m in session::snapshot(&self.chat) {
@@ -195,6 +195,125 @@ impl Tui {
                 ]
             }
         }
+    }
+
+    /// The same verdict the desktop app shows as badges: RAM fit and
+    /// estimated speed, e.g. "fits · ~12 t/s".
+    fn gauge(&self, name: &str, size: u64) -> String {
+        format!(
+            "{} · {}",
+            Fit::of(size, self.hardware.total_ram).label(),
+            models::fmt_tok_s(models::est_tokens_per_sec(
+                name,
+                size,
+                self.hardware.mem_bandwidth
+            ))
+        )
+    }
+
+    fn models_body(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for dl in &self.downloads {
+            let note = match &dl.failed {
+                Some(e) => format!("failed: {e} — download it again to resume"),
+                None => {
+                    let pct = if dl.total > 0 {
+                        dl.bytes * 100 / dl.total
+                    } else {
+                        0
+                    };
+                    format!(
+                        "{pct}% · {} of {}",
+                        crate::hardware::fmt_bytes(dl.bytes),
+                        crate::hardware::fmt_bytes(dl.total)
+                    )
+                }
+            };
+            lines.push(format!("⇣ {} — {note}", dl.file));
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        match self.view {
+            ModelsView::Local => {
+                lines.push("↑/↓ select · Enter load · u unload · d delete · /search <query> for Hugging Face".into());
+                // Dynamic proposals: what this machine can comfortably run.
+                let p = models::propose(self.hardware.total_ram);
+                if p.chat.is_some() || p.code.is_some() {
+                    lines.push(String::new());
+                    lines.push("Recommended for your hardware (/get chat · /get code):".into());
+                    if let Some(c) = &p.chat {
+                        lines.push(format!("  chat  {}  ({})", c.name, self.gauge(c.file, c.size)));
+                    }
+                    if let Some(c) = &p.code {
+                        lines.push(format!("  code  {}  ({})", c.name, self.gauge(c.file, c.size)));
+                    }
+                }
+                lines.push(String::new());
+                if self.models.is_empty() {
+                    lines.push("No models on disk — /search <query> finds one to download.".into());
+                }
+                for (i, m) in self.models.iter().enumerate() {
+                    let marker = if self.loaded.as_deref() == Some(m.name.as_str()) {
+                        "●"
+                    } else if i == self.selected {
+                        "›"
+                    } else {
+                        " "
+                    };
+                    lines.push(format!(
+                        "{marker} {:<48} {:>9}  {}",
+                        m.name.chars().take(48).collect::<String>(),
+                        crate::hardware::fmt_bytes(m.size),
+                        self.gauge(&m.name, m.size),
+                    ));
+                }
+            }
+            ModelsView::Search => {
+                lines.push(format!(
+                    "Hugging Face “{}” · Enter shows files · Esc goes back",
+                    self.search_query
+                ));
+                lines.push(String::new());
+                if self.search_pending {
+                    lines.push("searching…".into());
+                } else if self.search_results.is_empty() {
+                    lines.push("No GGUF repos found.".into());
+                }
+                for (i, r) in self.search_results.iter().enumerate() {
+                    let marker = if i == self.selected { "›" } else { " " };
+                    lines.push(format!(
+                        "{marker} {:<56} {} downloads",
+                        r.id.chars().take(56).collect::<String>(),
+                        r.downloads
+                    ));
+                }
+            }
+            ModelsView::Files => {
+                let Some((repo, files, only_multipart)) = &self.repo_files else {
+                    return lines;
+                };
+                lines.push(format!("{repo} · Enter downloads · Esc goes back"));
+                lines.push(String::new());
+                if files.is_empty() {
+                    lines.push(if *only_multipart {
+                        "Only multi-part GGUFs here — offgrid can't download those.".into()
+                    } else {
+                        "No usable GGUF files in this repo.".into()
+                    });
+                }
+                for (i, f) in files.iter().enumerate() {
+                    let marker = if i == self.selected { "›" } else { " " };
+                    lines.push(format!(
+                        "{marker} {:<56} {:>9}  {}",
+                        f.name.chars().take(56).collect::<String>(),
+                        crate::hardware::fmt_bytes(f.size),
+                        self.gauge(&f.name, f.size),
+                    ));
+                }
+            }
+        }
+        lines
     }
 
     fn draw(&mut self) -> std::io::Result<()> {
@@ -339,6 +458,57 @@ impl Tui {
             agent::release(&self.active);
             self.run = None;
         }
+        while let Ok(event) = self.hub_rx.try_recv() {
+            dirty = true;
+            match event {
+                HubEvent::SearchResults(results) => {
+                    self.search_pending = false;
+                    self.status = format!("{} matching repos", results.len());
+                    self.search_results = results;
+                }
+                HubEvent::Files {
+                    repo,
+                    mut files,
+                    only_multipart,
+                } => {
+                    // Only jump forward if the user is still on the results;
+                    // a late reply must not yank them out of another view.
+                    if self.view == ModelsView::Search {
+                        files.sort_by_key(|f| f.size);
+                        self.repo_files = Some((repo, files, only_multipart));
+                        self.selected = 0;
+                        self.scroll = 0;
+                        self.view = ModelsView::Files;
+                    }
+                }
+                HubEvent::Error(e) => {
+                    self.search_pending = false;
+                    self.status = format!("hub: {e}");
+                }
+            }
+        }
+        let mut done = false;
+        for dl in &mut self.downloads {
+            while let Ok(event) = dl.rx.try_recv() {
+                dirty = true;
+                match event {
+                    DownloadEvent::Progress { bytes, total } => {
+                        dl.bytes = bytes;
+                        dl.total = total;
+                    }
+                    DownloadEvent::Done => {
+                        dl.bytes = u64::MAX; // mark finished
+                        done = true;
+                    }
+                    DownloadEvent::Error(e) => dl.failed = Some(e),
+                }
+            }
+        }
+        if done {
+            self.downloads.retain(|d| d.bytes != u64::MAX);
+            self.models = models::scan_local(&models_dir());
+            self.status = "download finished".into();
+        }
         dirty
     }
 
@@ -362,6 +532,14 @@ impl Tui {
         }
         if let Some(rest) = text.strip_prefix("/serve") {
             self.toggle_server(rest.trim());
+            return;
+        }
+        if let Some(rest) = text.strip_prefix("/search") {
+            self.start_search(rest.trim());
+            return;
+        }
+        if let Some(rest) = text.strip_prefix("/get") {
+            self.get_proposal(rest.trim());
             return;
         }
         if text == "/quit" || text == "/exit" {
@@ -483,6 +661,109 @@ impl Tui {
         self.run = Some(run);
     }
 
+    /// Download the proposed chat or coding model for this hardware.
+    fn get_proposal(&mut self, kind: &str) {
+        let p = models::propose(self.hardware.total_ram);
+        let entry = match kind {
+            "chat" => p.chat,
+            "code" | "coding" => p.code,
+            _ => {
+                self.status = "usage: /get chat|code".into();
+                return;
+            }
+        };
+        let Some(entry) = entry else {
+            self.status = "nothing in the catalog fits this machine — try /search".into();
+            return;
+        };
+        self.tab = Tab::Models;
+        self.view = ModelsView::Local;
+        if self.models.iter().any(|m| m.name == entry.file.trim_end_matches(".gguf"))
+            || models_dir().join(entry.file).exists()
+        {
+            self.status = format!("{} is already downloaded", entry.name);
+            return;
+        }
+        if self.downloads.iter().any(|d| d.path == entry.file) {
+            self.status = format!("{} is already downloading", entry.name);
+            return;
+        }
+        self.downloads
+            .push(hub::start_download(entry.repo, entry.file, entry.size, &models_dir()));
+        self.status = format!("downloading {}", entry.name);
+    }
+
+    fn start_search(&mut self, query: &str) {
+        if query.is_empty() {
+            self.status = "usage: /search <query>".into();
+            return;
+        }
+        hub::spawn_search(query.to_string(), self.hub_tx.clone());
+        self.tab = Tab::Models;
+        self.view = ModelsView::Search;
+        self.search_query = query.to_string();
+        self.search_results.clear();
+        self.search_pending = true;
+        self.selected = 0;
+        self.scroll = 0;
+        self.status = format!("searching Hugging Face for “{query}”…");
+    }
+
+    /// How many rows the current Models view has, for selection clamping.
+    fn list_len(&self) -> usize {
+        match self.view {
+            ModelsView::Local => self.models.len(),
+            ModelsView::Search => self.search_results.len(),
+            ModelsView::Files => self
+                .repo_files
+                .as_ref()
+                .map(|(_, f, _)| f.len())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Esc in the Models tab walks back up: files → results → local list.
+    fn pop_view(&mut self) {
+        match self.view {
+            ModelsView::Files => {
+                self.view = ModelsView::Search;
+                // Put the cursor back on the repo the files came from.
+                self.selected = self
+                    .repo_files
+                    .as_ref()
+                    .and_then(|(repo, ..)| self.search_results.iter().position(|r| &r.id == repo))
+                    .unwrap_or(0);
+            }
+            ModelsView::Search => {
+                self.view = ModelsView::Local;
+                self.selected = 0;
+            }
+            ModelsView::Local => {}
+        }
+        self.scroll = 0;
+    }
+
+    fn activate_selected(&mut self) {
+        match self.view {
+            ModelsView::Local => self.load_selected(),
+            ModelsView::Search => {
+                if let Some(r) = self.search_results.get(self.selected) {
+                    hub::spawn_list_files(r.id.clone(), self.hub_tx.clone());
+                    self.status = format!("listing files in {}…", r.id);
+                }
+            }
+            ModelsView::Files => {
+                if let Some((repo, files, _)) = &self.repo_files
+                    && let Some(f) = files.get(self.selected)
+                {
+                    self.downloads
+                        .push(hub::start_download(repo, &f.name, f.size, &models_dir()));
+                    self.status = format!("downloading {}", f.name);
+                }
+            }
+        }
+    }
+
     fn toggle_server(&mut self, arg: &str) {
         match arg {
             "off" => {
@@ -516,6 +797,9 @@ impl Tui {
     }
 
     fn key(&mut self, key: KeyEvent) -> bool {
+        // Any keypress cancels a pending delete; only a second `d` (below)
+        // reads this back to confirm, so anything else is a silent abort.
+        let armed_delete = self.confirm_delete.take();
         match (key.code, key.modifiers) {
             (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => return false,
             (KeyCode::Tab, _) => {
@@ -530,26 +814,41 @@ impl Tui {
             }
             (KeyCode::Enter, _) => {
                 if self.tab == Tab::Models && self.input.is_empty() {
-                    self.load_selected();
+                    self.activate_selected();
                 } else {
                     self.submit();
                 }
             }
             (KeyCode::Esc, _) => {
-                self.llm.stop.store(true, Ordering::Relaxed);
-                if let Some(state) = self.active.lock().unwrap().as_ref() {
-                    state.stop.store(true, Ordering::Relaxed);
+                if self.tab == Tab::Models && self.view != ModelsView::Local {
+                    self.pop_view();
+                } else {
+                    self.llm.stop.store(true, Ordering::Relaxed);
+                    if let Some(state) = self.active.lock().unwrap().as_ref() {
+                        state.stop.store(true, Ordering::Relaxed);
+                    }
+                    self.status = "stopped".into();
                 }
-                self.status = "stopped".into();
             }
             (KeyCode::Up, _) if self.tab == Tab::Models => {
                 self.selected = self.selected.saturating_sub(1)
             }
             (KeyCode::Down, _) if self.tab == Tab::Models => {
-                self.selected = (self.selected + 1).min(self.models.len().saturating_sub(1))
+                self.selected = (self.selected + 1).min(self.list_len().saturating_sub(1))
             }
-            (KeyCode::Char('u'), _) if self.tab == Tab::Models && self.input.is_empty() => {
+            (KeyCode::Char('u'), _)
+                if self.tab == Tab::Models
+                    && self.view == ModelsView::Local
+                    && self.input.is_empty() =>
+            {
                 let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
+            }
+            (KeyCode::Char('d'), _)
+                if self.tab == Tab::Models
+                    && self.view == ModelsView::Local
+                    && self.input.is_empty() =>
+            {
+                self.delete_selected(armed_delete);
             }
             (KeyCode::PageUp, _) => self.scroll += 5,
             (KeyCode::PageDown, _) => self.scroll = self.scroll.saturating_sub(5),
@@ -564,8 +863,50 @@ impl Tui {
         true
     }
 
+    /// Delete the selected local model. The first press arms it (passing the
+    /// previously armed name in `armed`); a second press on the same model
+    /// confirms and removes the file, unloading it first if it is loaded.
+    fn delete_selected(&mut self, armed: Option<String>) {
+        let Some(m) = self.models.get(self.selected).cloned() else {
+            return;
+        };
+        if armed.as_deref() != Some(m.name.as_str()) {
+            self.confirm_delete = Some(m.name.clone());
+            self.status = format!(
+                "delete {} ({})? press d again to confirm",
+                m.name,
+                crate::hardware::fmt_bytes(m.size)
+            );
+            return;
+        }
+        if self.loaded.as_deref() == Some(m.name.as_str()) {
+            let _ = self.llm.cmd_tx.send(LlmCmd::Unload);
+            self.loaded = None;
+        }
+        if self.config.last_model.as_deref() == Some(m.path.as_path()) {
+            self.config.last_model = None;
+            self.config.save();
+        }
+        match std::fs::remove_file(&m.path) {
+            Ok(()) => self.status = format!("deleted {}", m.name),
+            Err(e) => self.status = format!("delete failed: {e}"),
+        }
+        self.models = models::scan_local(&models_dir());
+        self.selected = self.selected.min(self.models.len().saturating_sub(1));
+    }
+
     fn load_selected(&mut self) {
         if let Some(m) = self.models.get(self.selected) {
+            // Loading past physical RAM kills the whole process (llama.cpp
+            // aborts), so refuse instead of terminating a headless session.
+            if Fit::of(m.size, self.hardware.total_ram) == Fit::TooBig {
+                self.status = format!(
+                    "{} won't fit: needs more than the {} of RAM here",
+                    m.name,
+                    crate::hardware::fmt_bytes(self.hardware.total_ram)
+                );
+                return;
+            }
             self.loading = true;
             self.status = format!("loading {}…", m.name);
             let _ = self.llm.cmd_tx.send(LlmCmd::Load(m.path.clone()));
@@ -582,6 +923,22 @@ pub fn run() -> Result<(), String> {
     let llm = llm::spawn_worker(hardware.physical_cores);
     let models = models::scan_local(&models_dir());
     let loaded_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (hub_tx, hub_rx) = std::sync::mpsc::channel();
+
+    // Only auto-load the last model if it still fits — re-loading a too-big
+    // one is what got the process OOM-killed ("Killed") on the last run.
+    let autoload = config
+        .last_model
+        .clone()
+        .filter(|p| p.exists() && models::safe_to_load(p, hardware.total_ram));
+    let startup_status = match &config.last_model {
+        Some(p) if autoload.is_none() && p.exists() => format!(
+            "{} won't fit the {} of RAM here — not auto-loaded; pick another in Models.",
+            p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            crate::hardware::fmt_bytes(hardware.total_ram)
+        ),
+        _ => "ready".into(),
+    };
 
     let mut tui = Tui {
         tab: Tab::Chat,
@@ -590,9 +947,9 @@ pub fn run() -> Result<(), String> {
         transcript: Vec::new(),
         selected: 0,
         loaded: None,
-        loading: config.last_model.is_some(),
+        loading: autoload.is_some(),
         generating: false,
-        status: "ready".into(),
+        status: startup_status,
         scroll: 0,
         chat: session::conversation(),
         busy: ChatBusy::new(),
@@ -603,9 +960,19 @@ pub fn run() -> Result<(), String> {
         models,
         llm,
         config,
+        view: ModelsView::Local,
+        search_query: String::new(),
+        search_results: Vec::new(),
+        search_pending: false,
+        repo_files: None,
+        hub_tx,
+        hub_rx,
+        downloads: Vec::new(),
+        hardware,
+        confirm_delete: None,
     };
-    // Pick up where the desktop app left off.
-    if let Some(path) = tui.config.last_model.clone() {
+    // Pick up where the desktop app left off — but only if it fits.
+    if let Some(path) = autoload {
         let _ = tui.llm.cmd_tx.send(LlmCmd::Load(path));
     }
 
@@ -641,8 +1008,8 @@ fn event_loop(tui: &mut Tui) -> Result<(), String> {
                 _ => {}
             }
         }
-        // While tokens stream in, keep repainting.
-        if tui.generating || tui.run.is_some() {
+        // While tokens stream in or bytes come down, keep repainting.
+        if tui.generating || tui.run.is_some() || !tui.downloads.is_empty() {
             dirty = true;
         }
     }

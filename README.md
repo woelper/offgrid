@@ -77,7 +77,17 @@ Code, Serve — drawn with crossterm and nothing else. Tab switches tabs,
 Enter sends, Esc stops generation, Ctrl-C quits; `/workspace <path>`,
 `/serve on|off|lan`, and the same `/chat`, `/code`, `/status`, `/stop`,
 `/last`, `/resume` vocabulary as the Telegram bridge, because both
-frontends share one session core. It starts automatically on Linux when
+frontends share one session core. `/search <query>` searches Hugging Face
+from the Models tab: Enter drills into a repo's GGUF files and starts a
+download, Esc walks back out, and progress is drawn right in the list —
+so a headless box no longer needs the desktop app to fetch models. Every
+model row (local, search, and download) carries the same fit badge and
+tok/s estimate as the desktop app, and loading one that is too big for RAM
+is refused rather than crashing the process. The Models tab also proposes
+the best chat and coding models your hardware can comfortably run;
+`/get chat` and `/get code` download them without typing a search. `d`
+deletes the selected local model — press it once to arm, again to confirm,
+and any other key cancels; a loaded model is unloaded first. It starts automatically on Linux when
 there is no display, so an SSH session gets a usable app instead of a
 winit error.
 
@@ -91,11 +101,15 @@ on the [releases page](https://github.com/woelper/offgrid/releases).
 
 ## Build
 
-You need a C/C++ toolchain and CMake, because llama.cpp gets compiled into
-the binary. That is the price of having no dependencies later.
+You need a C/C++ toolchain, CMake, and clang, because llama.cpp gets compiled
+into the binary and its Rust bindings are generated with bindgen, which needs
+libclang *and* clang's builtin headers. That is the price of having no
+dependencies later. Having only `libclang1` installed is not enough — bindgen
+will find the library and then die on `fatal error: 'stdbool.h' file not
+found`, which is its way of asking for the full `clang` package.
 
 ```sh
-sudo apt install build-essential cmake   # debian/ubuntu
+sudo apt install build-essential cmake clang   # debian/ubuntu
 cargo run --release
 ```
 
