@@ -39,6 +39,16 @@ fn main() -> eframe::Result {
         smoke(false);
         hard_exit(0);
     }
+    // Diagnostic: run the web-chat router turn once and print what the model
+    // emits, so we can see whether it produces a parseable tool call.
+    // Usage: offgrid --web-probe <model-substring> <question…>
+    if let Some(i) = std::env::args().position(|a| a == "--web-probe") {
+        let args: Vec<String> = std::env::args().collect();
+        let model_match = args.get(i + 1).cloned().unwrap_or_default();
+        let question = args[i + 2..].join(" ");
+        web_probe(&model_match, &question);
+        hard_exit(0);
+    }
     // Same, but exercises the coding-agent loop instead of serving.
     // Headless: no display, or asked for explicitly.
     let headless = cfg!(target_os = "linux")
@@ -75,6 +85,94 @@ fn main() -> eframe::Result {
     }
     // Bypass ggml/llama.cpp static destructors, which abort on exit (macOS).
     hard_exit(if result.is_ok() { 0 } else { 1 });
+}
+
+/// Load a model whose filename contains `model_match` and run exactly one
+/// web-chat router turn for `question`, printing the raw model output and
+/// whether `parse_tool_call` found a call. This is the pre-pass that decides
+/// whether chat searches the web — if the model does not emit a tool call
+/// here, chat silently answers from memory.
+fn web_probe(model_match: &str, question: &str) {
+    let dir = config::models_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("no models dir at {}", dir.display());
+        return;
+    };
+    let path = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_lowercase().contains(&model_match.to_lowercase()))
+        });
+    let Some(path) = path else {
+        eprintln!("no .gguf in {} matching {model_match:?}", dir.display());
+        return;
+    };
+    println!("model: {}", path.display());
+    println!("question: {question}\n");
+
+    // Keep KV small so big models don't thrash while we probe.
+    llama_cpp_2::send_logs_to_tracing(
+        llama_cpp_2::LogOptions::default().with_logs_enabled(false),
+    );
+    let handle = llm::spawn_worker(hardware::HardwareProfile::detect().physical_cores);
+    handle.cmd_tx.send(llm::LlmCmd::Load(path)).unwrap();
+    loop {
+        match handle.event_rx.recv().unwrap() {
+            llm::LlmEvent::Loaded(n) => {
+                println!("loaded: {n}\n");
+                break;
+            }
+            llm::LlmEvent::Error(e) => {
+                eprintln!("load failed: {e}");
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Drive the real web-chat path end to end, exactly as the TUI/GUI do.
+    let conversation = vec![llm::ChatMessage {
+        role: llm::Role::User,
+        content: question.to_string(),
+    }];
+    let (tx, rx) = std::sync::mpsc::channel();
+    webchat::spawn(
+        conversation,
+        handle.cmd_tx.clone(),
+        tx,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        0.7,
+        4096,
+    );
+    let mut searched = false;
+    let mut answer = String::new();
+    for event in rx {
+        match event {
+            llm::LlmEvent::Info(note) => {
+                searched = true;
+                println!("[info] {note}");
+            }
+            llm::LlmEvent::Token(t) => answer.push_str(&t),
+            llm::LlmEvent::GenDone => break,
+            llm::LlmEvent::Error(e) => {
+                eprintln!("error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    println!("\n--- answer ---\n{answer}\n--- end ---");
+    println!(
+        "\nRESULT: {}",
+        if searched {
+            "searched the web ✓"
+        } else {
+            "did NOT search — answered from memory"
+        }
+    );
 }
 
 fn smoke(agent_mode: bool) {

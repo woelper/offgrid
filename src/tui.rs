@@ -454,8 +454,15 @@ impl Tui {
         } else if self.generating {
             "generating… (esc stops)".to_string()
         } else {
+            // Show the web state on the Chat tab so it's obvious whether
+            // /web took effect before you send a message.
+            let web = if self.effective_mode() == Mode::Chat && self.chat_web {
+                " · web on"
+            } else {
+                ""
+            };
             format!(
-                "{} mode · tab switches · ctrl-c quits",
+                "{} mode{web} · tab switches · ctrl-c quits",
                 self.effective_mode().label()
             )
         };

@@ -144,6 +144,10 @@ xattr -cr /Applications/offgrid.app
 ```sh
 cargo run --release -- --smoke         # download tiny model, generate, serve
 cargo run --release -- --smoke-agent   # run the coding agent end to end
+
+# Does web-augmented chat fire for a given model? Runs the real pre-pass and
+# prints whether the model emitted a tool call and searched.
+cargo run --release -- --web-probe <model-name-substring> "your question"
 ```
 
 ## UI snapshot test
