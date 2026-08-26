@@ -495,7 +495,7 @@ impl OffgridApp {
             ui,
             &mut self.tab,
             &[
-                (Tab::Models, theme::icons().disk.clone(), "Models"),
+                (Tab::Models, theme::icons().models.clone(), "Models"),
                 (Tab::Chat, theme::icons().chat.clone(), "Chat"),
                 (Tab::Code, theme::icons().code.clone(), "Code"),
                 (Tab::Serve, theme::icons().serve.clone(), "Serve"),
@@ -508,7 +508,7 @@ impl OffgridApp {
         theme::group(
             ui,
             "Appearance",
-            Some(theme::icons().settings.clone()),
+            Some(theme::icons().appearance.clone()),
             |ui| {
                 let row_h = theme::skin().control_height;
                 ui.horizontal(|ui| {
@@ -2011,7 +2011,7 @@ mod tests {
                     ui,
                     &mut tab,
                     &[
-                        (Tab::Models, theme::icons().disk.clone(), "Models"),
+                        (Tab::Models, theme::icons().models.clone(), "Models"),
                         (Tab::Chat, theme::icons().chat.clone(), "Chat"),
                         (Tab::Code, theme::icons().code.clone(), "Code"),
                         (Tab::Serve, theme::icons().serve.clone(), "Serve"),

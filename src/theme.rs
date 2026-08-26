@@ -227,6 +227,10 @@ pub fn skin() -> &'static Skin {
 pub struct IconSet {
     /// The loaded LLM (robot).
     pub model: egui::ImageSource<'static>,
+    /// The Models tab (Haiku: the Pairs game icon).
+    pub models: egui::ImageSource<'static>,
+    /// The Appearance group in Settings.
+    pub appearance: egui::ImageSource<'static>,
     pub disk: egui::ImageSource<'static>,
     pub chat: egui::ImageSource<'static>,
     pub serve: egui::ImageSource<'static>,
@@ -242,6 +246,8 @@ pub struct IconSet {
 
 pub static HAIKU_ICONS: IconSet = IconSet {
     model: egui::include_image!("../assets/icons/App_Automator.png"),
+    models: egui::include_image!("../assets/icons/App_Pairs.png"),
+    appearance: egui::include_image!("../assets/icons/Prefs_Appearance.png"),
     disk: egui::include_image!("../assets/icons/Device_Harddisk.png"),
     chat: egui::include_image!("../assets/icons/App_Chat.png"),
     serve: egui::include_image!("../assets/icons/Server_Net.png"),
@@ -252,11 +258,13 @@ pub static HAIKU_ICONS: IconSet = IconSet {
     code: egui::include_image!("../assets/icons/App_Terminal.png"),
     file: egui::include_image!("../assets/icons/File_Text.png"),
     folder: egui::include_image!("../assets/icons/Folder_generic.png"),
-    settings: egui::include_image!("../assets/icons/Haiku_gear.png"),
+    settings: egui::include_image!("../assets/icons/Prefs_Mouse.png"),
 };
 
 pub static NEUTRAL_ICONS: IconSet = IconSet {
     model: egui::include_image!("../assets/icons/neutral/model.png"),
+    models: egui::include_image!("../assets/icons/neutral/disk.png"),
+    appearance: egui::include_image!("../assets/icons/neutral/settings.png"),
     disk: egui::include_image!("../assets/icons/neutral/disk.png"),
     chat: egui::include_image!("../assets/icons/neutral/chat.png"),
     serve: egui::include_image!("../assets/icons/neutral/serve.png"),
