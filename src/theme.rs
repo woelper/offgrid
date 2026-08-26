@@ -714,9 +714,11 @@ pub fn caret_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
         return;
     }
     let visuals = ui.style().interact(response);
+    // Slightly larger than the stock icon and nudged down so it sits on the
+    // text baseline like Haiku's latch.
     let rect = egui::Rect::from_center_size(
-        response.rect.center(),
-        egui::Vec2::splat(response.rect.height() * 0.75),
+        response.rect.center() + egui::vec2(0.0, response.rect.height() * 0.12),
+        egui::Vec2::splat(response.rect.height() * 0.9),
     )
     .expand(visuals.expansion);
     let c = rect.center();
