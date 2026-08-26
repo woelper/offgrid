@@ -129,6 +129,13 @@ cargo run --release
 Use `--release`. Debug-build inference is not "slower", it is a form of
 meditation.
 
+`vendor/egui_commonmark_backend` is upstream 0.24.0 plus a one-line patch:
+egui has no font weights and egui_commonmark has no hook for a bold face, so
+`**bold**` in chat used to render in the regular weight. The patch makes
+strong text and headings use the `bold` font family that `theme.rs` binds to
+each skin's Bold face. Cargo picks it up via `[patch.crates-io]`; nothing to
+install.
+
 ## macOS releases
 
 The `.app` is ad-hoc signed but not notarized, because Apple charges rent for

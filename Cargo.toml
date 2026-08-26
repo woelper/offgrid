@@ -33,6 +33,14 @@ wait-timeout = "0.2.1"
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
 
+[patch.crates-io]
+# egui has no font weights (`strong()` only changes the colour) and
+# egui_commonmark offers no hook for a bold face, so `**bold**` in markdown
+# rendered in the regular weight. This is upstream 0.24.0 plus one change in
+# src/misc.rs: strong text and headings use the font family named "bold" when
+# the app has registered one (theme.rs binds it to the skin's Bold face).
+egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
+
 # Debug builds: light optimization for our code (fast incremental compiles),
 # full optimization for dependencies — that's where the hot paths live
 # (syntect, inference glue), and it makes the cmake-built llama.cpp compile

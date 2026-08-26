@@ -1132,8 +1132,6 @@ dependencies = [
 [[package]]
 name = "egui_commonmark_backend"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5758a1110eb8259743c9b220241c30ff014b2dec53c1a2b861d464e41fa3483e"
 dependencies = [
  "egui",
  "egui_extras",

@@ -292,6 +292,48 @@ fn text_color(ui: &egui::Ui) -> Color32 {
         .unwrap_or_else(|| ui.visuals().strong_text_color())
 }
 
+/// Name of the bold font family. egui has no font weights — `strong()` only
+/// changes the colour — so bold is a separate family holding the Bold face of
+/// the skin's UI font. The vendored egui_commonmark_backend picks this family
+/// for `**strong**` and headings when it is registered; keep the name in sync
+/// with `vendor/egui_commonmark_backend/src/misc.rs`.
+pub const BOLD_FAMILY: &str = "bold";
+
+pub fn bold_family() -> egui::FontFamily {
+    egui::FontFamily::Name(BOLD_FAMILY.into())
+}
+
+/// Whether the fonts currently in effect bind the bold family. `set_fonts`
+/// only lands at the next frame start, so the frame that first applies a skin
+/// still lays out with the previous definitions; drawing bold text in it
+/// would ask epaint for a family it cannot find (a panic). Callers that apply
+/// the skin mid-frame should skip drawing until this is true.
+pub fn fonts_ready(ctx: &egui::Context) -> bool {
+    ctx.fonts(|f| f.definitions().families.contains_key(&bold_family()))
+}
+
+/// Genuinely bold text: the Bold face, not just a stronger colour.
+pub fn bold(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text).strong().family(bold_family())
+}
+
+/// Register `data` as the skin's bold face and bind the bold family to it,
+/// with the proportional fonts as fallbacks for glyphs it lacks. Every skin
+/// must call this: epaint panics when text asks for a family that is not
+/// bound to any font.
+fn bind_bold(fonts: &mut egui::FontDefinitions, name: &str, data: egui::FontData) {
+    fonts.font_data.insert(name.to_owned(), data.into());
+    let mut family = vec![name.to_owned()];
+    family.extend(
+        fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    fonts.families.insert(bold_family(), family);
+}
+
 /// System font of the skin (Noto Sans = Haiku's UI font), mono for code.
 /// The egui defaults stay in the family lists as fallbacks.
 fn install_fonts(ctx: &egui::Context) {
@@ -315,6 +357,11 @@ fn install_fonts(ctx: &egui::Context) {
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .insert(0, "NotoSansMono".into());
+    bind_bold(
+        &mut fonts,
+        "NotoSansBold",
+        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Bold.ttf")),
+    );
     ctx.set_fonts(fonts);
 }
 
@@ -340,6 +387,11 @@ fn install_fonts_material(ctx: &egui::Context) {
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .insert(0, "PlexMono".into());
+    bind_bold(
+        &mut fonts,
+        "PlexSansBold",
+        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf")),
+    );
     ctx.set_fonts(fonts);
 }
 
@@ -382,6 +434,10 @@ fn apply_material(ctx: &egui::Context) {
     v.widgets.open.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
     v.widgets.open.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
     style.visuals = v;
+    // Headings in the real Bold face; egui's default is the regular weight.
+    if let Some(h) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+        h.family = bold_family();
+    }
     style.spacing.button_padding = s.button_padding;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     ctx.set_style_of(egui::Theme::Light, style.clone());
@@ -394,8 +450,15 @@ pub fn apply(ctx: &egui::Context) {
         return;
     }
     if kind() == SkinKind::EguiDefault {
-        // Stock egui: default fonts, default style, light theme.
-        ctx.set_fonts(egui::FontDefinitions::default());
+        // Stock egui: default fonts, default style, light theme. egui ships no
+        // bold face, so the bold family still needs binding (see bind_bold).
+        let mut fonts = egui::FontDefinitions::default();
+        bind_bold(
+            &mut fonts,
+            "NotoSansBold",
+            egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Bold.ttf")),
+        );
+        ctx.set_fonts(fonts);
         ctx.set_style_of(
             egui::Theme::Light,
             egui::Style {
@@ -456,6 +519,10 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.open.weak_bg_fill = s.control;
     v.widgets.open.bg_stroke = Stroke::new(1.0, s.control_border);
 
+    // Headings in the real Bold face; egui's default is the regular weight.
+    if let Some(h) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+        h.family = bold_family();
+    }
     style.spacing.button_padding = s.button_padding;
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     ctx.set_style_of(egui::Theme::Light, style.clone());
@@ -632,7 +699,7 @@ pub fn group<R>(
         if let Some(icon) = icon {
             ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 18.0)));
         }
-        ui.label(egui::RichText::new(title).strong());
+        ui.label(bold(title));
     });
     let s = skin();
     let outer_bottom = 10.0;

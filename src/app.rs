@@ -962,13 +962,13 @@ impl OffgridApp {
                     if let Some(chat) = &proposals.chat {
                         ui.horizontal(|ui| {
                             ui.label("Chat:");
-                            ui.strong(chat.name);
+                            ui.label(theme::bold(chat.name));
                         });
                     }
                     if let Some(code) = &proposals.code {
                         ui.horizontal(|ui| {
                             ui.label("Coding:");
-                            ui.strong(code.name);
+                            ui.label(theme::bold(code.name));
                         });
                     }
                     ui.separator();
@@ -1112,7 +1112,7 @@ impl OffgridApp {
                                                         .on_hover_text(&tip);
                                                 }
                                                 if best.as_deref() == Some(f.name.as_str()) {
-                                                    ui.strong("• best pick").on_hover_text(
+                                                    ui.label(theme::bold("• best pick")).on_hover_text(
                                                         "The highest-quality quant of this repo \
                                                      that fits your RAM.",
                                                     );
@@ -1528,7 +1528,7 @@ impl OffgridApp {
                         } => {
                             ui.horizontal(|ui| {
                                 theme::icon(ui, tool_icon(name), 22.0);
-                                ui.strong(name);
+                                ui.label(theme::bold(name));
                                 ui.weak(summary);
                                 match ok {
                                     Some(true) => {
@@ -1582,7 +1582,7 @@ impl OffgridApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 theme::icon(ui, theme::icons().code.clone(), 22.0);
-                                ui.strong("The agent wants to run a command:");
+                                ui.label(theme::bold("The agent wants to run a command:"));
                             });
                             ui.monospace(command);
                             ui.horizontal(|ui| {
@@ -2277,6 +2277,14 @@ mod tests {
         let ctx = ui.ctx().clone();
         theme::apply(&ctx);
         egui_extras::install_image_loaders(&ctx);
+        // The skin's fonts land at the next frame start (egui_kittest renders
+        // a frame during construction, before any test code runs), so the
+        // first frame would lay out bold text without the bold face bound.
+        // Draw nothing and come back once the fonts are in effect.
+        if !theme::fonts_ready(&ctx) {
+            ctx.request_repaint();
+            return;
+        }
 
         let desktop = ui.max_rect();
         ui.painter()
@@ -2433,7 +2441,7 @@ mod tests {
             theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Recommended for your hardware:");
-                    ui.strong("Qwen3 Coder 30B-A3B (Q4_K_M)");
+                    ui.label(theme::bold("Qwen3 Coder 30B-A3B (Q4_K_M)"));
                 });
                 ui.separator();
                 let rows: [(&str, u64); 3] = [
@@ -2471,5 +2479,36 @@ mod tests {
             .build_ui(desktop_ui);
         harness.run();
         harness.snapshot("offgrid");
+    }
+
+    /// `**bold**` in markdown must select the Bold face, not merely a darker
+    /// colour (egui's `strong()` alone). A real bold face is measurably wider
+    /// than the regular one; a colour change is not.
+    #[test]
+    fn markdown_bold_uses_bold_face() {
+        use egui_kittest::kittest::Queryable;
+
+        fn rendered_width(markdown: &'static str) -> f32 {
+            let mut cache = CommonMarkCache::default();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 100.0))
+                .build_ui(move |ui| {
+                    let ctx = ui.ctx().clone();
+                    theme::apply(&ctx);
+                    if !theme::fonts_ready(&ctx) {
+                        ctx.request_repaint();
+                        return;
+                    }
+                    CommonMarkViewer::new().show(ui, &mut cache, markdown);
+                });
+            harness.run();
+            harness.get_by_label("Weighty words").rect().width()
+        }
+        let regular = rendered_width("Weighty words");
+        let bold = rendered_width("**Weighty words**");
+        assert!(
+            bold > regular + 2.0,
+            "bold markdown should use the Bold face: bold {bold}px vs regular {regular}px"
+        );
     }
 }
