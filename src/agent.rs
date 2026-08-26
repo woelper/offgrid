@@ -165,6 +165,12 @@ fn run_loop(
     let mut verified_since_write = true;
     let mut verify_nudged = false;
 
+    // Consecutive failures per exact command string. A command failing over
+    // and over means the model is cycling through from-memory guesses (a real
+    // run burned 34 turns re-trying eframe API variants while the compiler
+    // printed the exact fix three times).
+    let mut cmd_fails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
@@ -172,6 +178,10 @@ fn run_loop(
             break;
         }
 
+        // Temperature escalation: at 0.25 a small model reproduces the same
+        // wrong pattern almost deterministically. Once a command has failed
+        // three times in a row, add sampling variety to break the loop.
+        let stuck = cmd_fails.values().copied().max().unwrap_or(0);
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         cmd_tx
             .send(LlmCmd::Generate {
@@ -179,7 +189,7 @@ fn run_loop(
                 reply: reply_tx,
                 // Low temperature: agent runs need valid JSON and careful
                 // code much more than they need creative variety.
-                temp: 0.25,
+                temp: if stuck >= 3 { 0.6 } else { 0.25 },
                 n_ctx,
             })
             .map_err(|_| "LLM worker unavailable".to_string())?;
@@ -393,6 +403,40 @@ fn run_loop(
                 _ => {}
             }
         }
+        // Loop breaker: when the same command keeps failing, the model is
+        // cycling through from-memory guesses. Call the repetition out, quote
+        // the tool's own suggested fix in isolation, and point at web_search.
+        if call.name == "run_command" {
+            let command = call.arg("command").unwrap_or("").to_string();
+            if ok {
+                cmd_fails.remove(&command);
+            } else {
+                let n = cmd_fails.entry(command).or_insert(0);
+                *n += 1;
+                if *n >= 3 {
+                    let help = extract_help_suggestion(&output)
+                        .map(|h| {
+                            format!(
+                                " The tool itself printed the fix — apply it EXACTLY, \
+                                 character for character, changing nothing else:\n{h}\n"
+                            )
+                        })
+                        .unwrap_or_default();
+                    let web = if web_tools {
+                        " You have web access: call web_search with the first error \
+                         line and the crate name/version to find the correct usage."
+                    } else {
+                        ""
+                    };
+                    output.push_str(&format!(
+                        "\n\n[guidance: this command has failed {n} times in a row — \
+                         your attempts from memory are cycling. Do NOT retry a variant \
+                         you already tried.{help}{web}]",
+                        n = *n
+                    ));
+                }
+            }
+        }
         // A successful write_file leaves a full copy of the file in the
         // assistant's turn — the biggest context hog. Replace it with a
         // bracketed editor-style note (NOT a syntactically valid tool call,
@@ -446,6 +490,27 @@ fn claims_fake_write(response: &str) -> bool {
     response.contains("transcript note")
         || (response.contains("(wrote ") && response.contains(" bytes"))
         || (response.contains("write_file tool") && !response.contains("<tool_call>"))
+}
+
+/// Pull the last `help:` suggestion block out of compiler/tool output so the
+/// loop breaker can quote it in isolation — buried inside a full error dump,
+/// models demonstrably ignore it. Returns the help line plus the snippet
+/// lines under it.
+fn extract_help_suggestion(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("help:"))?;
+    let mut block = vec![lines[start].trim_start().to_string()];
+    for l in lines[start + 1..].iter().take(8) {
+        let t = l.trim();
+        if t.contains('|') || t.starts_with('+') || t.starts_with('~') {
+            block.push((*l).to_string());
+        } else {
+            break;
+        }
+    }
+    Some(block.join("\n"))
 }
 
 /// Reject overwriting an existing file the model has not read since the run
@@ -1388,6 +1453,22 @@ mod tests {
         };
         assert!(write_gate(&read, &ws, &fresh).is_none());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn extracts_compiler_help_block() {
+        // Shape taken from a real rustc error the agent looped on.
+        let out = "error[E0308]: mismatched types\n  --> src/main.rs:56:49\n   |\n\
+                   56 |         Box::new(|cc| Box::new(App::new(cc))),\n   |\n\
+                   help: try wrapping the expression in `Ok`\n   |\n\
+                   56 |         Box::new(|cc| Ok(Box::new(App::new(cc)))),\n\
+                      |                       +++                       +\n\
+                   \nFor more information about this error, try `rustc --explain E0308`.";
+        let help = extract_help_suggestion(out).unwrap();
+        assert!(help.starts_with("help: try wrapping"));
+        assert!(help.contains("Ok(Box::new"));
+        assert!(!help.contains("For more information"));
+        assert!(extract_help_suggestion("error: something with no suggestion").is_none());
     }
 
     #[test]
