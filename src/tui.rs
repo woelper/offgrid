@@ -679,6 +679,7 @@ impl Tui {
             }
             Command::New => {
                 session::clear(&self.chat);
+                self.chat_ctx_used = 0; // the header's ctx % follows the cleared chat
                 self.status = "new conversation".into();
             }
             Command::Last => self.status = "see the Chat tab".into(),
