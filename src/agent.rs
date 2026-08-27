@@ -17,6 +17,10 @@ const MAX_ITERATIONS: usize = 40;
 const MAX_FILE_READ: u64 = 50 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
+// Web pages get a tighter cap: a single stripped docs.rs page at 16KB is a
+// quarter of a 16k-token context — two fetches once forced a compaction that
+// erased the very facts they had delivered.
+const MAX_WEB_OUTPUT: usize = 7 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 60;
 const WEB_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) offgrid/0.1";
 const OFFLINE_HINT: &str =
@@ -170,6 +174,10 @@ fn run_loop(
     // run burned 34 turns re-trying eframe API variants while the compiler
     // printed the exact fix three times).
     let mut cmd_fails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Indices of web_search/fetch_url responses in `messages` — compaction
+    // trims these last (expensive to re-acquire). Messages are only ever
+    // edited in place, never removed, so indices stay valid.
+    let mut web_msgs: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
@@ -220,7 +228,7 @@ fn run_loop(
             if e.starts_with("context window full") && compact_level < 2 {
                 compact_level += 1;
                 log.log("COMPACTION", &format!("level {}", compact_level));
-                compact_transcript(&mut messages, compact_level);
+                compact_transcript(&mut messages, compact_level, &web_msgs);
                 let _ = tx.send(AgentEvent::Info(format!(
                     "context window full — compacting transcript (level {compact_level}) and retrying"
                 )));
@@ -356,15 +364,20 @@ fn run_loop(
         }
 
         let mut output = output;
-        if output.len() > MAX_TOOL_OUTPUT {
+        let cap = if call.name == "fetch_url" || call.name == "web_search" {
+            MAX_WEB_OUTPUT
+        } else {
+            MAX_TOOL_OUTPUT
+        };
+        if output.len() > cap {
             // Keep head AND tail: compilers put the errors at the end.
             let head_end = output
                 .char_indices()
                 .map(|(i, _)| i)
-                .take_while(|&i| i <= MAX_TOOL_OUTPUT / 4)
+                .take_while(|&i| i <= cap / 4)
                 .last()
                 .unwrap_or(0);
-            let tail_target = output.len() - (MAX_TOOL_OUTPUT - MAX_TOOL_OUTPUT / 4);
+            let tail_target = output.len() - (cap - cap / 4);
             let tail_start = output
                 .char_indices()
                 .map(|(i, _)| i)
@@ -424,7 +437,9 @@ fn run_loop(
                         .unwrap_or_default();
                     let web = if web_tools {
                         " You have web access: call web_search with the first error \
-                         line and the crate name/version to find the correct usage."
+                         line and the crate name/version to find the correct usage, and \
+                         fetch docs at the EXACT version your Cargo.toml pins — never \
+                         'latest' or 'master', they describe a different API."
                     } else {
                         ""
                     };
@@ -473,6 +488,9 @@ fn run_loop(
             role: Role::User,
             content: format!("<tool_response>\n{output}\n</tool_response>"),
         });
+        if matches!(call.name.as_str(), "web_search" | "fetch_url") && ok {
+            web_msgs.insert(messages.len() - 1);
+        }
     }
 
     let _ = tx.send(AgentEvent::Done {
@@ -564,7 +582,17 @@ fn tool_output_ok(output: &str) -> bool {
 /// Shrink the transcript to free context. Level 1 trims old tool responses;
 /// level 2 trims all tool responses and long assistant turns, keeping the
 /// system prompt and the task intact.
-fn compact_transcript(messages: &mut [ChatMessage], level: usize) {
+///
+/// `web_msgs` holds indices of web_search/fetch_url responses. They are the
+/// most expensive results to re-acquire and get trimmed LAST: spared at
+/// level 1, kept three times longer at level 2 (a compaction once erased
+/// freshly fetched docs facts, and the model promptly regressed to the wrong
+/// API it had just unlearned).
+fn compact_transcript(
+    messages: &mut [ChatMessage],
+    level: usize,
+    web_msgs: &std::collections::HashSet<usize>,
+) {
     let len = messages.len();
     let keep_from = if level >= 2 {
         len.saturating_sub(1)
@@ -572,10 +600,17 @@ fn compact_transcript(messages: &mut [ChatMessage], level: usize) {
         len.saturating_sub(4)
     };
     // Never touch the system prompt (0) and the task (1).
-    for m in messages[..keep_from].iter_mut().skip(2) {
-        if m.role == Role::User && m.content.starts_with("<tool_response>") && m.content.len() > 600
+    for (i, m) in messages[..keep_from].iter_mut().enumerate().skip(2) {
+        let is_web = web_msgs.contains(&i);
+        if is_web && level < 2 {
+            continue;
+        }
+        let keep_chars = if is_web { 900 } else { 300 };
+        if m.role == Role::User
+            && m.content.starts_with("<tool_response>")
+            && m.content.len() > keep_chars * 2
         {
-            let head: String = m.content.chars().take(300).collect();
+            let head: String = m.content.chars().take(keep_chars).collect();
             m.content = format!("{head}\n[older tool output trimmed]\n</tool_response>");
         }
         if level >= 2 && m.role == Role::Assistant && m.content.len() > 1500 {
@@ -683,8 +718,12 @@ fn system_prompt(workspace: &Path, web_tools: bool) -> String {
          - fetch_url: arguments {\"url\": \"https://...\"} — fetch a web page as plain text\n\
          If the task involves \"latest\", \"current\", version numbers, URLs, or anything \
          possibly newer than your training data, call web_search FIRST instead of \
-         answering from memory. Web tools may be offline: if one reports that web access \
-         is unavailable, do NOT retry more than once — continue with local knowledge.\n"
+         answering from memory. When fetching crate or library documentation, put the \
+         EXACT version the project uses in the URL (e.g. https://docs.rs/sysinfo/0.29.11/…) \
+         — never fetch \"latest\" or \"master\" docs for a pinned older version: they \
+         describe a different API and will mislead you. Web tools may be offline: if one \
+         reports that web access is unavailable, do NOT retry more than once — continue \
+         with local knowledge.\n"
     } else {
         ""
     };
@@ -1572,15 +1611,43 @@ mod tests {
                 content: "task".into(),
             },
         ];
-        compact_transcript(&mut messages, 1);
+        let no_web = std::collections::HashSet::new();
+        compact_transcript(&mut messages, 1, &no_web);
         // index 0/1 (system + task) are never touched; index 2+ within range is
         assert!(messages[2].content == "a" || messages[2].content.len() <= 400);
         assert_eq!(messages[3].content, long); // within the keep window at level 1
-        compact_transcript(&mut messages, 2);
+        compact_transcript(&mut messages, 2, &no_web);
         assert!(messages[3].content.contains("[older tool output trimmed]"));
         assert!(messages[3].content.len() < 500);
         assert_eq!(messages[0].content, "sys"); // system prompt untouched
         assert_eq!(messages[5].content, "task"); // last message untouched
+    }
+
+    #[test]
+    fn compaction_trims_web_results_last() {
+        let long = format!("<tool_response>\n{}\n</tool_response>", "x".repeat(3000));
+        let msg = |role, content: &str| ChatMessage {
+            role,
+            content: content.into(),
+        };
+        let mut messages = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            msg(Role::User, &long), // ordinary tool result (index 2)
+            msg(Role::User, &long), // web result (index 3)
+            msg(Role::Assistant, "a"),
+            msg(Role::Assistant, "b"),
+            msg(Role::Assistant, "c"),
+            msg(Role::Assistant, "d"),
+        ];
+        let web: std::collections::HashSet<usize> = [3].into();
+        compact_transcript(&mut messages, 1, &web);
+        assert!(messages[2].content.contains("[older tool output trimmed]"));
+        assert_eq!(messages[3].content, long); // web result spared at level 1
+        compact_transcript(&mut messages, 2, &web);
+        assert!(messages[3].content.contains("[older tool output trimmed]"));
+        // …and keeps ~3x more than an ordinary result at level 2.
+        assert!(messages[3].content.len() > messages[2].content.len() + 500);
     }
 
     /// End-to-end proof that the agent loop uses web tools: a scripted fake
