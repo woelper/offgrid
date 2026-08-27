@@ -32,7 +32,13 @@ internet was there in the first place.
   and fail politely when offline, which is the entire point of this app.
 - **Serve**: an OpenAI-compatible API on `127.0.0.1:11633`, so opencode,
   aider, editors, and scripts can use your local models while believing they
-  are talking to something much more expensive.
+  are talking to something much more expensive. An opt-in "Allow LAN access"
+  mode binds 0.0.0.0 and adds remote-control endpoints: `GET /logs` +
+  `GET /logs/latest` (agent session logs), `POST /agent` (start a run:
+  `{"task": "...", "workspace": "...", "web_tools": true}`, always
+  auto-approve), `GET /agent` (status), `POST /agent/stop`. Only enable it on
+  a network where you trust every device — remote runs execute shell
+  commands.
 - **Settings**: three UI styles (a loving Haiku OS recreation as default, a
   clean Material look, and stock egui for the purists), context window size,
   and a summary of what your hardware can actually do.

@@ -28,27 +28,48 @@ impl Drop for ApiServer {
     }
 }
 
-pub fn start(
-    port: u16,
+/// Shared request-handler context. `agent_busy`/`agent_stop` serialize remote
+/// agent runs: one at a time, stoppable via POST /agent/stop.
+struct Ctx {
     cmd_tx: Sender<LlmCmd>,
     models_dir: PathBuf,
     loaded_model: Arc<Mutex<Option<String>>>,
     n_ctx: u32,
+    workspace: Option<PathBuf>,
+    agent_busy: Arc<AtomicBool>,
+    agent_stop: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+pub fn start(
+    port: u16,
+    lan: bool,
+    cmd_tx: Sender<LlmCmd>,
+    models_dir: PathBuf,
+    loaded_model: Arc<Mutex<Option<String>>>,
+    n_ctx: u32,
+    workspace: Option<PathBuf>,
 ) -> Result<ApiServer, String> {
-    let server =
-        tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| format!("server: {e}"))?;
+    // 0.0.0.0 exposes the model, the session logs, and remote agent runs
+    // (shell access!) to the local network — strictly opt-in.
+    let addr = if lan { "0.0.0.0" } else { "127.0.0.1" };
+    let server = tiny_http::Server::http((addr, port)).map_err(|e| format!("server: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
+    let ctx = Arc::new(Ctx {
+        cmd_tx,
+        models_dir,
+        loaded_model,
+        n_ctx,
+        workspace,
+        agent_busy: Arc::new(AtomicBool::new(false)),
+        agent_stop: Mutex::new(None),
+    });
     std::thread::spawn(move || {
         while !stop_thread.load(Ordering::Relaxed) {
             match server.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Some(request)) => {
-                    let cmd_tx = cmd_tx.clone();
-                    let models_dir = models_dir.clone();
-                    let loaded_model = loaded_model.clone();
-                    std::thread::spawn(move || {
-                        handle(request, cmd_tx, models_dir, loaded_model, n_ctx)
-                    });
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || handle(request, &ctx));
                 }
                 Ok(None) => {}
                 Err(_) => break,
@@ -69,17 +90,188 @@ fn json_response(status: u16, body: serde_json::Value) -> Response<std::io::Curs
     )
 }
 
-fn handle(
-    mut request: tiny_http::Request,
-    cmd_tx: Sender<LlmCmd>,
-    models_dir: PathBuf,
-    loaded_model: Arc<Mutex<Option<String>>>,
-    n_ctx: u32,
-) {
+fn text_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::new(
+        StatusCode(status),
+        vec![Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap()],
+        std::io::Cursor::new(body.into_bytes()),
+        None,
+        None,
+    )
+}
+
+/// Session logs in the data dir, newest first.
+fn list_logs() -> Vec<(String, u64, std::time::SystemTime)> {
+    let mut logs: Vec<_> = std::fs::read_dir(crate::config::logs_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !(name.starts_with("agent-") && name.ends_with(".log")) {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            Some((name, meta.len(), meta.modified().ok()?))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.2.cmp(&a.2));
+    logs
+}
+
+fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
+    let cmd_tx = ctx.cmd_tx.clone();
+    let models_dir = ctx.models_dir.clone();
+    let loaded_model = ctx.loaded_model.clone();
+    let n_ctx = ctx.n_ctx;
 
     match (method.as_str(), url.as_str()) {
+        ("GET", "/logs") => {
+            let data: Vec<_> = list_logs()
+                .into_iter()
+                .map(|(name, size, modified)| {
+                    let epoch = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    json!({"name": name, "size": size, "modified": epoch})
+                })
+                .collect();
+            let _ = request.respond(json_response(200, json!({"logs": data})));
+        }
+        ("GET", path) if path.starts_with("/logs/") => {
+            let name = &path["/logs/".len()..];
+            // "latest" resolves to the newest log; anything else must be a
+            // plain agent log filename (no path tricks).
+            let name = if name == "latest" {
+                match list_logs().into_iter().next() {
+                    Some((n, ..)) => n,
+                    None => {
+                        let _ = request.respond(text_response(404, "no logs yet".into()));
+                        return;
+                    }
+                }
+            } else if name.starts_with("agent-")
+                && name.ends_with(".log")
+                && !name.contains(['/', '\\'])
+            {
+                name.to_string()
+            } else {
+                let _ = request.respond(text_response(404, "no such log".into()));
+                return;
+            };
+            match std::fs::read_to_string(crate::config::logs_dir().join(&name)) {
+                Ok(text) => {
+                    let _ = request.respond(text_response(200, text));
+                }
+                Err(_) => {
+                    let _ = request.respond(text_response(404, "no such log".into()));
+                }
+            }
+        }
+        ("GET", "/agent") => {
+            let _ = request.respond(json_response(
+                200,
+                json!({"running": ctx.agent_busy.load(Ordering::Relaxed)}),
+            ));
+        }
+        ("POST", "/agent/stop") => {
+            let stopped = if let Some(s) = ctx.agent_stop.lock().unwrap().as_ref() {
+                s.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+            let _ = request.respond(json_response(200, json!({"stopped": stopped})));
+        }
+        ("POST", "/agent") => {
+            let mut body = String::new();
+            if request.as_reader().read_to_string(&mut body).is_err() {
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "unreadable body"}}),
+                ));
+                return;
+            }
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&body) else {
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "invalid JSON"}}),
+                ));
+                return;
+            };
+            let Some(task) = payload
+                .get("task")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.trim().is_empty())
+            else {
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "missing 'task'"}}),
+                ));
+                return;
+            };
+            let workspace = payload
+                .get("workspace")
+                .and_then(|w| w.as_str())
+                .map(PathBuf::from)
+                .or_else(|| ctx.workspace.clone());
+            let Some(workspace) = workspace.filter(|w| w.is_dir()) else {
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "no valid workspace (pass 'workspace' or set one in the Code tab)"}}),
+                ));
+                return;
+            };
+            let web_tools = payload
+                .get("web_tools")
+                .and_then(|w| w.as_bool())
+                .unwrap_or(false);
+            if ctx.loaded_model.lock().unwrap().is_none() {
+                let _ = request.respond(json_response(
+                    409,
+                    json!({"error": {"message": "no model loaded"}}),
+                ));
+                return;
+            }
+            if ctx.agent_busy.swap(true, Ordering::Relaxed) {
+                let _ = request.respond(json_response(
+                    409,
+                    json!({"error": {"message": "an agent run is already active"}}),
+                ));
+                return;
+            }
+            // Remote runs always auto-approve commands: there is no one at
+            // the approval prompt. That is why LAN mode is opt-in.
+            let run = crate::agent::start(
+                workspace.clone(),
+                task.to_string(),
+                ctx.cmd_tx.clone(),
+                true,
+                web_tools,
+                ctx.n_ctx,
+            );
+            *ctx.agent_stop.lock().unwrap() = Some(run.stop.clone());
+            let busy = ctx.agent_busy.clone();
+            std::thread::spawn(move || {
+                // Drain events until the run thread ends; the session log on
+                // disk is the observable record (GET /logs/latest).
+                for _event in run.rx {}
+                busy.store(false, Ordering::Relaxed);
+            });
+            let _ = request.respond(json_response(
+                200,
+                json!({
+                    "started": true,
+                    "workspace": workspace.display().to_string(),
+                    "web_tools": web_tools,
+                    "auto_approve": true,
+                    "watch": "GET /agent for status, GET /logs/latest for the transcript"
+                }),
+            ));
+        }
         ("GET", "/v1/models") => {
             let loaded = loaded_model.lock().unwrap().clone();
             let mut names: Vec<String> = models::scan_local(&models_dir)
@@ -306,5 +498,60 @@ impl Read for SseStream {
             }
             self.refill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Routing smoke for the remote-control endpoints: status and log
+    /// listing answer without a model; starting an agent run without a
+    /// loaded model is refused. Loopback only — CI-safe.
+    #[test]
+    fn remote_endpoints_respond() {
+        let (cmd_tx, _keep_rx) = std::sync::mpsc::channel();
+        let server = start(
+            18654,
+            false,
+            cmd_tx,
+            std::env::temp_dir(),
+            Arc::new(Mutex::new(None)),
+            16384,
+            None,
+        )
+        .expect("server start");
+
+        let mut res = ureq::get("http://127.0.0.1:18654/agent").call().unwrap();
+        let body = res.body_mut().read_to_string().unwrap();
+        assert!(body.contains("\"running\":false"));
+
+        let mut res = ureq::get("http://127.0.0.1:18654/logs").call().unwrap();
+        let body = res.body_mut().read_to_string().unwrap();
+        assert!(body.contains("\"logs\""));
+
+        // Path traversal must not resolve.
+        let res = ureq::get("http://127.0.0.1:18654/logs/../config.json")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .unwrap();
+        assert_eq!(res.status(), 404);
+
+        // No model loaded -> agent run refused with 409.
+        let body = format!(
+            r#"{{"task": "do things", "workspace": {}}}"#,
+            serde_json::json!(std::env::temp_dir().display().to_string())
+        );
+        let res = ureq::post("http://127.0.0.1:18654/agent")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(&body)
+            .unwrap();
+        assert_eq!(res.status(), 409);
+
+        server.stop();
     }
 }

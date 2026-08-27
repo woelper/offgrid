@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub last_model: Option<PathBuf>,
     pub server_enabled: bool,
+    /// Bind 0.0.0.0 instead of loopback: exposes model, logs, and remote
+    /// agent runs to the LAN. Off by default for obvious reasons.
+    #[serde(default)]
+    pub server_lan: bool,
     pub server_port: Option<u16>,
     pub workspace: Option<PathBuf>,
     pub web_tools: bool,

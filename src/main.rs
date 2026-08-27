@@ -137,10 +137,12 @@ fn smoke(agent_mode: bool) {
     let loaded = Arc::new(Mutex::new(Some(name)));
     let _server = server::start(
         server::DEFAULT_PORT,
+        false,
         handle.cmd_tx.clone(),
         dir,
         loaded,
         llm::DEFAULT_N_CTX,
+        None,
     )
     .expect("server start");
     println!(

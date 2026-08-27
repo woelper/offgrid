@@ -245,10 +245,12 @@ impl OffgridApp {
         }
         match server::start(
             self.server_port(),
+            self.config.server_lan,
             self.llm.cmd_tx.clone(),
             self.models_dir.clone(),
             self.loaded_model_shared.clone(),
             self.n_ctx(),
+            self.config.workspace.clone(),
         ) {
             Ok(s) => self.api_server = Some(s),
             Err(e) => {
@@ -1459,7 +1461,7 @@ impl OffgridApp {
             ui.add_space(4.0);
 
             let mut enabled = self.config.server_enabled;
-            if theme::checkbox(ui, &mut enabled, "Enable server (127.0.0.1 only)").changed() {
+            if theme::checkbox(ui, &mut enabled, "Enable server").changed() {
                 self.config.server_enabled = enabled;
                 if enabled {
                     self.start_server();
@@ -1469,10 +1471,36 @@ impl OffgridApp {
                 self.config.save();
             }
 
+            let mut lan = self.config.server_lan;
+            if theme::checkbox(ui, &mut lan, "Allow LAN access").changed() {
+                self.config.server_lan = lan;
+                self.config.save();
+                if let Some(s) = self.api_server.take() {
+                    // Rebind on the new address; give the old listener a
+                    // moment to release the port (its accept loop ticks
+                    // every 200ms).
+                    s.stop();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    self.start_server();
+                }
+            }
+            if self.config.server_lan {
+                ui.colored_label(
+                    theme::skin().warn,
+                    "Anyone on your network can use the model, read agent session logs, \
+                     and start agent runs that execute shell commands with auto-approve.",
+                );
+            }
+
             if self.api_server.is_some() {
                 ui.horizontal(|ui| {
                     ui.colored_label(theme::skin().good, "• running");
-                    ui.monospace(format!("http://127.0.0.1:{}/v1", self.server_port()));
+                    let host = if self.config.server_lan {
+                        "0.0.0.0"
+                    } else {
+                        "127.0.0.1"
+                    };
+                    ui.monospace(format!("http://{host}:{}/v1", self.server_port()));
                 });
                 if self.loaded_model.is_none() {
                     ui.colored_label(
