@@ -79,6 +79,16 @@ pub fn start(
     Ok(ApiServer { stop })
 }
 
+/// This machine's LAN IP: a connected UDP socket picks the outbound
+/// interface without sending a packet. Needs a default route, not internet —
+/// on a routerless offline box it returns None and callers fall back to
+/// showing the bind address.
+pub fn lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
 fn json_response(status: u16, body: serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
     let data = body.to_string().into_bytes();
     Response::new(

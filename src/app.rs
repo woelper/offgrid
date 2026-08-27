@@ -125,6 +125,9 @@ pub struct OffgridApp {
 
     // API server for external tools (opencode etc.)
     api_server: Option<ApiServer>,
+    /// Cached at server start — resolving it opens a UDP socket, too costly
+    /// per frame.
+    lan_ip: Option<String>,
 
     // Chat
     messages: Vec<ChatMessage>,
@@ -203,6 +206,7 @@ impl OffgridApp {
             loaded_model_shared,
             model_loading,
             api_server: None,
+            lan_ip: None,
             messages: Vec::new(),
             input: String::new(),
             generating: false,
@@ -243,6 +247,7 @@ impl OffgridApp {
         if self.api_server.is_some() {
             return;
         }
+        self.lan_ip = server::lan_ip();
         match server::start(
             self.server_port(),
             self.config.server_lan,
@@ -1496,9 +1501,9 @@ impl OffgridApp {
                 ui.horizontal(|ui| {
                     ui.colored_label(theme::skin().good, "• running");
                     let host = if self.config.server_lan {
-                        "0.0.0.0"
+                        self.lan_ip.clone().unwrap_or_else(|| "0.0.0.0".into())
                     } else {
-                        "127.0.0.1"
+                        "127.0.0.1".into()
                     };
                     ui.monospace(format!("http://{host}:{}/v1", self.server_port()));
                 });
