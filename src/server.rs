@@ -28,6 +28,16 @@ impl Drop for ApiServer {
     }
 }
 
+/// Live info about the current/last remote agent run, fed by the event
+/// drain thread.
+#[derive(Default, Clone)]
+struct RunInfo {
+    /// Session log file name (known after the run's first event).
+    log: Option<String>,
+    /// Completed model turns.
+    iterations: usize,
+}
+
 /// Shared request-handler context. `agent_busy`/`agent_stop` serialize remote
 /// agent runs: one at a time, stoppable via POST /agent/stop.
 struct Ctx {
@@ -38,6 +48,7 @@ struct Ctx {
     workspace: Option<PathBuf>,
     agent_busy: Arc<AtomicBool>,
     agent_stop: Mutex<Option<Arc<AtomicBool>>>,
+    agent_info: Arc<Mutex<RunInfo>>,
 }
 
 pub fn start(
@@ -63,6 +74,7 @@ pub fn start(
         workspace,
         agent_busy: Arc::new(AtomicBool::new(false)),
         agent_stop: Mutex::new(None),
+        agent_info: Arc::new(Mutex::new(RunInfo::default())),
     });
     std::thread::spawn(move || {
         while !stop_thread.load(Ordering::Relaxed) {
@@ -110,6 +122,10 @@ fn text_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>
     )
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// Session logs in the data dir, newest first.
 fn list_logs() -> Vec<(String, u64, std::time::SystemTime)> {
     let mut logs: Vec<_> = std::fs::read_dir(crate::config::logs_dir())
@@ -138,6 +154,60 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
     let n_ctx = ctx.n_ctx;
 
     match (method.as_str(), url.as_str()) {
+        // Human-readable live view: status plus the tail of the current
+        // session log, auto-refreshing. Point a browser at the server root.
+        ("GET", "/") => {
+            let running = ctx.agent_busy.load(Ordering::Relaxed);
+            let info = ctx.agent_info.lock().unwrap().clone();
+            let log_name = info
+                .log
+                .clone()
+                .or_else(|| list_logs().into_iter().next().map(|(n, ..)| n));
+            let status = if running {
+                format!(
+                    "&#9679; RUNNING — turn {} — {}",
+                    info.iterations,
+                    log_name.as_deref().unwrap_or("(log not started yet)")
+                )
+            } else {
+                format!(
+                    "idle — last log: {}",
+                    log_name.as_deref().unwrap_or("(none)")
+                )
+            };
+            let tail = log_name
+                .and_then(|n| std::fs::read_to_string(crate::config::logs_dir().join(n)).ok())
+                .map(|text| {
+                    let tail_start = text
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .find(|&i| i >= text.len().saturating_sub(8 * 1024))
+                        .unwrap_or(0);
+                    html_escape(&text[tail_start..])
+                })
+                .unwrap_or_else(|| "no session logs yet — start an agent run".into());
+            let page = format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\">\
+                 <meta http-equiv=\"refresh\" content=\"5\">\
+                 <title>offgrid agent</title>\
+                 <style>body{{font-family:monospace;background:#1e1e1e;color:#ddd;\
+                 margin:1.5em}}pre{{white-space:pre-wrap;word-break:break-word;\
+                 border-top:1px solid #444;padding-top:1em}}\
+                 a{{color:#7ab}}</style></head><body>\
+                 <b>offgrid agent</b> — {status} — <a href=\"/logs\">all logs</a>\
+                 <pre>{tail}</pre>\
+                 <script>window.scrollTo(0, document.body.scrollHeight);</script>\
+                 </body></html>"
+            );
+            let response = Response::new(
+                StatusCode(200),
+                vec![Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()],
+                std::io::Cursor::new(page.into_bytes()),
+                None,
+                None,
+            );
+            let _ = request.respond(response);
+        }
         ("GET", "/logs") => {
             let data: Vec<_> = list_logs()
                 .into_iter()
@@ -182,9 +252,14 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             }
         }
         ("GET", "/agent") => {
+            let info = ctx.agent_info.lock().unwrap().clone();
             let _ = request.respond(json_response(
                 200,
-                json!({"running": ctx.agent_busy.load(Ordering::Relaxed)}),
+                json!({
+                    "running": ctx.agent_busy.load(Ordering::Relaxed),
+                    "iterations": info.iterations,
+                    "log": info.log,
+                }),
             ));
         }
         ("POST", "/agent/stop") => {
@@ -264,11 +339,27 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 ctx.n_ctx,
             );
             *ctx.agent_stop.lock().unwrap() = Some(run.stop.clone());
+            *ctx.agent_info.lock().unwrap() = RunInfo::default();
             let busy = ctx.agent_busy.clone();
+            let info = ctx.agent_info.clone();
             std::thread::spawn(move || {
-                // Drain events until the run thread ends; the session log on
-                // disk is the observable record (GET /logs/latest).
-                for _event in run.rx {}
+                // Drain events until the run thread ends, keeping RunInfo
+                // current; the session log on disk is the full record.
+                for event in run.rx {
+                    match event {
+                        crate::agent::AgentEvent::Info(text) => {
+                            if let Some(path) = text.strip_prefix("session log: ") {
+                                info.lock().unwrap().log = std::path::Path::new(path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string());
+                            }
+                        }
+                        crate::agent::AgentEvent::TurnDone => {
+                            info.lock().unwrap().iterations += 1;
+                        }
+                        _ => {}
+                    }
+                }
                 busy.store(false, Ordering::Relaxed);
             });
             let _ = request.respond(json_response(
@@ -535,6 +626,12 @@ mod tests {
         let mut res = ureq::get("http://127.0.0.1:18654/agent").call().unwrap();
         let body = res.body_mut().read_to_string().unwrap();
         assert!(body.contains("\"running\":false"));
+        assert!(body.contains("\"iterations\":0"));
+
+        // Human live view at the root.
+        let mut res = ureq::get("http://127.0.0.1:18654/").call().unwrap();
+        let body = res.body_mut().read_to_string().unwrap();
+        assert!(body.contains("offgrid agent") && body.contains("idle"));
 
         let mut res = ureq::get("http://127.0.0.1:18654/logs").call().unwrap();
         let body = res.body_mut().read_to_string().unwrap();
