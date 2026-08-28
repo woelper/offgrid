@@ -255,8 +255,9 @@ fn run_loop(
         let Some(call) = parse_tool_call(&response) else {
             // A reply that clearly tried to call a tool but could not be
             // parsed gets one corrective nudge instead of ending the run.
-            let attempted = response.contains("<tool_call>")
-                || (response.contains("\"name\"") && response.contains("\"arguments\""));
+            let attempted = !dangling_tool_tag(&response)
+                && (response.contains("<tool_call>")
+                    || (response.contains("\"name\"") && response.contains("\"arguments\"")));
             if attempted && format_retries < 2 {
                 format_retries += 1;
                 log.log(
@@ -322,8 +323,9 @@ fn run_loop(
                 });
                 continue;
             }
-            if !response.trim().is_empty() {
-                append_history(workspace, task, &response, &files_touched);
+            let summary = response.trim_end().trim_end_matches("<tool_call>").trim();
+            if !summary.is_empty() {
+                append_history(workspace, task, summary, &files_touched);
             }
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
@@ -497,6 +499,14 @@ fn run_loop(
         iterations: MAX_ITERATIONS,
     });
     Ok(())
+}
+
+/// A bare trailing `<tool_call>` with nothing after it — a tic some models
+/// append to a final summary. It is not an attempted call; treating it as
+/// one burned two format-retry turns re-stating the same summary in a real
+/// run.
+fn dangling_tool_tag(response: &str) -> bool {
+    response.trim_end().ends_with("<tool_call>") && response.matches("<tool_call>").count() == 1
 }
 
 /// Does a reply with no parsable tool call *narrate* a file write? Models
@@ -1180,13 +1190,27 @@ fn web_agent() -> ureq::Agent {
         .into()
 }
 
-fn web_get(url: &str) -> Result<String, String> {
+/// An HTTP error status means the web works and the URL is wrong; a
+/// transport error means we may be offline. The model must react
+/// differently (try another URL vs. fall back to local knowledge), so the
+/// two must not share an error message.
+enum WebError {
+    Status(u16),
+    Transport(String),
+}
+
+fn web_get(url: &str) -> Result<String, WebError> {
     let mut res = web_agent()
         .get(url)
         .header("User-Agent", WEB_UA)
         .call()
-        .map_err(|e| e.to_string())?;
-    res.body_mut().read_to_string().map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => WebError::Status(code),
+            other => WebError::Transport(other.to_string()),
+        })?;
+    res.body_mut()
+        .read_to_string()
+        .map_err(|e| WebError::Transport(e.to_string()))
 }
 
 fn offline(err: String) -> String {
@@ -1229,7 +1253,10 @@ fn web_search(query: &str) -> Result<String, String> {
                 Ok(format!("No results found. {OFFLINE_HINT}"))
             }
         }
-        Err(e) => Ok(offline(e)),
+        Err(WebError::Status(code)) => Ok(format!(
+            "Search provider error (HTTP {code}). {OFFLINE_HINT}"
+        )),
+        Err(WebError::Transport(e)) => Ok(offline(e)),
     }
 }
 
@@ -1239,7 +1266,12 @@ fn fetch_url(url: &str) -> Result<String, String> {
     }
     match web_get(url) {
         Ok(html) => Ok(html_to_text(&html)),
-        Err(e) => Ok(offline(e)),
+        Err(WebError::Status(code)) => Err(format!(
+            "HTTP {code} from {url} — the web is reachable; this URL is wrong or the \
+             page is gone. Try a DIFFERENT url (do not retry this one, and do not \
+             conclude you are offline)."
+        )),
+        Err(WebError::Transport(e)) => Ok(offline(e)),
     }
 }
 
@@ -1443,6 +1475,20 @@ mod tests {
         };
         let out = execute(&call, &std::env::temp_dir(), false);
         assert!(out.contains("placeholder"));
+    }
+
+    #[test]
+    fn dangling_tag_is_not_an_attempted_call() {
+        // Verbatim shape from a real run: summary + bare trailing tag.
+        assert!(dangling_tool_tag(
+            "I've successfully completed the task. The code compiles.\n<tool_call>"
+        ));
+        assert!(dangling_tool_tag("Done.\n<tool_call>\n  "));
+        // A tag with content after it is an attempted (possibly broken) call.
+        assert!(!dangling_tool_tag(
+            "<tool_call>{\"name\": \"read_file\"  broken json"
+        ));
+        assert!(!dangling_tool_tag("All done, tests pass."));
     }
 
     #[test]
