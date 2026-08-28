@@ -22,6 +22,10 @@ const MAX_TOOL_OUTPUT: usize = 16 * 1024;
 // erased the very facts they had delivered.
 const MAX_WEB_OUTPUT: usize = 7 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 60;
+/// Marker prefix of the note appended when a command is killed at the
+/// timeout. Deliberately not a failure marker (see run_command_with_timeout)
+/// — but it must not count as *verification* of written code either.
+const TIMEOUT_KILL_NOTE: &str = "[the process was still running when the time limit expired";
 const WEB_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) offgrid/0.1";
 const OFFLINE_HINT: &str =
     "Continue using local knowledge and mention in your summary that the web was unavailable.";
@@ -414,7 +418,12 @@ fn run_loop(
                     }
                     verified_since_write = false;
                 }
-                "run_command" => verified_since_write = true,
+                // A timed-out command (e.g. a GUI smoke test) is a fine
+                // signal but not *verification* — that still takes a check
+                // or test that actually exits successfully.
+                "run_command" if !output.contains(TIMEOUT_KILL_NOTE) => {
+                    verified_since_write = true;
+                }
                 _ => {}
             }
         }
@@ -768,7 +777,10 @@ run_command and fix any errors until it succeeds — never declare code done \
 without running it. Writing a file ONLY happens through a write_file tool \
 call — never just describe or claim a write in prose.\n\
 Every run_command starts in the workspace root: `cd` does not persist between \
-commands, so use `cd subdir && command` when you need another directory.\n\
+commands, so use `cd subdir && command` when you need another directory. \
+Commands are killed after 60s: for a GUI or server program that is a \
+SUCCESSFUL smoke test (it launched and stayed up), for anything else it \
+means the command hung.\n\
 The workspace may already contain a working project from earlier tasks. To \
 change an existing file you must know its current content: read_file it \
 first. A blind overwrite is rejected once and shows you the file — resend \
@@ -1165,14 +1177,38 @@ fn run_command_with_timeout(
     {
         Some(status) => status,
         None => {
+            // Not an error: a GUI or server that reaches the timeout has
+            // launched and stayed up — that IS a successful smoke test
+            // (both bugs of a real run were invisible to cargo check but
+            // would have shown at launch). The note tells the model how to
+            // read it either way, and the partial output shows a hung
+            // build's last line.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("command timed out after {timeout_secs}s"));
+            let mut result = collect_output(out_thread, err_thread);
+            result.push_str(&format!(
+                "\n{TIMEOUT_KILL_NOTE} after {timeout_secs}s and was killed — there is \
+                 no exit code. If this was a GUI or server program, it launched \
+                 successfully and stayed up: that counts as a successful smoke test. \
+                 If it was a build, test, or script, it hung — treat that as a \
+                 failure.]"
+            ));
+            return Ok(result);
         }
     };
+    let mut result = collect_output(out_thread, err_thread);
+    if !status.success() {
+        result.push_str(&format!("\n[exit code: {}]", status.code().unwrap_or(-1)));
+    }
+    Ok(result)
+}
+
+fn collect_output(
+    out_thread: std::thread::JoinHandle<Vec<u8>>,
+    err_thread: std::thread::JoinHandle<Vec<u8>>,
+) -> String {
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
-
     let mut result = String::new();
     result.push_str(&String::from_utf8_lossy(&stdout));
     let stderr = String::from_utf8_lossy(&stderr);
@@ -1180,10 +1216,7 @@ fn run_command_with_timeout(
         result.push_str("\n[stderr]\n");
         result.push_str(&stderr);
     }
-    if !status.success() {
-        result.push_str(&format!("\n[exit code: {}]", status.code().unwrap_or(-1)));
-    }
-    Ok(result)
+    result
 }
 
 fn web_agent() -> ureq::Agent {
@@ -1850,11 +1883,17 @@ mod tests {
     fn run_command_times_out() {
         let ws = std::env::temp_dir();
         #[cfg(unix)]
-        let cmd = "sleep 30";
+        let cmd = "echo launching && sleep 30";
         #[cfg(windows)]
-        let cmd = "ping -n 31 127.0.0.1 > nul";
-        let err = run_command_with_timeout(cmd, &ws, 1).unwrap_err();
-        assert!(err.contains("timed out"));
+        let cmd = "echo launching && ping -n 31 127.0.0.1 > nul";
+        let out = run_command_with_timeout(cmd, &ws, 1).unwrap();
+        // Not an error: the note explains both readings (GUI smoke test ok /
+        // build hung), partial output survives, and no failure marker means
+        // tool_output_ok treats it as neutral-successful.
+        assert!(out.contains("launching"));
+        assert!(out.contains(TIMEOUT_KILL_NOTE));
+        assert!(out.contains("smoke test"));
+        assert!(tool_output_ok(&out));
     }
 
     #[test]
