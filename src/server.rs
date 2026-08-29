@@ -143,7 +143,7 @@ fn list_logs() -> Vec<(String, u64, std::time::SystemTime)> {
             Some((name, meta.len(), meta.modified().ok()?))
         })
         .collect();
-    logs.sort_by(|a, b| b.2.cmp(&a.2));
+    logs.sort_by_key(|l| std::cmp::Reverse(l.2)); // newest first
     logs
 }
 

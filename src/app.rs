@@ -646,7 +646,7 @@ impl OffgridApp {
                                 ))
                             })
                             .collect();
-                    logs.sort_by(|a, b| b.3.cmp(&a.3));
+                    logs.sort_by_key(|l| std::cmp::Reverse(l.3)); // newest first
                     if logs.is_empty() {
                         ui.weak("No session logs yet — run an agent task first.");
                     }
