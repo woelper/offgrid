@@ -123,7 +123,9 @@ fn text_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Session logs in the data dir, newest first.

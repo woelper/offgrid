@@ -626,8 +626,7 @@ impl OffgridApp {
                                     && name.ends_with(".log")
                                     && let Err(e) = std::fs::remove_file(entry.path())
                                 {
-                                    self.last_error =
-                                        Some(format!("could not delete {name}: {e}"));
+                                    self.last_error = Some(format!("could not delete {name}: {e}"));
                                 }
                             }
                         }
