@@ -448,8 +448,8 @@ fn run_loop(
                         .unwrap_or_default();
                     let web = if web_tools {
                         " You have web access: call web_search with the first error \
-                         line and the crate name/version to find the correct usage, and \
-                         fetch docs at the EXACT version your Cargo.toml pins — never \
+                         line and the library name/version to find the correct usage, \
+                         and fetch docs at the EXACT version your project pins — never \
                          'latest' or 'master', they describe a different API."
                     } else {
                         ""
@@ -720,6 +720,56 @@ fn recent_history(workspace: &Path) -> Option<String> {
     (!recent.trim().is_empty()).then_some(recent)
 }
 
+/// Language-specific documentation hint, only when the workspace actually
+/// contains that language (checked in the root and one level of subdirs —
+/// projects often live in a subdirectory). Constructing doc URLs directly
+/// beats searching for them, but the URL schemes are per-ecosystem.
+fn workspace_docs_hint(workspace: &Path) -> Option<&'static str> {
+    let markers: [(&str, &str); 5] = [
+        (
+            "Cargo.toml",
+            "This workspace contains Rust: crate docs live at \
+             https://docs.rs/<crate>/<version>/ — construct the URL directly \
+             with the exact version from Cargo.toml/Cargo.lock.\n",
+        ),
+        (
+            "pyproject.toml",
+            "This workspace contains Python: package pages live at \
+             https://pypi.org/project/<name>/, standard library docs at \
+             https://docs.python.org/3/.\n",
+        ),
+        (
+            "requirements.txt",
+            "This workspace contains Python: package pages live at \
+             https://pypi.org/project/<name>/, standard library docs at \
+             https://docs.python.org/3/.\n",
+        ),
+        (
+            "package.json",
+            "This workspace contains JavaScript/TypeScript: package pages \
+             live at https://www.npmjs.com/package/<name>.\n",
+        ),
+        (
+            "go.mod",
+            "This workspace contains Go: package docs live at \
+             https://pkg.go.dev/<module>@<version>.\n",
+        ),
+    ];
+    let mut dirs = vec![workspace.to_path_buf()];
+    for entry in std::fs::read_dir(workspace).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
+    for (marker, hint) in markers {
+        if dirs.iter().any(|d| d.join(marker).is_file()) {
+            return Some(hint);
+        }
+    }
+    None
+}
+
 fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let listing = list_files_impl(workspace, workspace, 1).unwrap_or_default();
     let agents_md = std::fs::read_to_string(workspace.join("AGENTS.md"))
@@ -738,18 +788,22 @@ fn system_prompt(workspace: &Path, web_tools: bool) -> String {
         })
         .unwrap_or_default();
     let web = if web_tools {
-        "- web_search: arguments {\"query\": \"...\"} — search the web\n\
-         - fetch_url: arguments {\"url\": \"https://...\"} — fetch a web page as plain text\n\
-         If the task involves \"latest\", \"current\", version numbers, URLs, or anything \
-         possibly newer than your training data, call web_search FIRST instead of \
-         answering from memory. When fetching crate or library documentation, put the \
-         EXACT version the project uses in the URL (e.g. https://docs.rs/sysinfo/0.29.11/…) \
-         — never fetch \"latest\" or \"master\" docs for a pinned older version: they \
-         describe a different API and will mislead you. Web tools may be offline: if one \
-         reports that web access is unavailable, do NOT retry more than once — continue \
-         with local knowledge.\n"
+        let docs_hint = workspace_docs_hint(workspace).unwrap_or_default();
+        format!(
+            "- web_search: arguments {{\"query\": \"...\"}} — search the web\n\
+             - fetch_url: arguments {{\"url\": \"https://...\"}} — fetch a web page as plain text\n\
+             If the task involves \"latest\", \"current\", version numbers, URLs, or anything \
+             possibly newer than your training data, call web_search FIRST instead of \
+             answering from memory. When fetching library documentation, put the \
+             EXACT version the project uses in the URL \
+             — never fetch \"latest\" or \"master\" docs for a pinned older version: they \
+             describe a different API and will mislead you. {docs_hint}\
+             Web tools may be offline: if one \
+             reports that web access is unavailable, do NOT retry more than once — continue \
+             with local knowledge.\n"
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         "You are a coding agent working in the workspace directory {ws}. All paths are \
@@ -1255,18 +1309,84 @@ fn offline(err: String) -> String {
     format!("Web access is unavailable (offline?): {err}. {OFFLINE_HINT}")
 }
 
+/// Drop near-duplicate results: GitHub mirror clones once ate three of five
+/// slots with an identical README snippet. Keyed on the normalized snippet
+/// line (first line = "title — url" is unique per mirror; the snippet isn't).
+fn dedupe_results(results: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    results
+        .into_iter()
+        .filter(|r| {
+            let snippet: String = r
+                .lines()
+                .skip(1)
+                .collect::<String>()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            // Results without a snippet can't be judged — keep them.
+            snippet.is_empty() || seen.insert(snippet)
+        })
+        .collect()
+}
+
+/// Parse the Stack Exchange `search/excerpts` JSON into result lines.
+fn parse_so_excerpts(json: &str) -> Vec<String> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = parsed["items"].as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|it| it["item_type"].as_str() == Some("question"))
+        .filter_map(|it| {
+            let id = it["question_id"].as_u64()?;
+            let title = html_to_text(it["title"].as_str()?);
+            let excerpt = html_to_text(it["excerpt"].as_str().unwrap_or_default());
+            Some(format!(
+                "{title} — https://stackoverflow.com/q/{id}\n{excerpt}"
+            ))
+        })
+        .take(3)
+        .collect()
+}
+
+/// Keyless Stack Overflow search (anonymous quota: 300 requests/day/IP) —
+/// the database for error messages in any language. Silent None on any
+/// problem: this only ever supplements the primary results.
+fn stackoverflow_search(query: &str) -> Option<String> {
+    let q = urlencode(query.trim());
+    let json = web_get(&format!(
+        "https://api.stackexchange.com/2.3/search/excerpts?order=desc&sort=relevance&q={q}&site=stackoverflow&pagesize=3"
+    ))
+    .ok()?;
+    let results = parse_so_excerpts(&json);
+    (!results.is_empty()).then(|| results.join("\n\n"))
+}
+
 fn web_search(query: &str) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
     }
     let q = urlencode(query.trim());
-    // Primary: DuckDuckGo Lite. It sometimes serves a bot challenge; treat a
-    // parse miss the same as being offline and fall back to Wikipedia.
+    // Primary: DuckDuckGo Lite, deduped, topped up with Stack Overflow (the
+    // agent's queries are programming queries). DDG sometimes serves a bot
+    // challenge; a parse miss degrades to the Wikipedia fallback.
+    let mut sections: Vec<String> = Vec::new();
     if let Ok(html) = web_get(&format!("https://lite.duckduckgo.com/lite/?q={q}")) {
-        let results = parse_ddg_lite(&html);
+        let results = dedupe_results(parse_ddg_lite(&html));
         if !results.is_empty() {
-            return Ok(results.join("\n\n"));
+            sections.push(results.into_iter().take(4).collect::<Vec<_>>().join("\n\n"));
         }
+    }
+    if let Some(so) = stackoverflow_search(query) {
+        sections.push(format!("Stack Overflow:\n{so}"));
+    }
+    if !sections.is_empty() {
+        return Ok(sections.join("\n\n"));
     }
     match web_get(&format!(
         "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={q}&format=json&srlimit=5"
@@ -1655,6 +1775,60 @@ mod tests {
         assert!(!text.contains(".a{}"));
         assert!(text.contains("Hello"));
         assert!(text.contains("world & more"));
+    }
+
+    #[test]
+    fn dedupes_mirror_results() {
+        let results = vec![
+            "sysinfo — https://github.com/GuillaumeGomez/sysinfo\nThe reason is because a lot of information".to_string(),
+            "mirror — https://github.com/jonashaag/sysinfo-crate\nThe reason is  because a LOT of information".to_string(),
+            "docs — https://docs.rs/sysinfo\nsysinfo is a crate used to get system information".to_string(),
+            "bare — https://example.com\n".to_string(),
+        ];
+        let deduped = dedupe_results(results);
+        assert_eq!(deduped.len(), 3); // mirror dropped, snippetless kept
+        assert!(deduped[1].starts_with("docs"));
+    }
+
+    #[test]
+    fn parses_stackoverflow_excerpts() {
+        let json = r#"{"items":[
+            {"item_type":"question","question_id":71504143,
+             "title":"Can&#39;t edit egui TextEdit",
+             "excerpt":"use <span class=\"highlight\">eframe</span>::{App, egui};"},
+            {"item_type":"answer","question_id":1,"title":"skip me","excerpt":"x"}
+        ]}"#;
+        let results = parse_so_excerpts(json);
+        assert_eq!(results.len(), 1); // answers filtered, questions kept
+        assert!(results[0].contains("Can't edit egui TextEdit"));
+        assert!(results[0].contains("https://stackoverflow.com/q/71504143"));
+        // Highlight tags stripped (the stripper inserts spaces where they were).
+        assert!(!results[0].contains("<span") && results[0].contains("{App, egui};"));
+        assert!(parse_so_excerpts("not json").is_empty());
+    }
+
+    #[test]
+    #[ignore = "hits the live network"]
+    fn stackoverflow_search_live() {
+        // Also proves ureq decodes the API's always-gzipped responses.
+        let out = stackoverflow_search("rust borrow checker cannot move out of").unwrap();
+        assert!(out.contains("stackoverflow.com/q/"));
+    }
+
+    #[test]
+    fn docs_hint_detects_language_in_subdirs() {
+        let ws = std::env::temp_dir().join("offgrid-docs-hint-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("sysmon")).unwrap();
+        assert!(workspace_docs_hint(&ws).is_none());
+        // Marker one level down (the common layout: project in a subdir).
+        std::fs::write(ws.join("sysmon/Cargo.toml"), "[package]").unwrap();
+        assert!(workspace_docs_hint(&ws).unwrap().contains("docs.rs"));
+        // A root-level Python marker also resolves.
+        std::fs::write(ws.join("pyproject.toml"), "[project]").unwrap();
+        let hints: Vec<_> = [workspace_docs_hint(&ws).unwrap()].to_vec();
+        assert!(hints[0].contains("docs.rs") || hints[0].contains("pypi.org"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
