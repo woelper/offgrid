@@ -34,6 +34,18 @@ impl HardwareProfile {
     }
 }
 
+/// Free space on the filesystem holding `path` — the disk whose mount point
+/// is the longest prefix of it (on Windows that is the drive, on unix it
+/// picks `/home` over `/` when both match). None if no mount point matches
+/// or the platform reports nothing.
+pub fn free_space(path: &std::path::Path) -> Option<u64> {
+    sysinfo::Disks::new_with_refreshed_list()
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
 /// Rough aggregate memory read bandwidth: several threads stream through
 /// their own buffers for ~120ms. Cheap, runs once at startup.
 fn measure_read_bandwidth(threads: usize) -> u64 {

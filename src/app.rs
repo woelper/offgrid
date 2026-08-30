@@ -9,7 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agent::{self, AgentEvent, AgentRun};
 use crate::config::{Config, models_dir};
-use crate::hardware::{HardwareProfile, fmt_bytes, fmt_bytes_precise};
+use crate::hardware::{self, HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, ChatMessage, LlmCmd, LlmEvent, LlmHandle, Role};
 use crate::models::{self, Fit, LocalModel};
@@ -99,6 +99,9 @@ enum AgentItem {
 
 pub struct OffgridApp {
     hardware: HardwareProfile,
+    /// Free space where models live. Cached: querying the mount table every
+    /// frame would be wasteful; refreshed whenever the model list changes.
+    free_space: Option<u64>,
     config: Config,
     tab: Tab,
     models_dir: PathBuf,
@@ -188,6 +191,7 @@ impl OffgridApp {
         let mut app = Self {
             local_models: models::scan_local(&models_dir),
             hardware,
+            free_space: hardware::free_space(&models_dir),
             config,
             tab: Tab::Models,
             models_dir,
@@ -274,6 +278,7 @@ impl OffgridApp {
     fn rescan(&mut self) {
         self.local_models = models::scan_local(&self.models_dir);
         self.interrupted = hub::scan_parts(&self.models_dir);
+        self.free_space = hardware::free_space(&self.models_dir);
     }
 
     /// End the current agent run and note why in the transcript.
@@ -723,7 +728,11 @@ impl OffgridApp {
                 },
             );
 
-            theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
+            let on_disk = match self.free_space {
+                Some(free) => format!("On disk  ({} free)", fmt_bytes(free)),
+                None => "On disk".to_string(),
+            };
+            theme::group(ui, &on_disk, Some(theme::icons().disk.clone()), |ui| {
                 if self.local_models.is_empty() {
                     ui.weak("No models yet — download one below.");
                 }
@@ -2067,49 +2076,56 @@ mod tests {
                     });
                 },
             );
-            theme::group(ui, "On disk", Some(theme::icons().disk.clone()), |ui| {
-                let rows: [(&str, u64, bool); 3] = [
-                    ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
-                    ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
-                    ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", 18_556_689_568, false),
-                ];
-                for (i, (name, size, loaded)) in rows.into_iter().enumerate() {
-                    list_row(
-                        ui,
-                        i % 2 == 1,
-                        |ui| {
-                            theme::icon(ui, theme::icons().disk.clone(), 16.0);
-                            ui.add(egui::Label::new(name).truncate());
-                            if loaded {
-                                ui.colored_label(theme::skin().good, "•");
-                            }
-                        },
-                        size,
-                        models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
-                        Fit::of(size, DEMO_RAM).badge(),
-                        |ui| {
-                            let _ = theme::button(
-                                ui,
-                                Some((theme::icons().trash.clone(), 18.0)),
-                                "Delete",
-                            );
-                            let load = ui.add_enabled(
-                                !loaded,
-                                egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
-                            );
-                            theme::gloss(ui, load.rect);
-                        },
-                    );
-                }
-                ui.horizontal(|ui| {
-                    theme::icon(ui, theme::icons().download.clone(), 16.0);
-                    ui.add(egui::Label::new("Qwen3.8-27B-UD-Q4_K_M.gguf").truncate());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("9.87 GB / 15.30 GB · 65.6 Mbit/s · 11:04 left");
+            // Fixed free-space figure: the real one varies per machine and
+            // would make the snapshot test non-deterministic.
+            theme::group(
+                ui,
+                "On disk  (412.7 GB free)",
+                Some(theme::icons().disk.clone()),
+                |ui| {
+                    let rows: [(&str, u64, bool); 3] = [
+                        ("Qwen3-0.6B-Q4_K_M", 396_705_472, false),
+                        ("Qwen_Qwen3-4B-Instruct-2507-Q4_K_M", 2_497_280_736, true),
+                        ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", 18_556_689_568, false),
+                    ];
+                    for (i, (name, size, loaded)) in rows.into_iter().enumerate() {
+                        list_row(
+                            ui,
+                            i % 2 == 1,
+                            |ui| {
+                                theme::icon(ui, theme::icons().disk.clone(), 16.0);
+                                ui.add(egui::Label::new(name).truncate());
+                                if loaded {
+                                    ui.colored_label(theme::skin().good, "•");
+                                }
+                            },
+                            size,
+                            models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
+                            Fit::of(size, DEMO_RAM).badge(),
+                            |ui| {
+                                let _ = theme::button(
+                                    ui,
+                                    Some((theme::icons().trash.clone(), 18.0)),
+                                    "Delete",
+                                );
+                                let load = ui.add_enabled(
+                                    !loaded,
+                                    egui::Button::new("Load").min_size(egui::vec2(60.0, 0.0)),
+                                );
+                                theme::gloss(ui, load.rect);
+                            },
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        theme::icon(ui, theme::icons().download.clone(), 16.0);
+                        ui.add(egui::Label::new("Qwen3.8-27B-UD-Q4_K_M.gguf").truncate());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.weak("9.87 GB / 15.30 GB · 65.6 Mbit/s · 11:04 left");
+                        });
                     });
-                });
-                theme::progress_bar(ui, 0.645);
-            });
+                    theme::progress_bar(ui, 0.645);
+                },
+            );
 
             theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
                 ui.horizontal(|ui| {
