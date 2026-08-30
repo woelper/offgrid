@@ -1015,7 +1015,14 @@ impl OffgridApp {
                                     .show(ui, |ui| {
                                         for f in &files {
                                             let tip = models::quant_tooltip(&f.name);
-                                            ui.label(&f.name).on_hover_text(&tip);
+                                            // Bounded + truncating: unbounded
+                                            // names widen the grid and push the
+                                            // download button off screen.
+                                            ui.scope(|ui| {
+                                                ui.set_max_width(COL_NAME);
+                                                ui.add(egui::Label::new(&f.name).truncate())
+                                                    .on_hover_text(&tip);
+                                            });
                                             ui.weak(fmt_bytes(f.size));
                                             ui.weak(models::fmt_tok_s(
                                                 models::est_tokens_per_sec(
@@ -1966,6 +1973,32 @@ mod tests {
 
     const DEMO_RAM: u64 = 32 * 1024 * 1024 * 1024;
     const DEMO_BW: u64 = 22_000_000_000;
+
+    /// A very long model name must not widen the search-results grid and push
+    /// the download button off screen — it truncates with an ellipsis instead.
+    #[test]
+    fn long_model_name_truncates_in_search_grid() {
+        let long = "unsloth_Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL-with-a-silly-long-name.gguf";
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let recorder = seen.clone();
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            egui::Grid::new("g").num_columns(2).show(ui, |ui| {
+                ui.scope(|ui| {
+                    ui.set_max_width(COL_NAME);
+                    ui.add(egui::Label::new(long).truncate());
+                });
+                let x = ui.button("Download").rect.min.x;
+                recorder.store(x as u32, std::sync::atomic::Ordering::Relaxed);
+                ui.end_row();
+            });
+        });
+        harness.run();
+        let button_x = seen.load(std::sync::atomic::Ordering::Relaxed) as f32;
+        assert!(
+            button_x > 0.0 && button_x < COL_NAME + 40.0,
+            "download button at x={button_x}, expected within the {COL_NAME}px name column"
+        );
+    }
 
     /// Wrap the demo screen in a faked Haiku desktop: blue backdrop, a window
     /// with the yellow title tab, border and drop shadow — for a README
