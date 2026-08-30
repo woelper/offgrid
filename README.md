@@ -52,7 +52,7 @@ The release binary is self-contained: statically linked inference, embedded
 fonts (Noto Sans, IBM Plex), embedded icons, no runtime downloads except the
 models you explicitly ask for. Copy it to another machine of the same OS and
 architecture and it just runs. Prebuilt Linux, macOS, and Windows builds are
-on the releases page.
+on the [releases page](https://github.com/woelper/offgrid/releases).
 
 ## Build
 
