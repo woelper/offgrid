@@ -123,13 +123,43 @@ fn split_message(text: &str) -> Vec<String> {
     out
 }
 
-/// POST a JSON body. Hand-rolled rather than ureq's `send_json` so the
-/// crate's `json` feature is not needed.
-fn post_json(base: &str, token: &str, method: &str, body: serde_json::Value) {
-    let _ = agent()
+/// POST a JSON body, returning the parsed response. Hand-rolled rather than
+/// ureq's `send_json` so the crate's `json` feature is not needed.
+fn post_json(
+    base: &str,
+    token: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut res = agent()
         .post(api(base, token, method))
         .header("Content-Type", "application/json")
-        .send(body.to_string());
+        .send(body.to_string())
+        .ok()?;
+    let text = res.body_mut().read_to_string().ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Send a message and return its id, so progress can be edited in place
+/// instead of spamming one notification per agent tool call.
+fn send_message_id(base: &str, token: &str, chat_id: i64, text: &str) -> Option<i64> {
+    post_json(
+        base,
+        token,
+        "sendMessage",
+        json!({"chat_id": chat_id, "text": text}),
+    )?["result"]["message_id"]
+        .as_i64()
+}
+
+fn edit_message(base: &str, token: &str, chat_id: i64, message_id: i64, text: &str) {
+    let text: String = text.chars().take(MAX_MSG).collect();
+    post_json(
+        base,
+        token,
+        "editMessageText",
+        json!({"chat_id": chat_id, "message_id": message_id, "text": text}),
+    );
 }
 
 fn send_message(base: &str, token: &str, chat_id: i64, text: &str) {
@@ -192,12 +222,98 @@ fn strip_think(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Progress lines kept in the live-edited run message.
+const RUN_LINES: usize = 12;
+
+/// Drive one agent run, reporting into a single message that is edited as
+/// the run proceeds (one notification, not one per tool call). Blocks until
+/// the run ends; callers put it on its own thread so polling continues.
+#[allow(clippy::too_many_arguments)]
+fn run_agent(
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    task: &str,
+    workspace: std::path::PathBuf,
+    cmd_tx: Sender<LlmCmd>,
+    web_tools: bool,
+    n_ctx: u32,
+    run_stop: &Arc<Mutex<Option<Arc<AtomicBool>>>>,
+) {
+    let head = format!(
+        "▶ {}\nin {}",
+        task.lines().next().unwrap_or(task),
+        workspace.display()
+    );
+    let msg_id = send_message_id(base, token, chat_id, &format!("{head}\n\nstarting…"));
+    // Remote runs auto-approve: nobody is at the approval prompt.
+    let run = crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx);
+    *run_stop.lock().unwrap() = Some(run.stop.clone());
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut turn_buf = String::new();
+    let mut last_turn = String::new();
+    let mut error: Option<String> = None;
+    let repaint = |lines: &[String], tail: &str| {
+        if let Some(id) = msg_id {
+            let body: Vec<&str> = lines.iter().map(String::as_str).collect();
+            edit_message(
+                base,
+                token,
+                chat_id,
+                id,
+                &format!("{head}\n\n{}\n{tail}", body.join("\n")),
+            );
+        }
+    };
+
+    for event in run.rx {
+        match event {
+            crate::agent::AgentEvent::Token(t) => turn_buf.push_str(&t),
+            crate::agent::AgentEvent::TurnDone => {
+                last_turn = strip_think(&turn_buf);
+                turn_buf.clear();
+            }
+            crate::agent::AgentEvent::ToolCall { name, summary } => {
+                let summary: String = summary.chars().take(80).collect();
+                lines.push(format!("• {name}: {summary}"));
+                if lines.len() > RUN_LINES {
+                    lines.remove(0);
+                }
+                repaint(&lines, "…working");
+            }
+            crate::agent::AgentEvent::ToolResult { ok: false, .. } => {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str("  ✗");
+                }
+                repaint(&lines, "…working");
+            }
+            crate::agent::AgentEvent::Error(e) => error = Some(e),
+            crate::agent::AgentEvent::Done { iterations } => {
+                repaint(&lines, &format!("✓ finished in {iterations} turns"));
+            }
+            _ => {}
+        }
+    }
+    *run_stop.lock().unwrap() = None;
+
+    match error {
+        Some(e) => send_message(base, token, chat_id, &format!("Run failed: {e}")),
+        None if !last_turn.is_empty() => send_message(base, token, chat_id, &last_turn),
+        None => send_message(base, token, chat_id, "Run ended."),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     token: String,
     allowed: Vec<i64>,
     cmd_tx: Sender<LlmCmd>,
     loaded_model: Arc<Mutex<Option<String>>>,
     n_ctx: u32,
+    workspace: Option<std::path::PathBuf>,
+    web_tools: bool,
+    code_enabled: bool,
 ) -> Bridge {
     start_with_base(
         TELEGRAM.to_string(),
@@ -206,11 +322,15 @@ pub fn start(
         cmd_tx,
         loaded_model,
         n_ctx,
+        workspace,
+        web_tools,
+        code_enabled,
     )
 }
 
 /// The bridge against an arbitrary API base — tests point it at a local
 /// server standing in for Telegram.
+#[allow(clippy::too_many_arguments)]
 fn start_with_base(
     base: String,
     token: String,
@@ -218,11 +338,17 @@ fn start_with_base(
     cmd_tx: Sender<LlmCmd>,
     loaded_model: Arc<Mutex<Option<String>>>,
     n_ctx: u32,
+    workspace: Option<std::path::PathBuf>,
+    web_tools: bool,
+    code_enabled: bool,
 ) -> Bridge {
     let stop = Arc::new(AtomicBool::new(false));
     let pending: Arc<Mutex<Vec<(i64, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new("connecting…".to_string()));
     let (stop_t, pending_t, status_t) = (stop.clone(), pending.clone(), status.clone());
+    // Set while an agent run is in flight; holds its abort flag for /stop.
+    let run_stop: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    let run_busy = Arc::new(AtomicBool::new(false));
 
     std::thread::spawn(move || {
         // Histories are per chat so two people don't share a conversation.
@@ -273,13 +399,21 @@ fn start_with_base(
                 let text = msg.text.trim();
                 match text {
                     "/start" | "/help" => {
+                        let code_line = if code_enabled {
+                            "/code <task> runs the coding agent in the workspace, \
+                             /stop aborts it.\n"
+                        } else {
+                            ""
+                        };
                         send_message(
                             &base,
                             &token,
                             msg.chat_id,
-                            "offgrid bridge. Send a message to chat with the loaded \
-                             model. /new starts a fresh conversation, /status shows \
-                             the model.",
+                            &format!(
+                                "offgrid bridge. Send a message to chat with the loaded \
+                                 model.\n{code_line}/new starts a fresh conversation, \
+                                 /status shows what is going on."
+                            ),
                         );
                         continue;
                     }
@@ -291,18 +425,85 @@ fn start_with_base(
                     "/status" => {
                         let model = loaded_model.lock().unwrap().clone();
                         let turns = histories.get(&msg.chat_id).map_or(0, Vec::len);
+                        let running = if run_busy.load(Ordering::Relaxed) {
+                            "\nan agent run is active (/stop to abort)"
+                        } else {
+                            ""
+                        };
                         send_message(
                             &base,
                             &token,
                             msg.chat_id,
                             &match model {
-                                Some(m) => format!("model: {m}\nturns in this chat: {turns}"),
+                                Some(m) => {
+                                    format!("model: {m}\nturns in this chat: {turns}{running}")
+                                }
                                 None => "No model loaded.".to_string(),
                             },
                         );
                         continue;
                     }
+                    "/stop" => {
+                        let flag = run_stop.lock().unwrap().clone();
+                        match flag {
+                            Some(f) => {
+                                f.store(true, Ordering::Relaxed);
+                                send_message(&base, &token, msg.chat_id, "Stopping the run…");
+                            }
+                            None => send_message(&base, &token, msg.chat_id, "No run is active."),
+                        }
+                        continue;
+                    }
                     _ => {}
+                }
+
+                if let Some(task) = text.strip_prefix("/code") {
+                    let task = task.trim();
+                    let reply = if !code_enabled {
+                        Some(
+                            "Code mode is disabled on this instance — enable it in the \
+                             Serve tab."
+                                .to_string(),
+                        )
+                    } else if task.is_empty() {
+                        Some("Usage: /code <task>".to_string())
+                    } else if workspace.as_ref().is_none_or(|w| !w.is_dir()) {
+                        Some("No workspace is set — pick one in the Code tab.".to_string())
+                    } else if loaded_model.lock().unwrap().is_none() {
+                        Some("No model is loaded — load one in the Models tab first.".to_string())
+                    } else if run_busy.swap(true, Ordering::Relaxed) {
+                        Some("An agent run is already active (/stop to abort).".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(text) = reply {
+                        send_message(&base, &token, msg.chat_id, &text);
+                        continue;
+                    }
+                    // Run on its own thread so /stop and /status still answer.
+                    let (base_t, token_t, task_t) = (base.clone(), token.clone(), task.to_string());
+                    let ws = workspace.clone().unwrap();
+                    let (cmd_t, stop_slot, busy) =
+                        (cmd_tx.clone(), run_stop.clone(), run_busy.clone());
+                    let chat_id = msg.chat_id;
+                    std::thread::spawn(move || {
+                        run_agent(
+                            &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
+                            &stop_slot,
+                        );
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                    continue;
+                }
+
+                if run_busy.load(Ordering::Relaxed) {
+                    send_message(
+                        &base,
+                        &token,
+                        msg.chat_id,
+                        "An agent run is active — /stop to abort, /status for progress.",
+                    );
+                    continue;
                 }
                 if loaded_model.lock().unwrap().is_none() {
                     send_message(
@@ -451,6 +652,9 @@ mod tests {
             cmd_tx,
             Arc::new(Mutex::new(Some("test-model".into()))),
             4096,
+            None,
+            false,
+            false,
         );
 
         // Wait for both replies to land (or give up after ~5s).
@@ -482,6 +686,110 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 99);
         assert_eq!(pending[0].1, "@stranger");
+    }
+
+    /// `/code` drives a real agent run and reports it back: progress edited
+    /// into one message, the model's closing summary sent separately. With
+    /// code mode off, the same command is refused.
+    #[test]
+    fn code_command_runs_the_agent_only_when_enabled() {
+        for code_enabled in [false, true] {
+            let ws = std::env::temp_dir().join(format!("offgrid-bridge-code-{code_enabled}"));
+            let _ = std::fs::remove_dir_all(&ws);
+            std::fs::create_dir_all(&ws).unwrap();
+
+            let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let sent: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let sent_srv = sent.clone();
+            std::thread::spawn(move || {
+                let mut polls = 0;
+                for mut req in server.incoming_requests() {
+                    let url = req.url().to_string();
+                    if url.contains("getUpdates") {
+                        polls += 1;
+                        let body = if polls == 1 {
+                            r#"{"ok":true,"result":[{"update_id":1,"message":{
+                                "chat":{"id":7},"from":{"username":"owner"},
+                                "text":"/code write a haiku"}}]}"#
+                        } else {
+                            r#"{"ok":true,"result":[]}"#
+                        };
+                        let _ = req.respond(tiny_http::Response::from_string(body));
+                    } else {
+                        let mut body = String::new();
+                        let _ = req.as_reader().read_to_string(&mut body);
+                        sent_srv.lock().unwrap().push(format!("{url} {body}"));
+                        let _ = req.respond(tiny_http::Response::from_string(
+                            r#"{"ok":true,"result":{"message_id":5}}"#,
+                        ));
+                    }
+                }
+            });
+
+            // Scripted model: one tool call, then a closing summary.
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<LlmCmd>();
+            std::thread::spawn(move || {
+                let mut turn = 0;
+                for cmd in cmd_rx {
+                    if let LlmCmd::Generate { reply, .. } = cmd {
+                        turn += 1;
+                        let text = if turn == 1 {
+                            "<tool_call>{\"name\": \"list_files\", \"arguments\": {}}</tool_call>"
+                        } else {
+                            "Wrote the haiku."
+                        };
+                        let _ = reply.send(LlmEvent::Token(text.into()));
+                        let _ = reply.send(LlmEvent::GenDone);
+                    }
+                }
+            });
+
+            let bridge = start_with_base(
+                format!("http://127.0.0.1:{port}"),
+                "test-token".into(),
+                vec![7],
+                cmd_tx,
+                Arc::new(Mutex::new(Some("test-model".into()))),
+                4096,
+                Some(ws.clone()),
+                false,
+                code_enabled,
+            );
+
+            let want = if code_enabled {
+                "Wrote the haiku."
+            } else {
+                "Code mode is disabled"
+            };
+            for _ in 0..50 {
+                if sent.lock().unwrap().iter().any(|s| s.contains(want)) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            bridge.stop();
+
+            let joined = sent.lock().unwrap().join("\n");
+            assert!(
+                joined.contains(want),
+                "code_enabled={code_enabled}: {joined}"
+            );
+            if code_enabled {
+                // Progress went into one edited message, not a flood.
+                assert!(
+                    joined.contains("editMessageText"),
+                    "no live progress: {joined}"
+                );
+                assert!(
+                    joined.contains("list_files"),
+                    "tool call not reported: {joined}"
+                );
+            } else {
+                assert!(!joined.contains("list_files"), "agent ran while disabled");
+            }
+            let _ = std::fs::remove_dir_all(&ws);
+        }
     }
 
     #[test]

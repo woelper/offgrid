@@ -1488,6 +1488,9 @@ impl OffgridApp {
             self.llm.cmd_tx.clone(),
             self.loaded_model_shared.clone(),
             self.n_ctx(),
+            self.config.workspace.clone(),
+            self.config.web_tools,
+            self.config.bridge_code,
         ));
     }
 
@@ -1532,6 +1535,27 @@ impl OffgridApp {
                     self.config.bridge_enabled = enabled;
                     self.config.save();
                     self.restart_bridge();
+                }
+
+                let mut code = self.config.bridge_code;
+                if theme::checkbox(ui, &mut code, "Allow /code (agent runs)").changed() {
+                    self.config.bridge_code = code;
+                    self.config.save();
+                    self.restart_bridge();
+                }
+                if self.config.bridge_code {
+                    ui.colored_label(
+                        theme::skin().warn,
+                        "Approved chats can run the coding agent in your workspace, \
+                         executing shell commands with auto-approve.",
+                    );
+                    match &self.config.workspace {
+                        Some(w) => ui.weak(format!("workspace: {}", w.display())),
+                        None => ui.colored_label(
+                            theme::skin().warn,
+                            "No workspace set — pick one in the Code tab first.",
+                        ),
+                    };
                 }
 
                 if let Some(b) = &self.bridge {

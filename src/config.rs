@@ -22,6 +22,11 @@ pub struct Config {
     pub bridge_token: String,
     #[serde(default)]
     pub bridge_allowed: Vec<i64>,
+    /// Allow `/code` over the bridge: agent runs with auto-approved shell
+    /// commands, triggered from a phone. Separate from `bridge_enabled`
+    /// because it is a different order of trust.
+    #[serde(default)]
+    pub bridge_code: bool,
     pub web_tools: bool,
     pub skin: Option<String>,
     pub n_ctx: Option<u32>,
