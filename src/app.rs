@@ -8,6 +8,7 @@ use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agent::{self, AgentEvent, AgentRun};
+use crate::bridge;
 use crate::config::{Config, models_dir};
 use crate::hardware::{self, HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
@@ -128,6 +129,7 @@ pub struct OffgridApp {
 
     // API server for external tools (opencode etc.)
     api_server: Option<ApiServer>,
+    bridge: Option<bridge::Bridge>,
     /// Cached at server start — resolving it opens a UDP socket, too costly
     /// per frame.
     lan_ip: Option<String>,
@@ -210,6 +212,7 @@ impl OffgridApp {
             loaded_model_shared,
             model_loading,
             api_server: None,
+            bridge: None,
             lan_ip: None,
             messages: Vec::new(),
             input: String::new(),
@@ -235,6 +238,9 @@ impl OffgridApp {
         };
         if app.config.server_enabled {
             app.start_server();
+        }
+        if app.config.bridge_enabled {
+            app.start_bridge();
         }
         app
     }
@@ -1472,6 +1478,115 @@ impl OffgridApp {
             });
     }
 
+    fn start_bridge(&mut self) {
+        if self.bridge.is_some() || self.config.bridge_token.trim().is_empty() {
+            return;
+        }
+        self.bridge = Some(bridge::start(
+            self.config.bridge_token.trim().to_string(),
+            self.config.bridge_allowed.clone(),
+            self.llm.cmd_tx.clone(),
+            self.loaded_model_shared.clone(),
+            self.n_ctx(),
+        ));
+    }
+
+    /// Restart the worker so a changed token or allowlist takes effect.
+    fn restart_bridge(&mut self) {
+        if let Some(b) = self.bridge.take() {
+            b.stop();
+        }
+        if self.config.bridge_enabled {
+            self.start_bridge();
+        }
+    }
+
+    fn bridge_ui(&mut self, ui: &mut egui::Ui) {
+        theme::group(
+            ui,
+            "Telegram bridge",
+            Some(theme::icons().chat.clone()),
+            |ui| {
+                ui.label(
+                    "Chat with the loaded model from your phone. The model still runs \
+                     here — but messages travel through Telegram's servers, so this is \
+                     the one part of offgrid that is not offline.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Bot token:");
+                    let field = egui::TextEdit::singleline(&mut self.config.bridge_token)
+                        .password(true)
+                        .hint_text("from @BotFather")
+                        .desired_width(260.0);
+                    if ui.add(field).lost_focus() {
+                        self.config.save();
+                        if self.config.bridge_enabled {
+                            self.restart_bridge();
+                        }
+                    }
+                });
+
+                let mut enabled = self.config.bridge_enabled;
+                if theme::checkbox(ui, &mut enabled, "Enable bridge").changed() {
+                    self.config.bridge_enabled = enabled;
+                    self.config.save();
+                    self.restart_bridge();
+                }
+
+                if let Some(b) = &self.bridge {
+                    let status = b.status.lock().unwrap().clone();
+                    let color = if status == "connected" {
+                        theme::skin().good
+                    } else {
+                        theme::skin().warn
+                    };
+                    ui.colored_label(color, format!("• {status}"));
+                    // Unknown senders queue up here for one-click approval.
+                    let pending: Vec<(i64, String)> = b.pending.lock().unwrap().clone();
+                    let mut allow: Option<i64> = None;
+                    for (id, from) in &pending {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{from} ({id}) wants to chat"));
+                            if theme::button(ui, None, "Allow").clicked() {
+                                allow = Some(*id);
+                            }
+                        });
+                    }
+                    if let Some(id) = allow {
+                        self.config.bridge_allowed.push(id);
+                        self.config.save();
+                        if let Some(b) = &self.bridge {
+                            b.pending.lock().unwrap().retain(|(i, _)| *i != id);
+                        }
+                        self.restart_bridge();
+                    }
+                }
+
+                if self.config.bridge_allowed.is_empty() {
+                    ui.weak("No chats allowed yet — message the bot once and approve it here.");
+                } else {
+                    let mut remove: Option<i64> = None;
+                    for id in self.config.bridge_allowed.clone() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("chat {id}"));
+                            if theme::button(ui, Some((theme::icons().trash.clone(), 14.0)), "")
+                                .clicked()
+                            {
+                                remove = Some(id);
+                            }
+                        });
+                    }
+                    if let Some(id) = remove {
+                        self.config.bridge_allowed.retain(|i| *i != id);
+                        self.config.save();
+                        self.restart_bridge();
+                    }
+                }
+            },
+        );
+    }
+
     fn serve_ui(&mut self, ui: &mut egui::Ui) {
         theme::group(ui, "API server", Some(theme::icons().serve.clone()), |ui| {
             ui.label(
@@ -1530,6 +1645,8 @@ impl OffgridApp {
                 }
             }
         });
+
+        self.bridge_ui(ui);
 
         theme::group(ui, "opencode setup", None, |ui| {
             ui.label(

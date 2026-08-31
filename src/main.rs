@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod bridge;
 mod config;
 mod hardware;
 mod hub;

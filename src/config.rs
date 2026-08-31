@@ -13,6 +13,15 @@ pub struct Config {
     pub server_lan: bool,
     pub server_port: Option<u16>,
     pub workspace: Option<PathBuf>,
+    /// Telegram bridge: bot token, and the chat ids allowed to talk to the
+    /// model. The allowlist is the only thing between a leaked token and a
+    /// stranger using your machine, so it starts empty.
+    #[serde(default)]
+    pub bridge_enabled: bool,
+    #[serde(default)]
+    pub bridge_token: String,
+    #[serde(default)]
+    pub bridge_allowed: Vec<i64>,
     pub web_tools: bool,
     pub skin: Option<String>,
     pub n_ctx: Option<u32>,

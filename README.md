@@ -39,6 +39,12 @@ internet was there in the first place.
   auto-approve), `GET /agent` (status), `POST /agent/stop`. Only enable it on
   a network where you trust every device — remote runs execute shell
   commands.
+  There is also an optional **Telegram bridge**: paste a bot token from
+  @BotFather and chat with the loaded model from your phone. It long-polls,
+  so no port, public URL, or tunnel is needed. Every chat must be approved
+  in the UI before the model answers it. This is the one feature that talks
+  to someone else's computer — your prompts pass through Telegram, even
+  though the model still runs on your machine — so it is off by default.
 - **Settings**: three UI styles (a loving Haiku OS recreation as default, a
   clean Material look, and stock egui for the purists), context window size,
   and a summary of what your hardware can actually do.
