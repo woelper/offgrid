@@ -97,9 +97,85 @@ pub struct AgentRun {
     pub auto_approve: Arc<AtomicBool>,
 }
 
+/// A run's full state between turns — the transcript is all that matters:
+/// files are already on disk, and the counters can safely restart.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SavedRun {
+    pub task: String,
+    pub turns: usize,
+    messages: Vec<ChatMessage>,
+}
+
+fn saved_run_path(workspace: &Path) -> PathBuf {
+    workspace.join(".offgrid").join("run.json")
+}
+
+/// The interrupted run waiting in this workspace, if any.
+pub fn saved_run(workspace: &Path) -> Option<SavedRun> {
+    let text = std::fs::read_to_string(saved_run_path(workspace)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn save_run(workspace: &Path, task: &str, turns: usize, messages: &[ChatMessage]) {
+    let path = saved_run_path(workspace);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let saved = SavedRun {
+        task: task.to_string(),
+        turns,
+        messages: messages.to_vec(),
+    };
+    if let Ok(json) = serde_json::to_string(&saved) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn clear_saved_run(workspace: &Path) {
+    let _ = std::fs::remove_file(saved_run_path(workspace));
+}
+
 pub fn start(
     workspace: PathBuf,
     task: String,
+    cmd_tx: Sender<LlmCmd>,
+    auto_approve: bool,
+    web_tools: bool,
+    n_ctx: u32,
+) -> AgentRun {
+    spawn(
+        workspace,
+        Some(task),
+        cmd_tx,
+        auto_approve,
+        web_tools,
+        n_ctx,
+    )
+}
+
+/// Continue the interrupted run saved in this workspace. None if there is
+/// nothing to resume.
+pub fn resume(
+    workspace: PathBuf,
+    cmd_tx: Sender<LlmCmd>,
+    auto_approve: bool,
+    web_tools: bool,
+    n_ctx: u32,
+) -> Option<AgentRun> {
+    saved_run(&workspace)?;
+    Some(spawn(
+        workspace,
+        None,
+        cmd_tx,
+        auto_approve,
+        web_tools,
+        n_ctx,
+    ))
+}
+
+fn spawn(
+    workspace: PathBuf,
+    task: Option<String>,
     cmd_tx: Sender<LlmCmd>,
     auto_approve: bool,
     web_tools: bool,
@@ -113,7 +189,7 @@ pub fn start(
     std::thread::spawn(move || {
         if let Err(e) = run_loop(
             &workspace,
-            &task,
+            task,
             &cmd_tx,
             &tx,
             &stop_thread,
@@ -134,7 +210,7 @@ pub fn start(
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
     workspace: &Path,
-    task: &str,
+    task: Option<String>,
     cmd_tx: &Sender<LlmCmd>,
     tx: &Sender<AgentEvent>,
     stop: &AtomicBool,
@@ -147,16 +223,34 @@ fn run_loop(
         "session log: {}",
         log.path.display()
     )));
-    let mut messages = vec![
-        ChatMessage {
-            role: Role::System,
-            content: system_prompt(workspace, web_tools),
-        },
-        ChatMessage {
-            role: Role::User,
-            content: task.to_string(),
-        },
-    ];
+    // A resume picks up the saved transcript; anything else starts fresh.
+    // Files are already on disk and the counters restart harmlessly — the
+    // transcript is the whole state.
+    let (task, mut messages, resumed_turns) = match task {
+        Some(task) => {
+            let messages = vec![
+                ChatMessage {
+                    role: Role::System,
+                    content: system_prompt(workspace, web_tools),
+                },
+                ChatMessage {
+                    role: Role::User,
+                    content: task.clone(),
+                },
+            ];
+            (task, messages, 0)
+        }
+        None => {
+            let saved = saved_run(workspace).ok_or("no saved run to resume")?;
+            let _ = tx.send(AgentEvent::Info(format!(
+                "resuming after {} turns: {}",
+                saved.turns,
+                saved.task.lines().next().unwrap_or_default()
+            )));
+            (saved.task, saved.messages, saved.turns)
+        }
+    };
+    let task = task.as_str();
     log.log("SYSTEM PROMPT", &messages[0].content);
     log.log("TASK", task);
     if recent_history(workspace).is_some() {
@@ -333,6 +427,7 @@ fn run_loop(
             if !summary.is_empty() {
                 append_history(workspace, "Done", task, summary, &files_touched);
             }
+            clear_saved_run(workspace);
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
             });
@@ -504,6 +599,8 @@ fn run_loop(
         if matches!(call.name.as_str(), "web_search" | "fetch_url") && ok {
             web_msgs.insert(messages.len() - 1);
         }
+        // Checkpoint: the transcript on disk is what a resume picks up.
+        save_run(workspace, task, resumed_turns + turns_taken, &messages);
     }
 
     // Stopped or out of turns: the clean-finish path above writes its own
@@ -511,12 +608,13 @@ fn run_loop(
     // otherwise the next run sees changed files with no idea why, which is
     // worse than knowing the work was cut short.
     if turns_taken > 0 {
+        let total = resumed_turns + turns_taken;
         let summary = if stop.load(Ordering::Relaxed) {
-            format!("STOPPED by the user after {turns_taken} turns — task NOT finished.")
+            format!("STOPPED by the user after {total} turns — task NOT finished (resumable).")
         } else {
             format!(
-                "Hit the {MAX_ITERATIONS}-turn limit after {turns_taken} turns — task NOT \
-                 finished."
+                "Hit the {MAX_ITERATIONS}-turn limit after {total} turns — task NOT \
+                 finished (resumable)."
             )
         };
         append_history(workspace, "Interrupted", task, &summary, &files_touched);
@@ -1609,6 +1707,87 @@ mod tests {
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
         assert!(parse_tool_call(r).is_none());
+    }
+
+    /// A stopped run leaves a resumable transcript; resuming continues it
+    /// (the model sees the earlier turns) and a clean finish clears it.
+    #[test]
+    fn interrupted_run_is_resumable() {
+        let ws = std::env::temp_dir().join("offgrid-resume-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        // Scripted model: keeps listing files, so the run never ends by
+        // itself and we can stop it mid-flight.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<LlmCmd>();
+        let saw_history = Arc::new(AtomicBool::new(false));
+        let saw = saw_history.clone();
+        std::thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let LlmCmd::Generate {
+                    messages, reply, ..
+                } = cmd
+                {
+                    // After a resume the earlier turns must still be there.
+                    if messages
+                        .iter()
+                        .filter(|m| m.role == Role::Assistant)
+                        .count()
+                        >= 2
+                    {
+                        saw.store(true, Ordering::SeqCst);
+                    }
+                    let _ = reply.send(LlmEvent::Token(
+                        "<tool_call>{\"name\": \"list_files\", \"arguments\": {}}</tool_call>"
+                            .into(),
+                    ));
+                    let _ = reply.send(LlmEvent::GenDone);
+                }
+            }
+        });
+
+        let run = start(
+            ws.clone(),
+            "keep listing".into(),
+            cmd_tx.clone(),
+            true,
+            false,
+            4096,
+        );
+        // Let a couple of turns happen, then stop like the UI button does.
+        for _ in 0..50 {
+            if saved_run(&ws).is_some_and(|s| s.turns >= 2) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        run.stop.store(true, Ordering::Relaxed);
+        while run.rx.recv().is_ok() {}
+
+        let saved = saved_run(&ws).expect("stopped run is resumable");
+        assert_eq!(saved.task, "keep listing");
+        assert!(saved.turns >= 2, "turns: {}", saved.turns);
+        // …and the interruption is recorded for the next run to see.
+        let history = std::fs::read_to_string(ws.join(".offgrid/history.md")).unwrap();
+        assert!(history.contains("## Interrupted: keep listing"));
+        assert!(history.contains("resumable"));
+
+        // Resuming continues the same conversation.
+        let run = resume(ws.clone(), cmd_tx, true, false, 4096).expect("resumable");
+        for _ in 0..50 {
+            if saw_history.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        run.stop.store(true, Ordering::Relaxed);
+        while run.rx.recv().is_ok() {}
+        assert!(
+            saw_history.load(Ordering::SeqCst),
+            "resumed run did not carry the earlier transcript"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

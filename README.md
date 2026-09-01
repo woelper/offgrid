@@ -29,14 +29,18 @@ internet was there in the first place.
   the workspace, shell commands wait for your approval unless you tell it to
   stop asking. Drop an `AGENTS.md` into the workspace for project
   instructions. Optional web tools (search and page fetch) are off by default
-  and fail politely when offline, which is the entire point of this app.
+  and fail politely when offline, which is the entire point of this app. A run
+  that is stopped or killed leaves its transcript behind, so a **Resume**
+  button picks it up where it left off instead of starting over.
 - **Serve**: an OpenAI-compatible API on `127.0.0.1:11633`, so opencode,
   aider, editors, and scripts can use your local models while believing they
   are talking to something much more expensive. An opt-in "Allow LAN access"
   mode binds 0.0.0.0 and adds remote-control endpoints: `GET /logs` +
   `GET /logs/latest` (agent session logs), `POST /agent` (start a run:
   `{"task": "...", "workspace": "...", "web_tools": true}`, always
-  auto-approve), `GET /agent` (status), `POST /agent/stop`. Only enable it on
+  auto-approve), `GET /agent` (status), `POST /agent/stop`,
+  `GET /agent/saved` + `POST /agent {"resume": true}` (continue an
+  interrupted run). Only enable it on
   a network where you trust every device — remote runs execute shell
   commands.
   There is also an optional **Telegram bridge**: paste a bot token from
@@ -44,7 +48,8 @@ internet was there in the first place.
   so no port, public URL, or tunnel is needed. Every chat must be approved
   in the UI before the model answers it. A second, separate toggle allows
   `/code <task>`, which runs the coding agent in your workspace and reports
-  progress into one live-updated message (`/stop` aborts, `/status` reports)
+  progress into one live-updated message (`/stop` aborts, `/status` reports,
+  `/resume` continues an interrupted run)
   — that is remote shell access with auto-approve, so treat it accordingly.
   This is the one feature that talks to someone else's computer — your
   prompts pass through Telegram, even though the model still runs on your

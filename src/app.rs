@@ -1310,6 +1310,34 @@ impl OffgridApp {
                         self.n_ctx(),
                     ));
                 }
+                // An interrupted run left its transcript behind: offer to
+                // pick it up instead of re-explaining the task.
+                if !running
+                    && let Some(ws) = self.workspace_path()
+                    && let Some(saved) = agent::saved_run(&ws)
+                {
+                    let first = saved.task.lines().next().unwrap_or_default().to_string();
+                    let label = format!("⏵ Resume ({} turns)", saved.turns);
+                    if ui
+                        .add_enabled(self.loaded_model.is_some(), egui::Button::new(label))
+                        .on_hover_text(format!("Continue the interrupted run:\n{first}"))
+                        .clicked()
+                        && let Some(run) = agent::resume(
+                            ws,
+                            self.llm.cmd_tx.clone(),
+                            self.agent_auto_approve,
+                            self.config.web_tools,
+                            self.n_ctx(),
+                        )
+                    {
+                        self.agent_transcript
+                            .push(AgentItem::Info(format!("resuming: {first}")));
+                        self.agent_current.clear();
+                        self.live_tokens = 0;
+                        self.live_start = None;
+                        self.agent_run = Some(run);
+                    }
+                }
                 if running {
                     if theme::button(ui, None, "Stop").clicked() {
                         if let Some(run) = &self.agent_run {

@@ -239,15 +239,27 @@ fn run_agent(
     web_tools: bool,
     n_ctx: u32,
     run_stop: &Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    resuming: bool,
 ) {
     let head = format!(
-        "▶ {}\nin {}",
+        "{} {}\nin {}",
+        if resuming { "⏵ resuming" } else { "▶" },
         task.lines().next().unwrap_or(task),
         workspace.display()
     );
     let msg_id = send_message_id(base, token, chat_id, &format!("{head}\n\nstarting…"));
     // Remote runs auto-approve: nobody is at the approval prompt.
-    let run = crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx);
+    let run = if resuming {
+        match crate::agent::resume(workspace, cmd_tx, true, web_tools, n_ctx) {
+            Some(run) => run,
+            None => {
+                send_message(base, token, chat_id, "Nothing to resume.");
+                return;
+            }
+        }
+    } else {
+        crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx)
+    };
     *run_stop.lock().unwrap() = Some(run.stop.clone());
 
     let mut lines: Vec<String> = Vec::new();
@@ -401,7 +413,7 @@ fn start_with_base(
                     "/start" | "/help" => {
                         let code_line = if code_enabled {
                             "/code <task> runs the coding agent in the workspace, \
-                             /stop aborts it.\n"
+                             /stop aborts it, /resume continues an interrupted run.\n"
                         } else {
                             ""
                         };
@@ -457,6 +469,39 @@ fn start_with_base(
                     _ => {}
                 }
 
+                if text == "/resume" {
+                    let saved = workspace.as_ref().and_then(|w| crate::agent::saved_run(w));
+                    let reply = if !code_enabled {
+                        Some("Code mode is disabled on this instance.".to_string())
+                    } else if saved.is_none() {
+                        Some("No interrupted run to resume.".to_string())
+                    } else if loaded_model.lock().unwrap().is_none() {
+                        Some("No model is loaded — load one in the Models tab first.".to_string())
+                    } else if run_busy.swap(true, Ordering::Relaxed) {
+                        Some("An agent run is already active (/stop to abort).".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(text) = reply {
+                        send_message(&base, &token, msg.chat_id, &text);
+                        continue;
+                    }
+                    let (base_t, token_t) = (base.clone(), token.clone());
+                    let task_t = saved.map(|s| s.task).unwrap_or_default();
+                    let ws = workspace.clone().unwrap();
+                    let (cmd_t, stop_slot, busy) =
+                        (cmd_tx.clone(), run_stop.clone(), run_busy.clone());
+                    let chat_id = msg.chat_id;
+                    std::thread::spawn(move || {
+                        run_agent(
+                            &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
+                            &stop_slot, true,
+                        );
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                    continue;
+                }
+
                 if let Some(task) = text.strip_prefix("/code") {
                     let task = task.trim();
                     let reply = if !code_enabled {
@@ -489,7 +534,7 @@ fn start_with_base(
                     std::thread::spawn(move || {
                         run_agent(
                             &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
-                            &stop_slot,
+                            &stop_slot, false,
                         );
                         busy.store(false, Ordering::Relaxed);
                     });

@@ -16,7 +16,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 pub const DEFAULT_N_CTX: u32 = 16384;
 const N_BATCH: u32 = 2048;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     System,
     User,
@@ -33,7 +33,7 @@ impl Role {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,

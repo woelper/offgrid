@@ -273,6 +273,19 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             };
             let _ = request.respond(json_response(200, json!({"stopped": stopped})));
         }
+        ("GET", "/agent/saved") => {
+            let saved = ctx
+                .workspace
+                .as_ref()
+                .and_then(|w| crate::agent::saved_run(w));
+            let _ = request.respond(json_response(
+                200,
+                match saved {
+                    Some(s) => json!({"saved": true, "task": s.task, "turns": s.turns}),
+                    None => json!({"saved": false}),
+                },
+            ));
+        }
         ("POST", "/agent") => {
             let mut body = String::new();
             if request.as_reader().read_to_string(&mut body).is_err() {
@@ -289,17 +302,21 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 ));
                 return;
             };
-            let Some(task) = payload
+            let resuming = payload
+                .get("resume")
+                .and_then(|r| r.as_bool())
+                .unwrap_or(false);
+            let task = payload
                 .get("task")
                 .and_then(|t| t.as_str())
-                .filter(|t| !t.trim().is_empty())
-            else {
+                .filter(|t| !t.trim().is_empty());
+            if task.is_none() && !resuming {
                 let _ = request.respond(json_response(
                     400,
-                    json!({"error": {"message": "missing 'task'"}}),
+                    json!({"error": {"message": "missing 'task' (or pass resume: true)"}}),
                 ));
                 return;
-            };
+            }
             let workspace = payload
                 .get("workspace")
                 .and_then(|w| w.as_str())
@@ -332,14 +349,34 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             }
             // Remote runs always auto-approve commands: there is no one at
             // the approval prompt. That is why LAN mode is opt-in.
-            let run = crate::agent::start(
-                workspace.clone(),
-                task.to_string(),
-                ctx.cmd_tx.clone(),
-                true,
-                web_tools,
-                ctx.n_ctx,
-            );
+            let run = if resuming {
+                match crate::agent::resume(
+                    workspace.clone(),
+                    ctx.cmd_tx.clone(),
+                    true,
+                    web_tools,
+                    ctx.n_ctx,
+                ) {
+                    Some(run) => run,
+                    None => {
+                        ctx.agent_busy.store(false, Ordering::Relaxed);
+                        let _ = request.respond(json_response(
+                            409,
+                            json!({"error": {"message": "no saved run to resume"}}),
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                crate::agent::start(
+                    workspace.clone(),
+                    task.unwrap_or_default().to_string(),
+                    ctx.cmd_tx.clone(),
+                    true,
+                    web_tools,
+                    ctx.n_ctx,
+                )
+            };
             *ctx.agent_stop.lock().unwrap() = Some(run.stop.clone());
             *ctx.agent_info.lock().unwrap() = RunInfo::default();
             let busy = ctx.agent_busy.clone();
@@ -368,6 +405,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 200,
                 json!({
                     "started": true,
+                    "resumed": resuming,
                     "workspace": workspace.display().to_string(),
                     "web_tools": web_tools,
                     "auto_approve": true,
