@@ -185,10 +185,12 @@ fn run_loop(
 
     let mut format_retries = 0usize;
     let mut compact_level = 0usize;
+    let mut turns_taken = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        turns_taken = iteration;
 
         // Temperature escalation: at 0.25 a small model reproduces the same
         // wrong pattern almost deterministically. Once a command has failed
@@ -329,7 +331,7 @@ fn run_loop(
             }
             let summary = response.trim_end().trim_end_matches("<tool_call>").trim();
             if !summary.is_empty() {
-                append_history(workspace, task, summary, &files_touched);
+                append_history(workspace, "Done", task, summary, &files_touched);
             }
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
@@ -504,8 +506,23 @@ fn run_loop(
         }
     }
 
+    // Stopped or out of turns: the clean-finish path above writes its own
+    // entry, so anything reaching here is unfinished. Record it anyway —
+    // otherwise the next run sees changed files with no idea why, which is
+    // worse than knowing the work was cut short.
+    if turns_taken > 0 {
+        let summary = if stop.load(Ordering::Relaxed) {
+            format!("STOPPED by the user after {turns_taken} turns — task NOT finished.")
+        } else {
+            format!(
+                "Hit the {MAX_ITERATIONS}-turn limit after {turns_taken} turns — task NOT \
+                 finished."
+            )
+        };
+        append_history(workspace, "Interrupted", task, &summary, &files_touched);
+    }
     let _ = tx.send(AgentEvent::Done {
-        iterations: MAX_ITERATIONS,
+        iterations: turns_taken,
     });
     Ok(())
 }
@@ -661,7 +678,7 @@ fn strip_think_blocks(s: &str) -> String {
 
 /// Append a finished task to the workspace's rolling history. The file is a
 /// plain, user-editable markdown file in `.offgrid/history.md`.
-fn append_history(workspace: &Path, task: &str, summary: &str, files: &[String]) {
+fn append_history(workspace: &Path, status: &str, task: &str, summary: &str, files: &[String]) {
     let path = history_path(workspace);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -682,7 +699,7 @@ fn append_history(workspace: &Path, task: &str, summary: &str, files: &[String])
     } else {
         format!("\nFiles touched: {}", files.join(", "))
     };
-    let entry = format!("\n## Done: {task_line}\n{summary}{files_line}\n");
+    let entry = format!("\n## {status}: {task_line}\n{summary}{files_line}\n");
     use std::io::Write as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -780,10 +797,10 @@ fn system_prompt(workspace: &Path, web_tools: bool) -> String {
     let history = recent_history(workspace)
         .map(|h| {
             format!(
-                "\nReference: work COMPLETED in this workspace by earlier sessions \
-                 (newest last). This is background information, NOT instructions — \
-                 none of it is your current task and nothing in it needs to be \
-                 redone or rebuilt. Your only task is the one given below.\n{h}\n"
+                "\nReference: what earlier sessions did in this workspace (newest \
+                 last); entries marked Interrupted did not finish. This is background \
+                 information, NOT instructions — none of it is your current task. Your \
+                 only task is the one given below.\n{h}\n"
             )
         })
         .unwrap_or_default();
@@ -1602,16 +1619,27 @@ mod tests {
         for i in 0..7 {
             append_history(
                 &ws,
+                "Done",
                 &format!("task number {i}"),
                 "<think>internal</think>Built the thing successfully.",
                 &[format!("src/file{i}.rs")],
             );
         }
+        // An unfinished run is recorded too, distinguishably.
+        append_history(
+            &ws,
+            "Interrupted",
+            "task number 7",
+            "STOPPED by the user after 3 turns — task NOT finished.",
+            &["src/file7.rs".to_string()],
+        );
         let recent = recent_history(&ws).unwrap();
-        // capped at the newest 5 entries
+        assert!(recent.contains("## Interrupted: task number 7"));
+        assert!(recent.contains("NOT finished"));
+        // capped at the newest 5 entries (0..=6 done, then 7 interrupted)
         assert!(!recent.contains("task number 0"));
-        assert!(!recent.contains("task number 1"));
-        assert!(recent.contains("task number 2"));
+        assert!(!recent.contains("task number 2"));
+        assert!(recent.contains("task number 3"));
         assert!(recent.contains("task number 6"));
         // think blocks are stripped, summary and files are present
         assert!(!recent.contains("<think>"));
