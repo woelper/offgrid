@@ -238,7 +238,7 @@ fn run_agent(
     cmd_tx: Sender<LlmCmd>,
     web_tools: bool,
     n_ctx: u32,
-    run_stop: &Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    active: &crate::agent::ActiveRun,
     resuming: bool,
 ) {
     let head = format!(
@@ -260,7 +260,12 @@ fn run_agent(
     } else {
         crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx)
     };
-    *run_stop.lock().unwrap() = Some(run.stop.clone());
+    crate::agent::claim(
+        active,
+        crate::agent::RunSource::Telegram,
+        task,
+        run.stop.clone(),
+    );
 
     let mut lines: Vec<String> = Vec::new();
     let mut turn_buf = String::new();
@@ -283,6 +288,7 @@ fn run_agent(
         match event {
             crate::agent::AgentEvent::Token(t) => turn_buf.push_str(&t),
             crate::agent::AgentEvent::TurnDone => {
+                crate::agent::note_turn(active);
                 last_turn = strip_think(&turn_buf);
                 turn_buf.clear();
             }
@@ -307,7 +313,7 @@ fn run_agent(
             _ => {}
         }
     }
-    *run_stop.lock().unwrap() = None;
+    crate::agent::release(active);
 
     match error {
         Some(e) => send_message(base, token, chat_id, &format!("Run failed: {e}")),
@@ -326,6 +332,7 @@ pub fn start(
     workspace: Option<std::path::PathBuf>,
     web_tools: bool,
     code_enabled: bool,
+    active: crate::agent::ActiveRun,
 ) -> Bridge {
     start_with_base(
         TELEGRAM.to_string(),
@@ -337,6 +344,7 @@ pub fn start(
         workspace,
         web_tools,
         code_enabled,
+        active,
     )
 }
 
@@ -353,14 +361,12 @@ fn start_with_base(
     workspace: Option<std::path::PathBuf>,
     web_tools: bool,
     code_enabled: bool,
+    active: crate::agent::ActiveRun,
 ) -> Bridge {
     let stop = Arc::new(AtomicBool::new(false));
     let pending: Arc<Mutex<Vec<(i64, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new("connecting…".to_string()));
     let (stop_t, pending_t, status_t) = (stop.clone(), pending.clone(), status.clone());
-    // Set while an agent run is in flight; holds its abort flag for /stop.
-    let run_stop: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
-    let run_busy = Arc::new(AtomicBool::new(false));
 
     std::thread::spawn(move || {
         // Histories are per chat so two people don't share a conversation.
@@ -437,10 +443,9 @@ fn start_with_base(
                     "/status" => {
                         let model = loaded_model.lock().unwrap().clone();
                         let turns = histories.get(&msg.chat_id).map_or(0, Vec::len);
-                        let running = if run_busy.load(Ordering::Relaxed) {
-                            "\nan agent run is active (/stop to abort)"
-                        } else {
-                            ""
+                        let running = match crate::agent::run_summary(&active) {
+                            Some(s) => format!("\n{s}\n/stop aborts it"),
+                            None => String::new(),
                         };
                         send_message(
                             &base,
@@ -456,11 +461,18 @@ fn start_with_base(
                         continue;
                     }
                     "/stop" => {
-                        let flag = run_stop.lock().unwrap().clone();
-                        match flag {
-                            Some(f) => {
-                                f.store(true, Ordering::Relaxed);
-                                send_message(&base, &token, msg.chat_id, "Stopping the run…");
+                        // Aborts whatever is running, including a run
+                        // started in the UI or over the API.
+                        let state = active.lock().unwrap().clone();
+                        match state {
+                            Some(s) => {
+                                s.stop.store(true, Ordering::Relaxed);
+                                send_message(
+                                    &base,
+                                    &token,
+                                    msg.chat_id,
+                                    &format!("Stopping the run started from {}…", s.source.label()),
+                                );
                             }
                             None => send_message(&base, &token, msg.chat_id, "No run is active."),
                         }
@@ -477,8 +489,9 @@ fn start_with_base(
                         Some("No interrupted run to resume.".to_string())
                     } else if loaded_model.lock().unwrap().is_none() {
                         Some("No model is loaded — load one in the Models tab first.".to_string())
-                    } else if run_busy.swap(true, Ordering::Relaxed) {
-                        Some("An agent run is already active (/stop to abort).".to_string())
+                    } else if crate::agent::run_summary(&active).is_some() {
+                        crate::agent::run_summary(&active)
+                            .map(|s| format!("Busy — {s}. /stop aborts it."))
                     } else {
                         None
                     };
@@ -489,15 +502,13 @@ fn start_with_base(
                     let (base_t, token_t) = (base.clone(), token.clone());
                     let task_t = saved.map(|s| s.task).unwrap_or_default();
                     let ws = workspace.clone().unwrap();
-                    let (cmd_t, stop_slot, busy) =
-                        (cmd_tx.clone(), run_stop.clone(), run_busy.clone());
+                    let (cmd_t, active_t) = (cmd_tx.clone(), active.clone());
                     let chat_id = msg.chat_id;
                     std::thread::spawn(move || {
                         run_agent(
                             &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
-                            &stop_slot, true,
+                            &active_t, true,
                         );
-                        busy.store(false, Ordering::Relaxed);
                     });
                     continue;
                 }
@@ -516,8 +527,9 @@ fn start_with_base(
                         Some("No workspace is set — pick one in the Code tab.".to_string())
                     } else if loaded_model.lock().unwrap().is_none() {
                         Some("No model is loaded — load one in the Models tab first.".to_string())
-                    } else if run_busy.swap(true, Ordering::Relaxed) {
-                        Some("An agent run is already active (/stop to abort).".to_string())
+                    } else if crate::agent::run_summary(&active).is_some() {
+                        crate::agent::run_summary(&active)
+                            .map(|s| format!("Busy — {s}. /stop aborts it."))
                     } else {
                         None
                     };
@@ -528,20 +540,18 @@ fn start_with_base(
                     // Run on its own thread so /stop and /status still answer.
                     let (base_t, token_t, task_t) = (base.clone(), token.clone(), task.to_string());
                     let ws = workspace.clone().unwrap();
-                    let (cmd_t, stop_slot, busy) =
-                        (cmd_tx.clone(), run_stop.clone(), run_busy.clone());
+                    let (cmd_t, active_t) = (cmd_tx.clone(), active.clone());
                     let chat_id = msg.chat_id;
                     std::thread::spawn(move || {
                         run_agent(
                             &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
-                            &stop_slot, false,
+                            &active_t, false,
                         );
-                        busy.store(false, Ordering::Relaxed);
                     });
                     continue;
                 }
 
-                if run_busy.load(Ordering::Relaxed) {
+                if active.lock().unwrap().is_some() {
                     send_message(
                         &base,
                         &token,
@@ -700,6 +710,7 @@ mod tests {
             None,
             false,
             false,
+            crate::agent::active_run(),
         );
 
         // Wait for both replies to land (or give up after ~5s).
@@ -800,6 +811,7 @@ mod tests {
                 Some(ws.clone()),
                 false,
                 code_enabled,
+                crate::agent::active_run(),
             );
 
             let want = if code_enabled {

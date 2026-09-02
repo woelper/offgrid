@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use crate::llm::{ChatMessage, LlmCmd, LlmEvent, Role};
 
@@ -95,6 +95,82 @@ pub struct AgentRun {
     /// Live-updatable: toggling auto-approve mid-run takes effect on the
     /// next command instead of only on the next run.
     pub auto_approve: Arc<AtomicBool>,
+}
+
+/// Who started the active run. The UI, the Telegram bridge and the HTTP
+/// server all drive the same single-threaded LLM worker, so they need one
+/// shared view of "is something running" — otherwise two runs interleave
+/// their turns and `/status` reports on a run nobody asked about.
+#[derive(Clone, Copy, PartialEq)]
+pub enum RunSource {
+    Ui,
+    Telegram,
+    Api,
+}
+
+impl RunSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            RunSource::Ui => "the UI",
+            RunSource::Telegram => "Telegram",
+            RunSource::Api => "the API",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RunState {
+    pub source: RunSource,
+    pub task: String,
+    pub turns: usize,
+    pub started: std::time::Instant,
+    /// Abort flag of the live run, so any driver can stop it.
+    pub stop: Arc<AtomicBool>,
+}
+
+/// The one active agent run, whoever started it. `None` means idle.
+pub type ActiveRun = Arc<Mutex<Option<RunState>>>;
+
+pub fn active_run() -> ActiveRun {
+    Arc::new(Mutex::new(None))
+}
+
+/// Claim the single run slot. Returns false if a run is already active.
+pub fn claim(active: &ActiveRun, source: RunSource, task: &str, stop: Arc<AtomicBool>) -> bool {
+    let mut slot = active.lock().unwrap();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(RunState {
+        source,
+        task: task.to_string(),
+        turns: 0,
+        started: std::time::Instant::now(),
+        stop,
+    });
+    true
+}
+
+pub fn release(active: &ActiveRun) {
+    *active.lock().unwrap() = None;
+}
+
+pub fn note_turn(active: &ActiveRun) {
+    if let Some(state) = active.lock().unwrap().as_mut() {
+        state.turns += 1;
+    }
+}
+
+/// One-line description of what is running, for `/status` and the API.
+pub fn run_summary(active: &ActiveRun) -> Option<String> {
+    let state = active.lock().unwrap().clone()?;
+    let mins = state.started.elapsed().as_secs() / 60;
+    let task = state.task.lines().next().unwrap_or_default();
+    Some(format!(
+        "running (started from {}): {task} — turn {}, {mins} min",
+        state.source.label(),
+        state.turns
+    ))
 }
 
 /// A run's full state between turns — the transcript is all that matters:
@@ -1707,6 +1783,58 @@ mod tests {
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
         assert!(parse_tool_call(r).is_none());
+    }
+
+    /// The UI, the bridge and the API share one run slot: a run started
+    /// anywhere is visible everywhere, only one can be active, and any
+    /// driver can abort it.
+    #[test]
+    fn run_slot_is_shared_across_drivers() {
+        let active = active_run();
+        assert!(run_summary(&active).is_none());
+
+        // The UI starts a run…
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(claim(
+            &active,
+            RunSource::Ui,
+            "fix the failing test",
+            stop.clone()
+        ));
+        note_turn(&active);
+        note_turn(&active);
+
+        // …Telegram sees it, with the origin named.
+        let summary = run_summary(&active).unwrap();
+        assert!(summary.contains("started from the UI"), "{summary}");
+        assert!(summary.contains("fix the failing test"), "{summary}");
+        assert!(summary.contains("turn 2"), "{summary}");
+
+        // A second run is refused while it is active…
+        assert!(!claim(
+            &active,
+            RunSource::Telegram,
+            "something else",
+            Arc::new(AtomicBool::new(false))
+        ));
+        // …and Telegram's /stop aborts the UI's run.
+        active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .stop
+            .store(true, Ordering::Relaxed);
+        assert!(stop.load(Ordering::Relaxed));
+
+        release(&active);
+        assert!(run_summary(&active).is_none());
+        assert!(claim(
+            &active,
+            RunSource::Telegram,
+            "now mine",
+            Arc::new(AtomicBool::new(false))
+        ));
     }
 
     /// A stopped run leaves a resumable transcript; resuming continues it

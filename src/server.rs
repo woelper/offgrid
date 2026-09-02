@@ -46,11 +46,13 @@ struct Ctx {
     loaded_model: Arc<Mutex<Option<String>>>,
     n_ctx: u32,
     workspace: Option<PathBuf>,
-    agent_busy: Arc<AtomicBool>,
-    agent_stop: Mutex<Option<Arc<AtomicBool>>>,
+    /// Shared with the UI and the Telegram bridge: one run at a time,
+    /// whoever started it.
+    active: crate::agent::ActiveRun,
     agent_info: Arc<Mutex<RunInfo>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     port: u16,
     lan: bool,
@@ -59,6 +61,7 @@ pub fn start(
     loaded_model: Arc<Mutex<Option<String>>>,
     n_ctx: u32,
     workspace: Option<PathBuf>,
+    active: crate::agent::ActiveRun,
 ) -> Result<ApiServer, String> {
     // 0.0.0.0 exposes the model, the session logs, and remote agent runs
     // (shell access!) to the local network — strictly opt-in.
@@ -72,8 +75,7 @@ pub fn start(
         loaded_model,
         n_ctx,
         workspace,
-        agent_busy: Arc::new(AtomicBool::new(false)),
-        agent_stop: Mutex::new(None),
+        active,
         agent_info: Arc::new(Mutex::new(RunInfo::default())),
     });
     std::thread::spawn(move || {
@@ -159,7 +161,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
         // Human-readable live view: status plus the tail of the current
         // session log, auto-refreshing. Point a browser at the server root.
         ("GET", "/") => {
-            let running = ctx.agent_busy.load(Ordering::Relaxed);
+            let running = ctx.active.lock().unwrap().is_some();
             let info = ctx.agent_info.lock().unwrap().clone();
             let log_name = info
                 .log
@@ -255,18 +257,22 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
         }
         ("GET", "/agent") => {
             let info = ctx.agent_info.lock().unwrap().clone();
+            let state = ctx.active.lock().unwrap().clone();
             let _ = request.respond(json_response(
                 200,
                 json!({
-                    "running": ctx.agent_busy.load(Ordering::Relaxed),
+                    "running": state.is_some(),
+                    "source": state.as_ref().map(|s| s.source.label()),
+                    "task": state.as_ref().map(|s| s.task.clone()),
+                    "turns": state.as_ref().map(|s| s.turns),
                     "iterations": info.iterations,
                     "log": info.log,
                 }),
             ));
         }
         ("POST", "/agent/stop") => {
-            let stopped = if let Some(s) = ctx.agent_stop.lock().unwrap().as_ref() {
-                s.store(true, Ordering::Relaxed);
+            let stopped = if let Some(s) = ctx.active.lock().unwrap().as_ref() {
+                s.stop.store(true, Ordering::Relaxed);
                 true
             } else {
                 false
@@ -340,10 +346,10 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 ));
                 return;
             }
-            if ctx.agent_busy.swap(true, Ordering::Relaxed) {
+            if let Some(summary) = crate::agent::run_summary(&ctx.active) {
                 let _ = request.respond(json_response(
                     409,
-                    json!({"error": {"message": "an agent run is already active"}}),
+                    json!({"error": {"message": format!("busy — {summary}")}}),
                 ));
                 return;
             }
@@ -359,7 +365,6 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 ) {
                     Some(run) => run,
                     None => {
-                        ctx.agent_busy.store(false, Ordering::Relaxed);
                         let _ = request.respond(json_response(
                             409,
                             json!({"error": {"message": "no saved run to resume"}}),
@@ -377,9 +382,14 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                     ctx.n_ctx,
                 )
             };
-            *ctx.agent_stop.lock().unwrap() = Some(run.stop.clone());
+            crate::agent::claim(
+                &ctx.active,
+                crate::agent::RunSource::Api,
+                task.unwrap_or("(resumed)"),
+                run.stop.clone(),
+            );
             *ctx.agent_info.lock().unwrap() = RunInfo::default();
-            let busy = ctx.agent_busy.clone();
+            let active = ctx.active.clone();
             let info = ctx.agent_info.clone();
             std::thread::spawn(move || {
                 // Drain events until the run thread ends, keeping RunInfo
@@ -395,11 +405,12 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                         }
                         crate::agent::AgentEvent::TurnDone => {
                             info.lock().unwrap().iterations += 1;
+                            crate::agent::note_turn(&active);
                         }
                         _ => {}
                     }
                 }
-                busy.store(false, Ordering::Relaxed);
+                crate::agent::release(&active);
             });
             let _ = request.respond(json_response(
                 200,
@@ -660,6 +671,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             16384,
             None,
+            crate::agent::active_run(),
         )
         .expect("server start");
 

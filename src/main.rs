@@ -144,6 +144,7 @@ fn smoke(agent_mode: bool) {
         loaded,
         llm::DEFAULT_N_CTX,
         None,
+        agent::active_run(),
     )
     .expect("server start");
     println!(

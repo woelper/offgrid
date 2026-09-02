@@ -147,6 +147,9 @@ pub struct OffgridApp {
     workspace_input: String,
     agent_task: String,
     agent_run: Option<AgentRun>,
+    /// Shared with the bridge and the API server: one agent run at a time,
+    /// visible to whoever asks.
+    active_run: agent::ActiveRun,
     agent_transcript: Vec<AgentItem>,
     agent_current: String,
     agent_auto_approve: bool,
@@ -224,6 +227,7 @@ impl OffgridApp {
             workspace_input,
             agent_task: String::new(),
             agent_run: None,
+            active_run: agent::active_run(),
             agent_transcript: Vec::new(),
             agent_current: String::new(),
             agent_auto_approve: false,
@@ -266,6 +270,7 @@ impl OffgridApp {
             self.loaded_model_shared.clone(),
             self.n_ctx(),
             self.config.workspace.clone(),
+            self.active_run.clone(),
         ) {
             Ok(s) => self.api_server = Some(s),
             Err(e) => {
@@ -290,6 +295,7 @@ impl OffgridApp {
     /// End the current agent run and note why in the transcript.
     fn agent_finished(&mut self, note: String) {
         self.agent_transcript.push(AgentItem::Info(note));
+        agent::release(&self.active_run);
         self.agent_run = None;
         self.agent_approval = None;
         self.llm.stop.store(false, Ordering::Relaxed);
@@ -362,6 +368,7 @@ impl OffgridApp {
                         self.agent_current.push_str(&t);
                     }
                     AgentEvent::TurnDone => {
+                        agent::note_turn(&self.active_run);
                         let text = std::mem::take(&mut self.agent_current);
                         if !text.trim().is_empty() {
                             self.agent_transcript.push(AgentItem::Assistant(text));
@@ -1301,14 +1308,21 @@ impl OffgridApp {
                     self.agent_current.clear();
                     self.live_tokens = 0;
                     self.live_start = None;
-                    self.agent_run = Some(agent::start(
+                    let run = agent::start(
                         ws,
-                        task,
+                        task.clone(),
                         self.llm.cmd_tx.clone(),
                         self.agent_auto_approve,
                         self.config.web_tools,
                         self.n_ctx(),
-                    ));
+                    );
+                    agent::claim(
+                        &self.active_run,
+                        agent::RunSource::Ui,
+                        &task,
+                        run.stop.clone(),
+                    );
+                    self.agent_run = Some(run);
                 }
                 // An interrupted run left its transcript behind: offer to
                 // pick it up instead of re-explaining the task.
@@ -1330,6 +1344,12 @@ impl OffgridApp {
                             self.n_ctx(),
                         )
                     {
+                        agent::claim(
+                            &self.active_run,
+                            agent::RunSource::Ui,
+                            &first,
+                            run.stop.clone(),
+                        );
                         self.agent_transcript
                             .push(AgentItem::Info(format!("resuming: {first}")));
                         self.agent_current.clear();
@@ -1519,6 +1539,7 @@ impl OffgridApp {
             self.config.workspace.clone(),
             self.config.web_tools,
             self.config.bridge_code,
+            self.active_run.clone(),
         ));
     }
 
