@@ -272,6 +272,26 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 }),
             ));
         }
+        ("POST", "/agent/say") => {
+            let mut body = String::new();
+            let _ = request.as_reader().read_to_string(&mut body);
+            let text = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["text"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if text.trim().is_empty() {
+                let _ = request.respond(json_response(
+                    400,
+                    json!({"error": {"message": "missing 'text'"}}),
+                ));
+                return;
+            }
+            let delivered = crate::agent::steer(&ctx.active, text.trim());
+            let _ = request.respond(json_response(
+                if delivered { 200 } else { 409 },
+                json!({"delivered": delivered}),
+            ));
+        }
         ("POST", "/agent/stop") => {
             let stopped = if let Some(s) = ctx.active.lock().unwrap().as_ref() {
                 s.stop.store(true, Ordering::Relaxed);
@@ -388,7 +408,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 &ctx.active,
                 crate::agent::RunSource::Api,
                 task.unwrap_or("(resumed)"),
-                run.stop.clone(),
+                &run,
             );
             *ctx.agent_info.lock().unwrap() = RunInfo::default();
             let active = ctx.active.clone();

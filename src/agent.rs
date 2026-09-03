@@ -95,7 +95,13 @@ pub struct AgentRun {
     /// Live-updatable: toggling auto-approve mid-run takes effect on the
     /// next command instead of only on the next run.
     pub auto_approve: Arc<AtomicBool>,
+    /// Instructions sent while the run is in flight; the loop drains them
+    /// into the transcript at the next turn boundary.
+    pub inbox: Inbox,
 }
+
+/// Mid-run instructions waiting to be handed to the model.
+pub type Inbox = Arc<Mutex<Vec<String>>>;
 
 /// Who started the active run. The UI, the Telegram bridge and the HTTP
 /// server all drive the same single-threaded LLM worker, so they need one
@@ -129,6 +135,8 @@ pub struct RunState {
     pub started: std::time::Instant,
     /// Abort flag of the live run, so any driver can stop it.
     pub stop: Arc<AtomicBool>,
+    /// Steering channel of the live run, so any driver can add to it.
+    pub inbox: Inbox,
     /// The most recent tool call, e.g. "run_command: cargo check".
     pub activity: String,
     /// Tail of what the model is writing right now — the only way a phone
@@ -144,7 +152,7 @@ pub fn active_run() -> ActiveRun {
 }
 
 /// Claim the single run slot. Returns false if a run is already active.
-pub fn claim(active: &ActiveRun, source: RunSource, task: &str, stop: Arc<AtomicBool>) -> bool {
+pub fn claim(active: &ActiveRun, source: RunSource, task: &str, run: &AgentRun) -> bool {
     let mut slot = active.lock().unwrap();
     if slot.is_some() {
         return false;
@@ -154,7 +162,8 @@ pub fn claim(active: &ActiveRun, source: RunSource, task: &str, stop: Arc<Atomic
         task: task.to_string(),
         turns: 0,
         started: std::time::Instant::now(),
-        stop,
+        stop: run.stop.clone(),
+        inbox: run.inbox.clone(),
         activity: String::new(),
         text: String::new(),
     });
@@ -177,6 +186,19 @@ pub fn note_activity(active: &ActiveRun, name: &str, summary: &str) {
     if let Some(state) = active.lock().unwrap().as_mut() {
         let summary: String = summary.chars().take(80).collect();
         state.activity = format!("{name}: {summary}");
+    }
+}
+
+/// Hand a new instruction to the running agent. False if nothing is
+/// running. The model sees it at the next turn boundary — mid-turn would
+/// mean interrupting generation, which costs the turn's work.
+pub fn steer(active: &ActiveRun, text: &str) -> bool {
+    match active.lock().unwrap().as_ref() {
+        Some(state) => {
+            state.inbox.lock().unwrap().push(text.to_string());
+            true
+        }
+        None => false,
     }
 }
 
@@ -298,6 +320,8 @@ fn spawn(
     let stop_thread = stop.clone();
     let auto = Arc::new(AtomicBool::new(auto_approve));
     let auto_thread = auto.clone();
+    let inbox: Inbox = Arc::new(Mutex::new(Vec::new()));
+    let inbox_thread = inbox.clone();
     std::thread::spawn(move || {
         if let Err(e) = run_loop(
             &workspace,
@@ -306,6 +330,7 @@ fn spawn(
             &tx,
             &stop_thread,
             &auto_thread,
+            &inbox_thread,
             web_tools,
             n_ctx,
         ) {
@@ -316,6 +341,7 @@ fn spawn(
         rx,
         stop,
         auto_approve: auto,
+        inbox,
     }
 }
 
@@ -327,6 +353,7 @@ fn run_loop(
     tx: &Sender<AgentEvent>,
     stop: &AtomicBool,
     auto_approve: &AtomicBool,
+    inbox: &Inbox,
     web_tools: bool,
     n_ctx: u32,
 ) -> Result<(), String> {
@@ -397,6 +424,19 @@ fn run_loop(
             break;
         }
         turns_taken = iteration;
+        // Instructions that arrived mid-run join the transcript here, where
+        // they read as the user speaking up between turns.
+        for note in inbox.lock().unwrap().drain(..) {
+            log.log("STEERING", &note);
+            let _ = tx.send(AgentEvent::Info(format!("new instruction: {note}")));
+            messages.push(ChatMessage {
+                role: Role::User,
+                content: format!(
+                    "New instruction from the user — this takes priority over the \
+                     original task if they conflict:\n{note}"
+                ),
+            });
+        }
 
         // Temperature escalation: at 0.25 a small model reproduces the same
         // wrong pattern almost deterministically. Once a command has failed
@@ -1826,16 +1866,27 @@ mod tests {
     /// driver can abort it.
     #[test]
     fn run_slot_is_shared_across_drivers() {
+        // A stand-in for a live run: the loop is not needed to test the slot.
+        fn fake_run() -> AgentRun {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            AgentRun {
+                rx,
+                stop: Arc::new(AtomicBool::new(false)),
+                auto_approve: Arc::new(AtomicBool::new(true)),
+                inbox: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
         let active = active_run();
         assert!(run_summary(&active).is_none());
 
         // The UI starts a run…
-        let stop = Arc::new(AtomicBool::new(false));
+        let ui_run = fake_run();
         assert!(claim(
             &active,
             RunSource::Ui,
             "fix the failing test",
-            stop.clone()
+            &ui_run
         ));
         note_turn(&active);
         note_turn(&active);
@@ -1863,9 +1914,15 @@ mod tests {
             &active,
             RunSource::Telegram,
             "something else",
-            Arc::new(AtomicBool::new(false))
+            &fake_run()
         ));
-        // …and Telegram's /stop aborts the UI's run.
+        // …Telegram can steer the UI's run…
+        assert!(steer(&active, "also update the README"));
+        assert_eq!(
+            ui_run.inbox.lock().unwrap().as_slice(),
+            ["also update the README"]
+        );
+        // …and Telegram's /stop aborts it.
         active
             .lock()
             .unwrap()
@@ -1873,16 +1930,68 @@ mod tests {
             .unwrap()
             .stop
             .store(true, Ordering::Relaxed);
-        assert!(stop.load(Ordering::Relaxed));
+        assert!(ui_run.stop.load(Ordering::Relaxed));
 
         release(&active);
         assert!(run_summary(&active).is_none());
-        assert!(claim(
-            &active,
-            RunSource::Telegram,
-            "now mine",
-            Arc::new(AtomicBool::new(false))
-        ));
+        assert!(!steer(&active, "nobody is listening"));
+        assert!(claim(&active, RunSource::Telegram, "now mine", &fake_run()));
+    }
+
+    /// An instruction sent while the agent is working reaches the model at
+    /// the next turn, marked as taking priority over the original task.
+    #[test]
+    fn steering_reaches_the_model_mid_run() {
+        let ws = std::env::temp_dir().join("offgrid-steer-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let saw_instruction = Arc::new(AtomicBool::new(false));
+        let saw = saw_instruction.clone();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<LlmCmd>();
+        std::thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let LlmCmd::Generate {
+                    messages, reply, ..
+                } = cmd
+                {
+                    if messages
+                        .iter()
+                        .any(|m| m.content.contains("also update the README"))
+                    {
+                        saw.store(true, Ordering::SeqCst);
+                    }
+                    // Keep working so the run stays alive to be steered.
+                    let _ = reply.send(LlmEvent::Token(
+                        "<tool_call>{\"name\": \"list_files\", \"arguments\": {}}</tool_call>"
+                            .into(),
+                    ));
+                    let _ = reply.send(LlmEvent::GenDone);
+                }
+            }
+        });
+
+        let run = start(ws.clone(), "list things".into(), cmd_tx, true, false, 4096);
+        let active = active_run();
+        assert!(claim(&active, RunSource::Ui, "list things", &run));
+
+        // Steer it the way Telegram would, then wait for the model to see it.
+        assert!(steer(&active, "also update the README"));
+        for _ in 0..60 {
+            if saw_instruction.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        run.stop.store(true, Ordering::Relaxed);
+        while run.rx.recv().is_ok() {}
+        release(&active);
+
+        assert!(
+            saw_instruction.load(Ordering::SeqCst),
+            "the steered instruction never reached the model"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// A stopped run leaves a resumable transcript; resuming continues it

@@ -225,6 +225,18 @@ fn strip_think(s: &str) -> String {
 /// Progress lines kept in the live-edited run message.
 const RUN_LINES: usize = 12;
 
+/// Last couple of lines of what the model is writing right now.
+fn live_tail(text: &str) -> String {
+    let clean = strip_think(text);
+    let skip = clean.chars().count().saturating_sub(220);
+    let tail: String = clean.chars().skip(skip).collect();
+    if tail.trim().is_empty() {
+        "…working".to_string()
+    } else {
+        format!("…{}", tail.trim())
+    }
+}
+
 /// Drive one agent run, reporting into a single message that is edited as
 /// the run proceeds (one notification, not one per tool call). Blocks until
 /// the run ends; callers put it on its own thread so polling continues.
@@ -260,16 +272,13 @@ fn run_agent(
     } else {
         crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx)
     };
-    crate::agent::claim(
-        active,
-        crate::agent::RunSource::Telegram,
-        task,
-        run.stop.clone(),
-    );
+    crate::agent::claim(active, crate::agent::RunSource::Telegram, task, &run);
 
     let mut lines: Vec<String> = Vec::new();
     let mut tokens = 0usize;
     let mut turn_buf = String::new();
+    // Telegram throttles edits; once every few seconds reads as live.
+    let mut last_edit = std::time::Instant::now();
     let mut last_turn = String::new();
     let mut error: Option<String> = None;
     let repaint = |lines: &[String], tail: &str| {
@@ -292,6 +301,10 @@ fn run_agent(
                 tokens += 1;
                 if tokens.is_multiple_of(16) {
                     crate::agent::note_text(active, &turn_buf);
+                    if last_edit.elapsed() > std::time::Duration::from_secs(3) {
+                        last_edit = std::time::Instant::now();
+                        repaint(&lines, &live_tail(&turn_buf));
+                    }
                 }
             }
             crate::agent::AgentEvent::TurnDone => {
@@ -306,6 +319,7 @@ fn run_agent(
                 if lines.len() > RUN_LINES {
                     lines.remove(0);
                 }
+                last_edit = std::time::Instant::now();
                 repaint(&lines, "…working");
             }
             crate::agent::AgentEvent::ToolResult { ok: false, .. } => {
@@ -313,6 +327,17 @@ fn run_agent(
                     last.push_str("  ✗");
                 }
                 repaint(&lines, "…working");
+            }
+            crate::agent::AgentEvent::Info(note) => {
+                if let Some(instruction) = note.strip_prefix("new instruction: ") {
+                    let instruction: String = instruction.chars().take(80).collect();
+                    lines.push(format!("↪ you: {instruction}"));
+                    if lines.len() > RUN_LINES {
+                        lines.remove(0);
+                    }
+                    last_edit = std::time::Instant::now();
+                    repaint(&lines, "…working");
+                }
             }
             crate::agent::AgentEvent::Error(e) => error = Some(e),
             crate::agent::AgentEvent::Done { iterations } => {
@@ -427,7 +452,9 @@ fn start_with_base(
                     "/start" | "/help" => {
                         let code_line = if code_enabled {
                             "/code <task> runs the coding agent in the workspace, \
-                             /stop aborts it, /resume continues an interrupted run.\n"
+                             /stop aborts it, /resume continues an interrupted run. \
+                             While it runs, anything you send is handed to it as a new \
+                             instruction.\n"
                         } else {
                             ""
                         };
@@ -559,12 +586,16 @@ fn start_with_base(
                     continue;
                 }
 
-                if active.lock().unwrap().is_some() {
+                // A message sent while the agent works is an instruction for
+                // it, not a chat turn — that is the whole point of watching a
+                // run from a phone.
+                if crate::agent::steer(&active, text) {
                     send_message(
                         &base,
                         &token,
                         msg.chat_id,
-                        "An agent run is active — /stop to abort, /status for progress.",
+                        "✔ passed to the agent — it will see this at the next turn. \
+                         /status for progress, /stop to abort.",
                     );
                     continue;
                 }

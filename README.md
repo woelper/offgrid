@@ -40,7 +40,7 @@ internet was there in the first place.
   `{"task": "...", "workspace": "...", "web_tools": true}`, always
   auto-approve), `GET /agent` (status), `POST /agent/stop`,
   `GET /agent/saved` + `POST /agent {"resume": true}` (continue an
-  interrupted run). Only enable it on
+  interrupted run), `POST /agent/say {"text": "..."}` (steer a running one). Only enable it on
   a network where you trust every device — remote runs execute shell
   commands.
   There is also an optional **Telegram bridge**: paste a bot token from
@@ -48,8 +48,10 @@ internet was there in the first place.
   so no port, public URL, or tunnel is needed. Every chat must be approved
   in the UI before the model answers it. A second, separate toggle allows
   `/code <task>`, which runs the coding agent in your workspace and reports
-  progress into one live-updated message (`/stop` aborts, `/status` reports,
-  `/resume` continues an interrupted run)
+  progress into one live-updated message — tool calls plus what the model is
+  writing right now. Anything you send while it works is handed to the agent
+  as a new instruction, so you can watch and steer from the couch (`/status`
+  reports, `/stop` aborts, `/resume` continues an interrupted run)
   — that is remote shell access with auto-approve, so treat it accordingly.
   This is the one feature that talks to someone else's computer — your
   prompts pass through Telegram, even though the model still runs on your

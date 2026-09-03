@@ -1304,6 +1304,21 @@ impl OffgridApp {
                     && self.loaded_model.is_some()
                     && self.workspace_path().is_some()
                     && !self.agent_task.trim().is_empty();
+                if running {
+                    // Mid-run the task box steers instead of starting: the
+                    // agent reads it at the next turn boundary.
+                    let can_send = !self.agent_task.trim().is_empty();
+                    let send = ui.add_enabled(can_send, egui::Button::new("↪ Send"));
+                    theme::gloss(ui, send.rect);
+                    if (send.clicked() || submit) && can_send {
+                        let note = self.agent_task.trim().to_string();
+                        if agent::steer(&self.active_run, &note) {
+                            self.agent_transcript
+                                .push(AgentItem::Info(format!("you: {note}")));
+                            self.agent_task.clear();
+                        }
+                    }
+                }
                 let run_resp = ui.add_enabled(ready, egui::Button::new("▶ Run"));
                 theme::gloss(ui, run_resp.rect);
                 if (run_resp.clicked() || submit) && ready {
@@ -1322,12 +1337,7 @@ impl OffgridApp {
                         self.config.web_tools,
                         self.n_ctx(),
                     );
-                    agent::claim(
-                        &self.active_run,
-                        agent::RunSource::Ui,
-                        &task,
-                        run.stop.clone(),
-                    );
+                    agent::claim(&self.active_run, agent::RunSource::Ui, &task, &run);
                     self.agent_run = Some(run);
                 }
                 // An interrupted run left its transcript behind: offer to
@@ -1350,12 +1360,7 @@ impl OffgridApp {
                             self.n_ctx(),
                         )
                     {
-                        agent::claim(
-                            &self.active_run,
-                            agent::RunSource::Ui,
-                            &first,
-                            run.stop.clone(),
-                        );
+                        agent::claim(&self.active_run, agent::RunSource::Ui, &first, &run);
                         self.agent_transcript
                             .push(AgentItem::Info(format!("resuming: {first}")));
                         self.agent_current.clear();
