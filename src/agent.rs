@@ -118,6 +118,9 @@ impl RunSource {
     }
 }
 
+/// How much of the model's live output is kept for remote viewers.
+const ACTIVITY_TAIL: usize = 400;
+
 #[derive(Clone)]
 pub struct RunState {
     pub source: RunSource,
@@ -126,6 +129,11 @@ pub struct RunState {
     pub started: std::time::Instant,
     /// Abort flag of the live run, so any driver can stop it.
     pub stop: Arc<AtomicBool>,
+    /// The most recent tool call, e.g. "run_command: cargo check".
+    pub activity: String,
+    /// Tail of what the model is writing right now — the only way a phone
+    /// can see more than a turn counter.
+    pub text: String,
 }
 
 /// The one active agent run, whoever started it. `None` means idle.
@@ -147,6 +155,8 @@ pub fn claim(active: &ActiveRun, source: RunSource, task: &str, stop: Arc<Atomic
         turns: 0,
         started: std::time::Instant::now(),
         stop,
+        activity: String::new(),
+        text: String::new(),
     });
     true
 }
@@ -158,6 +168,25 @@ pub fn release(active: &ActiveRun) {
 pub fn note_turn(active: &ActiveRun) {
     if let Some(state) = active.lock().unwrap().as_mut() {
         state.turns += 1;
+        state.text.clear();
+    }
+}
+
+/// Record the tool call now running.
+pub fn note_activity(active: &ActiveRun, name: &str, summary: &str) {
+    if let Some(state) = active.lock().unwrap().as_mut() {
+        let summary: String = summary.chars().take(80).collect();
+        state.activity = format!("{name}: {summary}");
+    }
+}
+
+/// Keep the tail of what the model is writing, for remote viewers.
+pub fn note_text(active: &ActiveRun, text: &str) {
+    if let Some(state) = active.lock().unwrap().as_mut() {
+        let text = strip_think_blocks(text);
+        let text = text.trim();
+        let skip = text.chars().count().saturating_sub(ACTIVITY_TAIL);
+        state.text = text.chars().skip(skip).collect();
     }
 }
 
@@ -166,11 +195,18 @@ pub fn run_summary(active: &ActiveRun) -> Option<String> {
     let state = active.lock().unwrap().clone()?;
     let mins = state.started.elapsed().as_secs() / 60;
     let task = state.task.lines().next().unwrap_or_default();
-    Some(format!(
+    let mut out = format!(
         "running (started from {}): {task} — turn {}, {mins} min",
         state.source.label(),
         state.turns
-    ))
+    );
+    if !state.activity.is_empty() {
+        out.push_str(&format!("\n▸ {}", state.activity));
+    }
+    if !state.text.is_empty() {
+        out.push_str(&format!("\n\n{}", state.text));
+    }
+    Some(out)
 }
 
 /// A run's full state between turns — the transcript is all that matters:
@@ -1809,6 +1845,18 @@ mod tests {
         assert!(summary.contains("started from the UI"), "{summary}");
         assert!(summary.contains("fix the failing test"), "{summary}");
         assert!(summary.contains("turn 2"), "{summary}");
+
+        // Live output: the current tool call and what the model is writing,
+        // with reasoning blocks stripped.
+        note_activity(&active, "run_command", "cargo check");
+        note_text(&active, "<think>hmm</think>Looking at the test now");
+        let summary = run_summary(&active).unwrap();
+        assert!(summary.contains("▸ run_command: cargo check"), "{summary}");
+        assert!(summary.contains("Looking at the test now"), "{summary}");
+        assert!(!summary.contains("hmm"), "think block leaked: {summary}");
+        // A new turn clears the previous turn's text.
+        note_turn(&active);
+        assert!(!run_summary(&active).unwrap().contains("Looking at"));
 
         // A second run is refused while it is active…
         assert!(!claim(

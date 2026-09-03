@@ -366,6 +366,11 @@ impl OffgridApp {
                     AgentEvent::Token(t) => {
                         self.note_token();
                         self.agent_current.push_str(&t);
+                        // Every few tokens is plenty for a remote viewer and
+                        // keeps the lock cheap.
+                        if self.live_tokens.is_multiple_of(16) {
+                            agent::note_text(&self.active_run, &self.agent_current);
+                        }
                     }
                     AgentEvent::TurnDone => {
                         agent::note_turn(&self.active_run);
@@ -377,6 +382,7 @@ impl OffgridApp {
                         self.live_start = None;
                     }
                     AgentEvent::ToolCall { name, summary } => {
+                        agent::note_activity(&self.active_run, &name, &summary);
                         self.agent_transcript.push(AgentItem::Tool {
                             name,
                             summary,

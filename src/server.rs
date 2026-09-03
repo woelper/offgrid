@@ -265,6 +265,8 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                     "source": state.as_ref().map(|s| s.source.label()),
                     "task": state.as_ref().map(|s| s.task.clone()),
                     "turns": state.as_ref().map(|s| s.turns),
+                    "activity": state.as_ref().map(|s| s.activity.clone()),
+                    "text": state.as_ref().map(|s| s.text.clone()),
                     "iterations": info.iterations,
                     "log": info.log,
                 }),
@@ -394,6 +396,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             std::thread::spawn(move || {
                 // Drain events until the run thread ends, keeping RunInfo
                 // current; the session log on disk is the full record.
+                let (mut tokens, mut turn_buf) = (0usize, String::new());
                 for event in run.rx {
                     match event {
                         crate::agent::AgentEvent::Info(text) => {
@@ -403,9 +406,20 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                                     .map(|n| n.to_string_lossy().to_string());
                             }
                         }
+                        crate::agent::AgentEvent::Token(t) => {
+                            tokens += 1;
+                            turn_buf.push_str(&t);
+                            if tokens.is_multiple_of(16) {
+                                crate::agent::note_text(&active, &turn_buf);
+                            }
+                        }
+                        crate::agent::AgentEvent::ToolCall { name, summary } => {
+                            crate::agent::note_activity(&active, &name, &summary);
+                        }
                         crate::agent::AgentEvent::TurnDone => {
                             info.lock().unwrap().iterations += 1;
                             crate::agent::note_turn(&active);
+                            turn_buf.clear();
                         }
                         _ => {}
                     }

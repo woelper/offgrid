@@ -268,6 +268,7 @@ fn run_agent(
     );
 
     let mut lines: Vec<String> = Vec::new();
+    let mut tokens = 0usize;
     let mut turn_buf = String::new();
     let mut last_turn = String::new();
     let mut error: Option<String> = None;
@@ -286,13 +287,20 @@ fn run_agent(
 
     for event in run.rx {
         match event {
-            crate::agent::AgentEvent::Token(t) => turn_buf.push_str(&t),
+            crate::agent::AgentEvent::Token(t) => {
+                turn_buf.push_str(&t);
+                tokens += 1;
+                if tokens.is_multiple_of(16) {
+                    crate::agent::note_text(active, &turn_buf);
+                }
+            }
             crate::agent::AgentEvent::TurnDone => {
                 crate::agent::note_turn(active);
                 last_turn = strip_think(&turn_buf);
                 turn_buf.clear();
             }
             crate::agent::AgentEvent::ToolCall { name, summary } => {
+                crate::agent::note_activity(active, &name, &summary);
                 let summary: String = summary.chars().take(80).collect();
                 lines.push(format!("• {name}: {summary}"));
                 if lines.len() > RUN_LINES {
