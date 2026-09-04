@@ -1162,7 +1162,7 @@ mod tests {
 
         for _ in 0..60 {
             let joined = sent.lock().unwrap().join("\n");
-            if joined.contains("Hi from chat.") && joined.contains("in /") {
+            if joined.contains("Hi from chat.") && joined.contains("offgrid-mode-test") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1172,8 +1172,10 @@ mod tests {
         let joined = sent.lock().unwrap().join("\n");
         // chat 7 switched mode and its bare message started a run…
         assert!(joined.contains("code mode"), "no mode switch: {joined}");
+        // The run header names the task and the workspace (whose path
+        // separator differs per platform — match on the directory name).
         assert!(
-            joined.contains("list the files") && joined.contains("in /"),
+            joined.contains("list the files") && joined.contains("offgrid-mode-test"),
             "bare message did not start a run: {joined}"
         );
         // …while chat 8, untouched, was answered as a normal chat.
