@@ -182,33 +182,6 @@ fn send_typing(base: &str, token: &str, chat_id: i64) {
     );
 }
 
-/// Ask the LLM worker for a reply, blocking until the turn is done.
-fn generate(
-    cmd_tx: &Sender<LlmCmd>,
-    messages: Vec<ChatMessage>,
-    n_ctx: u32,
-) -> Result<String, String> {
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    cmd_tx
-        .send(LlmCmd::Generate {
-            messages,
-            reply: reply_tx,
-            temp: 0.7,
-            n_ctx,
-        })
-        .map_err(|_| "LLM worker unavailable".to_string())?;
-    let mut text = String::new();
-    for event in reply_rx {
-        match event {
-            LlmEvent::Token(t) => text.push_str(&t),
-            LlmEvent::Error(e) => return Err(e),
-            LlmEvent::GenDone => break,
-            _ => {}
-        }
-    }
-    Ok(text)
-}
-
 /// Reasoning models emit `<think>` blocks; they are noise in a phone chat.
 fn strip_think(s: &str) -> String {
     let mut out = s.to_string();
@@ -220,6 +193,148 @@ fn strip_think(s: &str) -> String {
         out.replace_range(start..end, "");
     }
     out.trim().to_string()
+}
+
+/// What a chat's plain messages mean. Telegram has one input box, so the
+/// mode decides whether typing talks to the model or drives the agent —
+/// per chat, so a phone can chat while a laptop runs code.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum Mode {
+    #[default]
+    Chat,
+    Code,
+}
+
+impl Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Mode::Chat => "chat",
+            Mode::Code => "code",
+        }
+    }
+}
+
+/// Conversations, shared with the chat worker thread.
+type Histories = Arc<Mutex<std::collections::HashMap<i64, Vec<ChatMessage>>>>;
+/// Messages waiting to be answered: the LLM worker takes one at a time.
+type ChatQueue = Arc<Mutex<std::collections::VecDeque<(i64, String)>>>;
+
+/// Buttons along the bottom of the chat, so the mode is always one tap away
+/// (Telegram has no status bar to show which mode you are in).
+fn keyboard() -> serde_json::Value {
+    json!({
+        "keyboard": [["/chat", "/code"], ["/status", "/stop"]],
+        "resize_keyboard": true,
+        "is_persistent": true
+    })
+}
+
+fn send_with_keyboard(base: &str, token: &str, chat_id: i64, text: &str) {
+    post_json(
+        base,
+        token,
+        "sendMessage",
+        json!({"chat_id": chat_id, "text": text, "reply_markup": keyboard()}),
+    );
+}
+
+/// Answer one queued chat message, streaming the reply into a single
+/// message that is edited as tokens arrive — a slow local model otherwise
+/// means a minute of silence.
+fn answer_chat(
+    base: &str,
+    token: &str,
+    chat_id: i64,
+    histories: &Histories,
+    cmd_tx: &Sender<LlmCmd>,
+    n_ctx: u32,
+) {
+    let messages = histories
+        .lock()
+        .unwrap()
+        .get(&chat_id)
+        .cloned()
+        .unwrap_or_default();
+    let msg_id = send_message_id(base, token, chat_id, "…");
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    if cmd_tx
+        .send(LlmCmd::Generate {
+            messages,
+            reply: reply_tx,
+            temp: 0.7,
+            n_ctx,
+        })
+        .is_err()
+    {
+        send_message(base, token, chat_id, "Error: LLM worker unavailable");
+        return;
+    }
+
+    let mut text = String::new();
+    let mut error = None;
+    let mut last_edit = std::time::Instant::now();
+    for event in reply_rx {
+        match event {
+            LlmEvent::Token(t) => {
+                text.push_str(&t);
+                if last_edit.elapsed() > std::time::Duration::from_secs(3) {
+                    last_edit = std::time::Instant::now();
+                    let partial = strip_think(&text);
+                    if let (Some(id), false) = (msg_id, partial.is_empty()) {
+                        let shown: String = partial.chars().take(MAX_MSG).collect();
+                        edit_message(base, token, chat_id, id, &format!("{shown} ▍"));
+                    }
+                }
+            }
+            LlmEvent::Error(e) => error = Some(e),
+            LlmEvent::GenDone => break,
+            _ => {}
+        }
+    }
+
+    match error {
+        Some(e) => {
+            // Drop the unanswered turn so the next try is clean.
+            histories.lock().unwrap().entry(chat_id).or_default().pop();
+            match msg_id {
+                Some(id) => edit_message(base, token, chat_id, id, &format!("Error: {e}")),
+                None => send_message(base, token, chat_id, &format!("Error: {e}")),
+            }
+        }
+        None => {
+            let clean = strip_think(&text);
+            let clean = if clean.is_empty() {
+                "(no answer)".to_string()
+            } else {
+                clean
+            };
+            {
+                // One lock, one scope: nesting a second lock inside an
+                // `if let` on the first is a deadlock waiting to happen.
+                let mut map = histories.lock().unwrap();
+                let h = map.entry(chat_id).or_default();
+                h.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: text.clone(),
+                });
+                if h.len() > MAX_HISTORY {
+                    let drop_n = h.len() - MAX_HISTORY;
+                    h.drain(..drop_n);
+                }
+            }
+            // The first chunk lands in the streamed message; any overflow
+            // follows as ordinary messages.
+            let mut chunks = split_message(&clean).into_iter();
+            match (msg_id, chunks.next()) {
+                (Some(id), Some(first)) => edit_message(base, token, chat_id, id, &first),
+                (None, Some(first)) => send_message(base, token, chat_id, &first),
+                _ => {}
+            }
+            for rest in chunks {
+                send_message(base, token, chat_id, &rest);
+            }
+        }
+    }
 }
 
 /// Progress lines kept in the live-edited run message.
@@ -366,6 +481,7 @@ pub fn start(
     web_tools: bool,
     code_enabled: bool,
     active: crate::agent::ActiveRun,
+    llm_stop: Arc<AtomicBool>,
 ) -> Bridge {
     start_with_base(
         TELEGRAM.to_string(),
@@ -378,6 +494,7 @@ pub fn start(
         web_tools,
         code_enabled,
         active,
+        llm_stop,
     )
 }
 
@@ -395,16 +512,45 @@ fn start_with_base(
     web_tools: bool,
     code_enabled: bool,
     active: crate::agent::ActiveRun,
+    llm_stop: Arc<AtomicBool>,
 ) -> Bridge {
     let stop = Arc::new(AtomicBool::new(false));
     let pending: Arc<Mutex<Vec<(i64, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new("connecting…".to_string()));
     let (stop_t, pending_t, status_t) = (stop.clone(), pending.clone(), status.clone());
 
+    // Histories are per chat so two people don't share a conversation.
+    let histories: Histories = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let queue: ChatQueue = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+    // Chat answers run here, not in the poll loop: a slow model would
+    // otherwise block polling, so /status and /stop would go unanswered
+    // exactly when they matter. One at a time, because the LLM worker is.
+    {
+        let (base_w, token_w) = (base.clone(), token.clone());
+        let (hist_w, queue_w, cmd_w, stop_w) = (
+            histories.clone(),
+            queue.clone(),
+            cmd_tx.clone(),
+            stop.clone(),
+        );
+        let llm_stop_w = llm_stop.clone();
+        std::thread::spawn(move || {
+            while !stop_w.load(Ordering::Relaxed) {
+                let next = queue_w.lock().unwrap().pop_front();
+                match next {
+                    Some((chat_id, _text)) => {
+                        llm_stop_w.store(false, Ordering::Relaxed);
+                        answer_chat(&base_w, &token_w, chat_id, &hist_w, &cmd_w, n_ctx);
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(200)),
+                }
+            }
+        });
+    }
+
     std::thread::spawn(move || {
-        // Histories are per chat so two people don't share a conversation.
-        let mut histories: std::collections::HashMap<i64, Vec<ChatMessage>> =
-            std::collections::HashMap::new();
+        let mut modes: std::collections::HashMap<i64, Mode> = std::collections::HashMap::new();
         let mut offset: i64 = 0;
         let mut backoff = 1u64;
 
@@ -448,36 +594,63 @@ fn start_with_base(
                     continue;
                 }
                 let text = msg.text.trim();
+                let mode = *modes.entry(msg.chat_id).or_default();
                 match text {
+                    "/chat" => {
+                        modes.insert(msg.chat_id, Mode::Chat);
+                        send_with_keyboard(
+                            &base,
+                            &token,
+                            msg.chat_id,
+                            "chat mode — what you type goes to the model.",
+                        );
+                        continue;
+                    }
+                    "/code" if code_enabled => {
+                        modes.insert(msg.chat_id, Mode::Code);
+                        send_with_keyboard(
+                            &base,
+                            &token,
+                            msg.chat_id,
+                            "code mode — what you type becomes an agent task, or a new \
+                             instruction while one is running.",
+                        );
+                        continue;
+                    }
                     "/start" | "/help" => {
                         let code_line = if code_enabled {
-                            "/code <task> runs the coding agent in the workspace, \
-                             /stop aborts it, /resume continues an interrupted run. \
-                             While it runs, anything you send is handed to it as a new \
-                             instruction.\n"
+                            "/code switches to code mode: what you type becomes an agent \
+                             task, and anything sent while it runs is handed to it as a \
+                             new instruction. /stop aborts, /resume continues an \
+                             interrupted run.\n"
                         } else {
                             ""
                         };
-                        send_message(
+                        send_with_keyboard(
                             &base,
                             &token,
                             msg.chat_id,
                             &format!(
-                                "offgrid bridge. Send a message to chat with the loaded \
-                                 model.\n{code_line}/new starts a fresh conversation, \
-                                 /status shows what is going on."
+                                "offgrid bridge — now in {} mode.\n/chat talks to the \
+                                 loaded model.\n{code_line}/new starts a fresh \
+                                 conversation, /status shows what is going on.",
+                                mode.label()
                             ),
                         );
                         continue;
                     }
                     "/new" => {
-                        histories.remove(&msg.chat_id);
+                        histories.lock().unwrap().remove(&msg.chat_id);
                         send_message(&base, &token, msg.chat_id, "Started a new conversation.");
                         continue;
                     }
                     "/status" => {
                         let model = loaded_model.lock().unwrap().clone();
-                        let turns = histories.get(&msg.chat_id).map_or(0, Vec::len);
+                        let turns = histories
+                            .lock()
+                            .unwrap()
+                            .get(&msg.chat_id)
+                            .map_or(0, Vec::len);
                         let running = match crate::agent::run_summary(&active) {
                             Some(s) => format!("\n{s}\n/stop aborts it"),
                             None => String::new(),
@@ -487,9 +660,11 @@ fn start_with_base(
                             &token,
                             msg.chat_id,
                             &match model {
-                                Some(m) => {
-                                    format!("model: {m}\nturns in this chat: {turns}{running}")
-                                }
+                                Some(m) => format!(
+                                    "{} mode\nmodel: {m}\nturns in this chat: \
+                                     {turns}{running}",
+                                    mode.label()
+                                ),
                                 None => "No model loaded.".to_string(),
                             },
                         );
@@ -609,39 +784,52 @@ fn start_with_base(
                     continue;
                 }
 
-                let history = histories.entry(msg.chat_id).or_default();
-                history.push(ChatMessage {
-                    role: Role::User,
-                    content: text.to_string(),
-                });
-                if history.len() > MAX_HISTORY {
-                    let drop_n = history.len() - MAX_HISTORY;
-                    history.drain(..drop_n);
-                }
-                send_typing(&base, &token, msg.chat_id);
-                match generate(&cmd_tx, history.clone(), n_ctx) {
-                    Ok(reply) => {
-                        let clean = strip_think(&reply);
-                        history.push(ChatMessage {
-                            role: Role::Assistant,
-                            content: reply,
-                        });
+                // In code mode a plain message starts a run; in chat mode it
+                // joins the queue for the chat worker.
+                if mode == Mode::Code && code_enabled {
+                    let Some(ws) = workspace.clone().filter(|w| w.is_dir()) else {
                         send_message(
                             &base,
                             &token,
                             msg.chat_id,
-                            if clean.is_empty() {
-                                "(no answer)"
-                            } else {
-                                &clean
-                            },
+                            "No workspace is set — pick one in the Code tab.",
                         );
-                    }
-                    Err(e) => {
-                        // Drop the unanswered turn so the next try is clean.
-                        history.pop();
-                        send_message(&base, &token, msg.chat_id, &format!("Error: {e}"));
-                    }
+                        continue;
+                    };
+                    let (base_t, token_t, task_t) = (base.clone(), token.clone(), text.to_string());
+                    let (cmd_t, active_t) = (cmd_tx.clone(), active.clone());
+                    let chat_id = msg.chat_id;
+                    std::thread::spawn(move || {
+                        run_agent(
+                            &base_t, &token_t, chat_id, &task_t, ws, cmd_t, web_tools, n_ctx,
+                            &active_t, false,
+                        );
+                    });
+                    continue;
+                }
+
+                histories
+                    .lock()
+                    .unwrap()
+                    .entry(msg.chat_id)
+                    .or_default()
+                    .push(ChatMessage {
+                        role: Role::User,
+                        content: text.to_string(),
+                    });
+                let queued = {
+                    let mut q = queue.lock().unwrap();
+                    q.push_back((msg.chat_id, text.to_string()));
+                    q.len()
+                };
+                send_typing(&base, &token, msg.chat_id);
+                if queued > 1 {
+                    send_message(
+                        &base,
+                        &token,
+                        msg.chat_id,
+                        &format!("queued — {queued} messages waiting."),
+                    );
                 }
             }
         }
@@ -750,6 +938,7 @@ mod tests {
             false,
             false,
             crate::agent::active_run(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         // Wait for both replies to land (or give up after ~5s).
@@ -851,6 +1040,7 @@ mod tests {
                 false,
                 code_enabled,
                 crate::agent::active_run(),
+                Arc::new(AtomicBool::new(false)),
             );
 
             let want = if code_enabled {
@@ -886,6 +1076,112 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&ws);
         }
+    }
+
+    /// /code and /chat are sticky per chat: after switching, plain messages
+    /// start agent runs instead of chat turns, and switching back restores
+    /// chatting. Each chat keeps its own mode.
+    #[test]
+    fn mode_is_sticky_and_per_chat() {
+        let ws = std::env::temp_dir().join("offgrid-mode-test");
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let sent: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sent_srv = sent.clone();
+        std::thread::spawn(move || {
+            let mut polls = 0;
+            for mut req in server.incoming_requests() {
+                let url = req.url().to_string();
+                if url.contains("getUpdates") {
+                    polls += 1;
+                    // chat 7 switches to code mode then sends a bare task;
+                    // chat 8 stays in chat mode and just talks.
+                    let body = match polls {
+                        1 => {
+                            r#"{"ok":true,"result":[
+                            {"update_id":1,"message":{"chat":{"id":7},
+                             "from":{"username":"owner"},"text":"/code"}}]}"#
+                        }
+                        2 => {
+                            r#"{"ok":true,"result":[
+                            {"update_id":2,"message":{"chat":{"id":7},
+                             "from":{"username":"owner"},"text":"list the files"}},
+                            {"update_id":3,"message":{"chat":{"id":8},
+                             "from":{"username":"other"},"text":"hello there"}}]}"#
+                        }
+                        _ => r#"{"ok":true,"result":[]}"#,
+                    };
+                    let _ = req.respond(tiny_http::Response::from_string(body));
+                } else {
+                    let mut body = String::new();
+                    let _ = req.as_reader().read_to_string(&mut body);
+                    sent_srv.lock().unwrap().push(format!("{url} {body}"));
+                    let _ = req.respond(tiny_http::Response::from_string(
+                        r#"{"ok":true,"result":{"message_id":5}}"#,
+                    ));
+                }
+            }
+        });
+
+        // The model: one tool call for the agent, prose for chat.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<LlmCmd>();
+        std::thread::spawn(move || {
+            for cmd in cmd_rx {
+                if let LlmCmd::Generate {
+                    messages, reply, ..
+                } = cmd
+                {
+                    let agentic = messages.iter().any(|m| m.content.contains("coding agent"));
+                    let text = if agentic {
+                        "Listed them.".to_string()
+                    } else {
+                        "Hi from chat.".to_string()
+                    };
+                    let _ = reply.send(LlmEvent::Token(text));
+                    let _ = reply.send(LlmEvent::GenDone);
+                }
+            }
+        });
+
+        let bridge = start_with_base(
+            format!("http://127.0.0.1:{port}"),
+            "test-token".into(),
+            vec![7, 8],
+            cmd_tx,
+            Arc::new(Mutex::new(Some("test-model".into()))),
+            4096,
+            Some(ws.clone()),
+            false,
+            true,
+            crate::agent::active_run(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        for _ in 0..60 {
+            let joined = sent.lock().unwrap().join("\n");
+            if joined.contains("Hi from chat.") && joined.contains("in /") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        bridge.stop();
+
+        let joined = sent.lock().unwrap().join("\n");
+        // chat 7 switched mode and its bare message started a run…
+        assert!(joined.contains("code mode"), "no mode switch: {joined}");
+        assert!(
+            joined.contains("list the files") && joined.contains("in /"),
+            "bare message did not start a run: {joined}"
+        );
+        // …while chat 8, untouched, was answered as a normal chat.
+        assert!(
+            joined.contains("Hi from chat."),
+            "chat 8 not answered: {joined}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

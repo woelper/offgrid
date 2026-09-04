@@ -1551,6 +1551,7 @@ impl OffgridApp {
             self.config.web_tools,
             self.config.bridge_code,
             self.active_run.clone(),
+            self.llm.stop.clone(),
         ));
     }
 
