@@ -12,9 +12,10 @@ use crate::bridge;
 use crate::config::{Config, models_dir};
 use crate::hardware::{self, HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
-use crate::llm::{self, ChatMessage, LlmCmd, LlmEvent, LlmHandle, Role};
+use crate::llm::{self, LlmCmd, LlmEvent, LlmHandle, Role};
 use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
+use crate::session;
 use crate::theme;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -135,7 +136,10 @@ pub struct OffgridApp {
     lan_ip: Option<String>,
 
     // Chat
-    messages: Vec<ChatMessage>,
+    /// Shared with the bridge (and future frontends) so a chat started
+    /// here can be continued from a phone.
+    chat: session::Conversation,
+    chat_busy: session::ChatBusy,
     input: String,
     generating: bool,
     md_cache: CommonMarkCache,
@@ -217,7 +221,8 @@ impl OffgridApp {
             api_server: None,
             bridge: None,
             lan_ip: None,
-            messages: Vec::new(),
+            chat: session::conversation(),
+            chat_busy: session::ChatBusy::new(),
             input: String::new(),
             generating: false,
             md_cache: CommonMarkCache::default(),
@@ -432,11 +437,7 @@ impl OffgridApp {
                 }
                 Ok(LlmEvent::Token(text)) => {
                     self.note_token();
-                    if let Some(last) = self.messages.last_mut()
-                        && last.role == Role::Assistant
-                    {
-                        last.content.push_str(&text);
-                    }
+                    session::append_assistant(&self.chat, &text);
                 }
                 Ok(LlmEvent::Stats {
                     prompt_tokens,
@@ -455,11 +456,16 @@ impl OffgridApp {
                 }
                 Ok(LlmEvent::GenDone) => {
                     self.generating = false;
+                    self.chat_busy.release();
                     self.llm.stop.store(false, Ordering::Relaxed);
                 }
                 Ok(LlmEvent::Error(e)) => {
                     self.model_loading = false;
-                    self.generating = false;
+                    if self.generating {
+                        self.generating = false;
+                        self.chat_busy.release();
+                        session::pop_unanswered(&self.chat);
+                    }
                     self.last_error = Some(if e.starts_with("context window full") {
                         format!("{e} — press Clear (next to Send) to start a new conversation")
                     } else {
@@ -499,21 +505,20 @@ impl OffgridApp {
         if text.is_empty() || self.generating || self.loaded_model.is_none() {
             return;
         }
+        // The bridge may be answering the same conversation right now.
+        if !self.chat_busy.claim() {
+            self.last_error = Some("The model is answering another message — one moment.".into());
+            return;
+        }
         self.input.clear();
-        self.messages.push(ChatMessage {
-            role: Role::User,
-            content: text,
-        });
+        session::push_user(&self.chat, &text);
         let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
-            messages: self.messages.clone(),
+            messages: session::snapshot(&self.chat),
             reply: self.llm.event_tx.clone(),
             temp: 0.7,
             n_ctx: self.n_ctx(),
         });
-        self.messages.push(ChatMessage {
-            role: Role::Assistant,
-            content: String::new(),
-        });
+        session::push_assistant(&self.chat);
         self.generating = true;
         self.live_tokens = 0;
         self.live_start = None;
@@ -1120,7 +1125,7 @@ impl OffgridApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.generating
-                            && !self.messages.is_empty()
+                            && session::turns(&self.chat) > 0
                             && theme::button(
                                 ui,
                                 Some((theme::icons().trash.clone(), 14.0)),
@@ -1129,7 +1134,7 @@ impl OffgridApp {
                             .on_hover_text("Start a fresh conversation")
                             .clicked()
                         {
-                            self.messages.clear();
+                            session::clear(&self.chat);
                             self.chat_culler.clear();
                             self.chat_ctx_used = 0;
                         }
@@ -1166,9 +1171,12 @@ impl OffgridApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut culler = std::mem::take(&mut self.chat_culler);
-                    culler.begin(ui, self.messages.len());
-                    let len = self.messages.len();
-                    for (i, msg) in self.messages.iter().enumerate() {
+                    // Cloned once per frame: the bridge may append to this
+                    // conversation from its own thread while we draw.
+                    let messages = session::snapshot(&self.chat);
+                    culler.begin(ui, messages.len());
+                    let len = messages.len();
+                    for (i, msg) in messages.iter().enumerate() {
                         // The last messages may still stream — always render.
                         let hot = i + 2 >= len;
                         culler.row(ui, i, hot, |ui| {
@@ -1552,6 +1560,8 @@ impl OffgridApp {
             self.config.bridge_code,
             self.active_run.clone(),
             self.llm.stop.clone(),
+            self.chat.clone(),
+            self.chat_busy.clone(),
         ));
     }
 

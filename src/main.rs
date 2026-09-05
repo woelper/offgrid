@@ -7,6 +7,7 @@ mod hub;
 mod llm;
 mod models;
 mod server;
+mod session;
 mod theme;
 
 fn main() -> eframe::Result {

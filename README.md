@@ -46,9 +46,11 @@ internet was there in the first place.
   There is also an optional **Telegram bridge**: paste a bot token from
   @BotFather and chat with the loaded model from your phone. It long-polls,
   so no port, public URL, or tunnel is needed. Every chat must be approved
-  in the UI before the model answers it. `/chat` and `/code` switch modes per
-  chat: in chat mode your messages go to the model, streamed into one message
-  that updates as it writes; in code mode they become agent tasks, reported
+  in the UI before the model answers it. It is the **same conversation** as
+  the Chat tab, so you can start something at the keyboard and continue it on
+  the phone with the model still knowing what was said. `/chat` and `/code`
+  switch modes per chat: in chat mode your messages go to the model, streamed
+  into one message that updates as it writes; in code mode they become agent tasks, reported
   into one live-updated message of tool calls and current output. Anything
   you send while the agent works is handed to it as a new instruction, so you
   can watch and steer from the couch (`/status` reports, `/stop` aborts,
