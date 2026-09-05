@@ -186,7 +186,7 @@ type ChatQueue = Arc<Mutex<std::collections::VecDeque<i64>>>;
 /// (Telegram has no status bar to show which mode you are in).
 fn keyboard() -> serde_json::Value {
     json!({
-        "keyboard": [["/chat", "/code"], ["/status", "/stop"]],
+        "keyboard": [["/chat", "/code"], ["/last", "/status", "/stop"]],
         "resize_keyboard": true,
         "is_persistent": true
     })
@@ -652,6 +652,9 @@ fn start_with_base(
                     Command::New => {
                         session::clear(&conv);
                         send_message(&base, &token, msg.chat_id, "Started a new conversation.");
+                    }
+                    Command::Last => {
+                        send_message(&base, &token, msg.chat_id, &session::recent(&conv, 6, 600));
                     }
                     Command::Status => {
                         let model = loaded_model.lock().unwrap().clone();

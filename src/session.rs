@@ -75,6 +75,9 @@ pub enum Command {
     /// Hand an instruction to the run already in flight.
     Steer(String),
     SwitchMode(Mode),
+    /// Show the recent turns — how a phone catches up on a conversation
+    /// that was happening at the keyboard.
+    Last,
     Resume,
     Status,
     Stop,
@@ -103,6 +106,7 @@ pub fn parse(text: &str, mode: Mode, run_active: bool, code_enabled: bool) -> Co
         "/status" => Command::Status,
         "/stop" => Command::Stop,
         "/new" | "/clear" => Command::New,
+        "/last" | "/history" => Command::Last,
         "/resume" if code_enabled => Command::Resume,
         "/resume" => Command::CodeDisabled,
         "/chat" if rest.is_empty() => Command::SwitchMode(Mode::Chat),
@@ -135,8 +139,9 @@ pub fn help(mode: Mode, code_enabled: bool) -> String {
     };
     format!(
         "offgrid — now in {} mode.\n/chat — talk to the loaded model.\n\
-         {code_line}/new starts a fresh conversation, /status shows what is \
-         going on.",
+         {code_line}/last shows the recent turns (the same conversation as \
+         the desktop Chat tab), /new starts a fresh one, /status shows what \
+         is going on.",
         mode.label()
     )
 }
@@ -202,6 +207,41 @@ fn trim(c: &mut Vec<ChatMessage>) {
     }
 }
 
+/// The last few turns as plain text, so a phone can catch up on a
+/// conversation that was happening at the keyboard. Long turns are cut:
+/// this is a recap, not a transcript.
+pub fn recent(conv: &Conversation, turns: usize, per_turn: usize) -> String {
+    let all = conv.lock().unwrap();
+    if all.is_empty() {
+        return "This conversation is empty.".to_string();
+    }
+    let start = all.len().saturating_sub(turns);
+    let mut out = Vec::new();
+    if start > 0 {
+        out.push(format!("(…{} earlier turns)", start));
+    }
+    for m in &all[start..] {
+        let who = match m.role {
+            Role::User => "you",
+            Role::Assistant => "model",
+            Role::System => "system",
+        };
+        let body = strip_think(&m.content);
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let shown: String = body.chars().take(per_turn).collect();
+        let ellipsis = if body.chars().count() > per_turn {
+            "…"
+        } else {
+            ""
+        };
+        out.push(format!("{who}: {shown}{ellipsis}"));
+    }
+    out.join("\n\n")
+}
+
 /// Reasoning models emit `<think>` blocks; they are noise outside the
 /// desktop UI, which renders them as a quote block.
 pub fn strip_think(s: &str) -> String {
@@ -249,6 +289,7 @@ mod tests {
         assert_eq!(parse("/STATUS", chat, false, true), Command::Status);
         assert_eq!(parse("/stop@offgridbot", chat, true, true), Command::Stop);
         assert_eq!(parse("/clear", chat, false, true), Command::New);
+        assert_eq!(parse("/last", chat, false, true), Command::Last);
         assert_eq!(parse("   ", chat, false, true), Command::Empty);
         // With code mode off, code commands are refused, not chatted.
         assert_eq!(parse("/code x", chat, false, false), Command::CodeDisabled);
@@ -284,6 +325,27 @@ mod tests {
 
         clear(&conv);
         assert_eq!(turns(&conv), 0);
+    }
+
+    #[test]
+    fn recent_turns_read_as_a_recap() {
+        let conv = conversation();
+        assert!(recent(&conv, 6, 200).contains("empty"));
+
+        push_user(&conv, "what is the capital of Peru?");
+        push_assistant(&conv);
+        append_assistant(&conv, "<think>geography</think>Lima.");
+        let recap = recent(&conv, 6, 200);
+        assert!(recap.contains("you: what is the capital of Peru?"));
+        assert!(recap.contains("model: Lima."));
+        assert!(!recap.contains("geography"), "think block leaked: {recap}");
+
+        // Long turns are cut, and older ones are summarised as a count.
+        push_user(&conv, &"x".repeat(500));
+        let recap = recent(&conv, 1, 20);
+        assert!(recap.contains("(…2 earlier turns)"), "{recap}");
+        assert!(recap.contains('…'));
+        assert!(recap.chars().count() < 120, "not truncated: {recap}");
     }
 
     #[test]
