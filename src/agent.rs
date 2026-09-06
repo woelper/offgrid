@@ -112,6 +112,7 @@ pub enum RunSource {
     Ui,
     Telegram,
     Api,
+    Tui,
 }
 
 impl RunSource {
@@ -120,6 +121,7 @@ impl RunSource {
             RunSource::Ui => "the UI",
             RunSource::Telegram => "Telegram",
             RunSource::Api => "the API",
+            RunSource::Tui => "the terminal",
         }
     }
 }

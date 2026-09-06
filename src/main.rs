@@ -9,6 +9,7 @@ mod models;
 mod server;
 mod session;
 mod theme;
+mod tui;
 
 fn main() -> eframe::Result {
     // Headless check of the core plumbing (download → load → generate → serve).
@@ -17,6 +18,18 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     // Same, but exercises the coding-agent loop instead of serving.
+    // Headless: no display, or asked for explicitly.
+    let headless = cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    if std::env::args().any(|a| a == "--tui") || headless {
+        if let Err(e) = tui::run() {
+            eprintln!("tui: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     if std::env::args().any(|a| a == "--smoke-agent") {
         smoke(true);
         return Ok(());

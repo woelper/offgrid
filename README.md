@@ -66,6 +66,21 @@ internet was there in the first place.
 Models live in `~/.local/share/offgrid/models/`, config in
 `~/.config/offgrid/`. Delete those two folders and it is like we never met.
 
+## Headless / terminal mode
+
+```sh
+offgrid --tui
+```
+
+A small terminal UI with the same tabs as the desktop app — Models, Chat,
+Code, Serve — drawn with crossterm and nothing else. Tab switches tabs,
+Enter sends, Esc stops generation, Ctrl-C quits; `/workspace <path>`,
+`/serve on|off|lan`, and the same `/chat`, `/code`, `/status`, `/stop`,
+`/last`, `/resume` vocabulary as the Telegram bridge, because both
+frontends share one session core. It starts automatically on Linux when
+there is no display, so an SSH session gets a usable app instead of a
+winit error.
+
 ## Portability
 
 The release binary is self-contained: statically linked inference, embedded

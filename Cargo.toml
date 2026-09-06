@@ -13,6 +13,7 @@ category = "Developer Tool"
 short_description = "Fully local LLM prepper tool"
 
 [dependencies]
+crossterm = "0.29.0"
 directories = "6.0.0"
 eframe = "0.35.0"
 egui_commonmark = "0.24.0"
