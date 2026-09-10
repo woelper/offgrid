@@ -458,6 +458,25 @@ fn run_loop(
             });
         }
 
+        // Full write_file turns are the model's best examples of its own
+        // calls, and every elided one is a template it may copy instead of
+        // writing code (a real run did so on every third write). So keep
+        // them verbatim as long as the window allows, and only when the
+        // transcript passes three quarters of it elide the oldest, down to
+        // KEEP_FULL_WRITES. Roughly three characters per token for code.
+        let mut elided = 0;
+        while intact_writes.len() > KEEP_FULL_WRITES
+            && messages.iter().map(|m| m.content.len() / 3 + 8).sum::<usize>()
+                > n_ctx as usize * 3 / 4
+        {
+            let idx = intact_writes.remove(0);
+            elide_write(&mut messages[idx]);
+            elided += 1;
+        }
+        if elided > 0 {
+            log.log("ELISION", &format!("{elided} older write_file turns elided to fit the window"));
+        }
+
         // Temperature escalation: at 0.25 a small model reproduces the same
         // wrong pattern almost deterministically. Once a command has failed
         // three times in a row, add sampling variety to break the loop.
@@ -822,18 +841,12 @@ fn run_loop(
                 }
             }
         }
-        // A successful write_file leaves a full copy of the file in the
-        // assistant's turn — the biggest context hog. Older ones get their
-        // content elided, but the newest few stay verbatim: once every
-        // write in context was a stub, a real run produced fifteen
-        // imitations of the stub instead of calls (see elide_write).
+        // Remember where the full write_file turns are; they are elided
+        // lazily, before a generation, only once the transcript nears the
+        // window (see the top of the loop).
         if ok && call.name == "write_file" && messages.last().is_some_and(|m| m.role == Role::Assistant)
         {
             intact_writes.push(messages.len() - 1);
-            while intact_writes.len() > KEEP_FULL_WRITES {
-                let idx = intact_writes.remove(0);
-                elide_write(&mut messages[idx]);
-            }
         }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
