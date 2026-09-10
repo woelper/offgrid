@@ -416,6 +416,11 @@ fn run_loop(
     // run burned 34 turns re-trying eframe API variants while the compiler
     // printed the exact fix three times).
     let mut cmd_fails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // The exact same tool call failing again and again (a real run sent
+    // one placeholder write nine times in a row): first break the template
+    // it is copying, then give up.
+    let mut same_fail: Option<(String, String)> = None;
+    let mut same_fail_count = 0usize;
     // Indices of web_search/fetch_url responses in `messages` — compaction
     // trims these last (expensive to re-acquire). Messages are only ever
     // edited in place, never removed, so indices stay valid.
@@ -712,6 +717,51 @@ fn run_loop(
         {
             files_touched.push(path.to_string());
         }
+        if ok {
+            same_fail = None;
+            same_fail_count = 0;
+        } else {
+            let key = (call.name.clone(), call.arguments.to_string());
+            if same_fail.as_ref() == Some(&key) {
+                same_fail_count += 1;
+            } else {
+                same_fail = Some(key);
+                same_fail_count = 1;
+            }
+            if same_fail_count >= SAME_FAIL_GIVE_UP {
+                let reason = format!(
+                    "the same failing {} call was repeated {same_fail_count} times",
+                    call.name
+                );
+                log.log("GIVING UP", &reason);
+                abort_reason = Some(reason);
+                break;
+            }
+            if same_fail_count >= 3
+                && call.name == "write_file"
+                && call.arg("content").is_some_and(looks_like_placeholder)
+                && let Some(path) = call.arg("path")
+            {
+                // Remove every elided write of this path from the
+                // transcript: as long as one is in context, the model
+                // copies it instead of writing code.
+                let dropped = purge_elided_writes(&mut messages, path);
+                if dropped > 0 {
+                    web_msgs.clear();
+                    intact_writes.clear();
+                }
+                log.log(
+                    "PLACEHOLDER LOOP",
+                    &format!("{same_fail_count}× placeholder write of {path}; dropped {dropped} elided turns"),
+                );
+                output.push_str(&format!(
+                    "\n\n[guidance: you have sent this same failing call {same_fail_count} times. \
+                     The content is a transcript placeholder, not source code, and every \
+                     earlier write of {path} has now been removed from this transcript. \
+                     Write the COMPLETE file from scratch now, as real code.]"
+                ));
+            }
+        }
         // Freshness/verification bookkeeping for the write gate and the
         // unverified-finish guard.
         if ok {
@@ -842,6 +892,37 @@ fn dangling_tool_tag(response: &str) -> bool {
 
 /// How many of the most recent write_file turns keep their full content.
 const KEEP_FULL_WRITES: usize = 2;
+
+/// Consecutive identical failing tool calls before the run gives up.
+const SAME_FAIL_GIVE_UP: usize = 6;
+
+/// Remove assistant turns whose (elided) write_file call targets `path`,
+/// together with the tool response that followed each. Returns how many
+/// turns were dropped. Indices into `messages` held elsewhere are stale
+/// afterwards.
+fn purge_elided_writes(messages: &mut Vec<ChatMessage>, path: &str) -> usize {
+    let mut dropped = 0;
+    let mut i = 2; // never the system prompt or the task
+    while i < messages.len() {
+        let is_target = messages[i].role == Role::Assistant
+            && messages[i].content.contains(ELIDED_CONTENT)
+            && parse_tool_call(&messages[i].content)
+                .is_some_and(|c| c.name == "write_file" && c.arg("path") == Some(path));
+        if !is_target {
+            i += 1;
+            continue;
+        }
+        messages.remove(i);
+        if i < messages.len()
+            && messages[i].role == Role::User
+            && messages[i].content.starts_with("<tool_response>")
+        {
+            messages.remove(i);
+        }
+        dropped += 1;
+    }
+    dropped
+}
 
 /// Marker that replaces elided write_file content in the transcript.
 const ELIDED_CONTENT: &str = "elided from transcript";
@@ -1549,9 +1630,19 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
         "write_file" => resolve(workspace, call.arg("path").unwrap_or("")).and_then(|path| {
             let content = call.arg("content").unwrap_or("");
             if looks_like_placeholder(content) {
+                // Serve what is on disk: the model usually imitates the
+                // placeholder because the content it wants to edit was
+                // elided from its context.
+                let current = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.is_file() && m.len() <= MAX_FILE_READ)
+                    .and_then(|_| std::fs::read_to_string(&path).ok())
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(" The file currently contains:\n---\n{c}\n---"))
+                    .unwrap_or_default();
                 return Err(format!(
                     "content looks like a placeholder ({content:?}), not real file \
-                     content — send the actual file content"
+                     content.{current} Resend write_file with the COMPLETE file content."
                 ));
             }
             if let Some(parent) = path.parent() {
@@ -2528,6 +2619,44 @@ mod tests {
         let mut plain = ChatMessage { role: Role::Assistant, content: "Done.".into() };
         elide_write(&mut plain);
         assert_eq!(plain.content, "Done.");
+    }
+
+    /// Once the model copies an elided write instead of writing code, the
+    /// template has to go: purge drops exactly the elided turns for that
+    /// path (and their tool responses), leaving everything else.
+    #[test]
+    fn purge_drops_only_elided_writes_of_the_path() {
+        let msg = |role, content: &str| ChatMessage {
+            role,
+            content: content.into(),
+        };
+        let mut w = msg(
+            Role::Assistant,
+            "Writing it.\n<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.rs\", \"content\": \"fn a() {}\"}}</tool_call>",
+        );
+        elide_write(&mut w);
+        let mut other = msg(
+            Role::Assistant,
+            "Writing b.\n<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"b.rs\", \"content\": \"fn b() {}\"}}</tool_call>",
+        );
+        elide_write(&mut other);
+        let mut messages = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            w.clone(),
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            other,
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            w,
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            msg(Role::Assistant, "Now checking.\n<tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"cargo check\"}}</tool_call>"),
+        ];
+        assert_eq!(purge_elided_writes(&mut messages, "a.rs"), 2);
+        assert_eq!(messages.len(), 5);
+        assert!(messages[2].content.contains("b.rs"));
+        assert!(messages[4].content.contains("cargo check"));
+        // A second purge finds nothing.
+        assert_eq!(purge_elided_writes(&mut messages, "a.rs"), 0);
     }
 
     /// A run saved under the old stub shape resumes with valid calls.
