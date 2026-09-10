@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +50,9 @@ struct Ctx {
     cmd_tx: Sender<LlmCmd>,
     models_dir: PathBuf,
     loaded_model: Arc<Mutex<Option<String>>>,
-    n_ctx: u32,
+    /// Shared with the UI: a Settings change applies to the next request
+    /// instead of waiting for a server restart.
+    n_ctx: Arc<AtomicU32>,
     workspace: Option<PathBuf>,
     /// Shared with the UI and the Telegram bridge: one run at a time,
     /// whoever started it.
@@ -65,7 +67,7 @@ pub fn start(
     cmd_tx: Sender<LlmCmd>,
     models_dir: PathBuf,
     loaded_model: Arc<Mutex<Option<String>>>,
-    n_ctx: u32,
+    n_ctx: Arc<AtomicU32>,
     workspace: Option<PathBuf>,
     active: crate::agent::ActiveRun,
 ) -> Result<ApiServer, String> {
@@ -161,7 +163,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
     let cmd_tx = ctx.cmd_tx.clone();
     let models_dir = ctx.models_dir.clone();
     let loaded_model = ctx.loaded_model.clone();
-    let n_ctx = ctx.n_ctx;
+    let n_ctx = ctx.n_ctx.load(Ordering::Relaxed);
 
     match (method.as_str(), url.as_str()) {
         // Human-readable live view: status plus the tail of the current
@@ -391,7 +393,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                     ctx.cmd_tx.clone(),
                     true,
                     web_tools,
-                    ctx.n_ctx,
+                    n_ctx,
                 ) {
                     Some(run) => run,
                     None => {
@@ -409,7 +411,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                     ctx.cmd_tx.clone(),
                     true,
                     web_tools,
-                    ctx.n_ctx,
+                    n_ctx,
                 )
             };
             crate::agent::claim(
@@ -742,7 +744,7 @@ mod tests {
             cmd_tx,
             std::env::temp_dir(),
             Arc::new(Mutex::new(None)),
-            16384,
+            Arc::new(AtomicU32::new(16384)),
             None,
             crate::agent::active_run(),
         )

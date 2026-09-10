@@ -906,7 +906,9 @@ impl Tui {
                     self.llm.cmd_tx.clone(),
                     models_dir(),
                     self.loaded_shared.clone(),
-                    self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX),
+                    Arc::new(std::sync::atomic::AtomicU32::new(
+                        self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX),
+                    )),
                     self.config.workspace.clone(),
                     self.active.clone(),
                 ) {

@@ -281,7 +281,7 @@ fn smoke(agent_mode: bool) {
         handle.cmd_tx.clone(),
         dir,
         loaded,
-        llm::DEFAULT_N_CTX,
+        Arc::new(std::sync::atomic::AtomicU32::new(llm::DEFAULT_N_CTX)),
         None,
         agent::active_run(),
     )
