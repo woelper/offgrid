@@ -492,10 +492,19 @@ fn run_loop(
         if let Some(e) = gen_error {
             // On context overflow, compact progressively harder and retry
             // instead of aborting the run.
-            if e.starts_with("context window full") && compact_level < 2 {
-                compact_level += 1;
+            // Levels 1–2 trim; level 3 drops the middle of the transcript
+            // and can repeat as long as there is a middle left to drop, so
+            // a long session keeps going instead of dying at the window.
+            let can_compact = compact_level < 3 || messages.len() > 2 + COMPACT_KEEP_RECENT;
+            if e.starts_with("context window full") && can_compact {
+                compact_level = (compact_level + 1).min(3);
                 log.log("COMPACTION", &format!("level {}", compact_level));
-                compact_transcript(&mut messages, compact_level, &web_msgs);
+                compact_transcript(&mut messages, compact_level, &web_msgs, &files_touched);
+                if compact_level >= 3 {
+                    // Messages were removed: the index sets are stale.
+                    web_msgs.clear();
+                    intact_writes.clear();
+                }
                 let _ = tx.send(AgentEvent::Info(format!(
                     "context window full — compacting transcript (level {compact_level}) and retrying"
                 )));
@@ -978,7 +987,10 @@ fn write_gate(
     }
     // Unreadable or oversized files can never be served (read_file caps at
     // the same limit), so gating them would block writes forever — waive.
+    // An empty file (models love `touch` before writing) has nothing to
+    // regress: gating it cost a real run eleven turns for nothing.
     let current = match std::fs::metadata(&path).map(|m| m.len()) {
+        Ok(0) => return None,
         Ok(len) if len <= MAX_FILE_READ => std::fs::read_to_string(&path).ok()?,
         _ => return None,
     };
@@ -1012,11 +1024,36 @@ fn tool_output_ok(output: &str) -> bool {
 /// level 1, kept three times longer at level 2 (a compaction once erased
 /// freshly fetched docs facts, and the model promptly regressed to the wrong
 /// API it had just unlearned).
+/// Messages kept verbatim at the end of the transcript by a level-3 compaction.
+const COMPACT_KEEP_RECENT: usize = 6;
+
 fn compact_transcript(
-    messages: &mut [ChatMessage],
+    messages: &mut Vec<ChatMessage>,
     level: usize,
     web_msgs: &std::collections::HashSet<usize>,
+    files_touched: &[String],
 ) {
+    if level >= 3 && messages.len() > 2 + COMPACT_KEEP_RECENT {
+        let removed = messages.len() - 2 - COMPACT_KEEP_RECENT;
+        let files = if files_touched.is_empty() {
+            "none yet".to_string()
+        } else {
+            files_touched.join(", ")
+        };
+        messages.drain(2..2 + removed);
+        messages.insert(
+            2,
+            ChatMessage {
+                role: Role::User,
+                content: format!(
+                    "[transcript compacted: {removed} earlier messages were removed to fit \
+                     the context window. Files written so far: {files}. The workspace is \
+                     on disk — use list_files and read_file to re-orient, then continue \
+                     the task.]"
+                ),
+            },
+        );
+    }
     let len = messages.len();
     let keep_from = if level >= 2 {
         len.saturating_sub(1)
@@ -2665,15 +2702,45 @@ mod tests {
             },
         ];
         let no_web = std::collections::HashSet::new();
-        compact_transcript(&mut messages, 1, &no_web);
+        compact_transcript(&mut messages, 1, &no_web, &[]);
         // index 0/1 (system + task) are never touched; index 2+ within range is
         assert!(messages[2].content == "a" || messages[2].content.len() <= 400);
         assert_eq!(messages[3].content, long); // within the keep window at level 1
-        compact_transcript(&mut messages, 2, &no_web);
+        compact_transcript(&mut messages, 2, &no_web, &[]);
         assert!(messages[3].content.contains("[older tool output trimmed]"));
         assert!(messages[3].content.len() < 500);
         assert_eq!(messages[0].content, "sys"); // system prompt untouched
         assert_eq!(messages[5].content, "task"); // last message untouched
+    }
+
+    /// Level 3 drops the middle of the transcript: system prompt, task and
+    /// the newest turns survive, with one note in between so the model knows
+    /// what it built. A real 97-turn run died at the window with levels 1–2
+    /// only trimming messages, never removing any.
+    #[test]
+    fn level_three_compaction_drops_the_middle() {
+        let msg = |role, content: &str| ChatMessage {
+            role,
+            content: content.into(),
+        };
+        let mut messages = vec![msg(Role::System, "sys"), msg(Role::User, "task")];
+        for i in 0..20 {
+            messages.push(msg(Role::Assistant, &format!("turn {i}")));
+            messages.push(msg(Role::User, &format!("<tool_response>r{i}</tool_response>")));
+        }
+        let no_web = std::collections::HashSet::new();
+        let files = vec!["src/main.rs".to_string(), "Cargo.toml".to_string()];
+        compact_transcript(&mut messages, 3, &no_web, &files);
+        assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);
+        assert_eq!(messages[0].content, "sys");
+        assert_eq!(messages[1].content, "task");
+        assert!(messages[2].content.starts_with("[transcript compacted: 34 earlier messages"));
+        assert!(messages[2].content.contains("src/main.rs, Cargo.toml"));
+        assert_eq!(messages[3].content, "turn 17");
+        assert_eq!(messages.last().unwrap().content, "<tool_response>r19</tool_response>");
+        // Nothing left to drop: a second pass is a no-op on the shape.
+        compact_transcript(&mut messages, 3, &no_web, &files);
+        assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);
     }
 
     #[test]
@@ -2694,10 +2761,10 @@ mod tests {
             msg(Role::Assistant, "d"),
         ];
         let web: std::collections::HashSet<usize> = [3].into();
-        compact_transcript(&mut messages, 1, &web);
+        compact_transcript(&mut messages, 1, &web, &[]);
         assert!(messages[2].content.contains("[older tool output trimmed]"));
         assert_eq!(messages[3].content, long); // web result spared at level 1
-        compact_transcript(&mut messages, 2, &web);
+        compact_transcript(&mut messages, 2, &web, &[]);
         assert!(messages[3].content.contains("[older tool output trimmed]"));
         // …and keeps ~3x more than an ordinary result at level 2.
         assert!(messages[3].content.len() > messages[2].content.len() + 500);
