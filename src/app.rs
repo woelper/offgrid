@@ -127,6 +127,8 @@ pub struct OffgridApp {
     loaded_model: Option<String>,
     // Same value, shared with the API server thread.
     loaded_model_shared: Arc<Mutex<Option<String>>>,
+    /// Live copy of the context size for the API server.
+    n_ctx_shared: Arc<std::sync::atomic::AtomicU32>,
     model_loading: bool,
 
     // API server for external tools (opencode etc.)
@@ -209,6 +211,9 @@ impl OffgridApp {
         }
 
         let loaded_model_shared = Arc::new(Mutex::new(None));
+        let n_ctx_shared = Arc::new(std::sync::atomic::AtomicU32::new(
+            config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX),
+        ));
         let workspace_input = config
             .workspace
             .as_ref()
@@ -235,6 +240,7 @@ impl OffgridApp {
             llm,
             loaded_model: None,
             loaded_model_shared,
+            n_ctx_shared,
             model_loading,
             api_server: None,
             bridge: None,
@@ -293,7 +299,7 @@ impl OffgridApp {
             self.llm.cmd_tx.clone(),
             self.models_dir.clone(),
             self.loaded_model_shared.clone(),
-            self.n_ctx(),
+            self.n_ctx_shared.clone(),
             self.config.workspace.clone(),
             self.active_run.clone(),
         ) {
@@ -636,6 +642,7 @@ impl OffgridApp {
                 if n_ctx != self.n_ctx() {
                     self.config.n_ctx = Some(n_ctx);
                     self.config.save();
+                    self.n_ctx_shared.store(n_ctx, Ordering::Relaxed);
                 }
             });
             ui.weak(
@@ -803,7 +810,13 @@ impl OffgridApp {
                 for (i, model) in locals.iter().enumerate() {
                     let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
                     let can_load = !loaded && !self.model_loading;
-                    let badge = Fit::of(model.size, self.hardware.total_ram, self.n_ctx()).badge();
+                    let badge = Fit::of_model(
+                        model.size,
+                        model.kv_per_token,
+                        self.hardware.total_ram,
+                        self.n_ctx(),
+                    )
+                    .badge();
                     let mut clicked_load = false;
                     let mut clicked_delete = false;
                     list_row(

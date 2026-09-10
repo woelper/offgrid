@@ -49,7 +49,8 @@ internet was there in the first place.
   mode binds 0.0.0.0 and adds remote-control endpoints: `GET /logs` +
   `GET /logs/latest` (agent session logs), `POST /agent` (start a run:
   `{"task": "...", "workspace": "...", "web_tools": true}`, always
-  auto-approve), `GET /agent` (status), `POST /agent/stop`,
+  auto-approve), `GET /agent` (status, including a `note` with the last nudge or
+  compaction and an `outcome` once the run ended), `POST /agent/stop`,
   `GET /agent/saved` + `POST /agent {"resume": true}` (continue an
   interrupted run), `POST /agent/say {"text": "..."}` (steer a running one). Only enable it on
   a network where you trust every device — remote runs execute shell

@@ -13,9 +13,132 @@ use eframe::egui;
 /// called it merely "tight". The factors below put that case just over the
 /// "too big" line, while a short context or a small model stays comfortable.
 fn overhead(model_size: u64, n_ctx: u32) -> u64 {
-    const BASE: u64 = 1024 * 1024 * 1024; // ~1 GB compute/activation buffers
     let kv = (model_size / 12) * (n_ctx as u64) / 4096;
-    BASE + kv
+    BASE_OVERHEAD + kv
+}
+
+/// Compute/activation buffers beyond weights and KV cache, ~1 GB.
+const BASE_OVERHEAD: u64 = 1024 * 1024 * 1024;
+
+/// KV-cache bytes per token, read from the GGUF header: K and V, one f16
+/// each, for every KV head of every layer. This is what actually decides
+/// whether a long context fits — a 30B mixture-of-experts with 4 KV heads
+/// needs ~100 KB/token, a dense model of the same file size several times
+/// that — so the size-based guess in `overhead` is only the fallback.
+pub fn kv_bytes_per_token(path: &Path) -> Option<u64> {
+    use std::io::Read as _;
+    let mut r = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut buf = [0u8; 8];
+    macro_rules! read {
+        (u32) => {{
+            r.read_exact(&mut buf[..4]).ok()?;
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+        }};
+        (u64) => {{
+            r.read_exact(&mut buf).ok()?;
+            u64::from_le_bytes(buf)
+        }};
+    }
+    if read!(u32) != 0x4655_4747 {
+        return None; // not "GGUF"
+    }
+    let version = read!(u32);
+    if !(2..=3).contains(&version) {
+        return None;
+    }
+    let _tensors = read!(u64);
+    let kv_count = read!(u64);
+    // Scalar value sizes by GGUF type id; strings and arrays are variable.
+    fn scalar_len(t: u32) -> Option<u64> {
+        Some(match t {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            10..=12 => 8,
+            _ => return None,
+        })
+    }
+    let read_string = |r: &mut std::io::BufReader<std::fs::File>| -> Option<String> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b).ok()?;
+        let len = u64::from_le_bytes(b);
+        if len > 1 << 20 {
+            return None;
+        }
+        let mut v = vec![0u8; len as usize];
+        r.read_exact(&mut v).ok()?;
+        Some(String::from_utf8_lossy(&v).into_owned())
+    };
+    let mut arch = String::new();
+    let (mut layers, mut kv_heads, mut kv_heads_sum, mut key_len, mut val_len, mut embd, mut heads) =
+        (None, None, None, None, None, None, None);
+    for _ in 0..kv_count {
+        let key = read_string(&mut r)?;
+        let t = read!(u32);
+        // Metadata that matters comes first; the tokenizer arrays after it
+        // are megabytes we need not walk.
+        if key.starts_with("tokenizer.") && layers.is_some() && kv_heads.or(kv_heads_sum).is_some() {
+            break;
+        }
+        let want = !arch.is_empty() && key.starts_with(arch.as_str());
+        match t {
+            8 => {
+                let v = read_string(&mut r)?;
+                if key == "general.architecture" {
+                    arch = format!("{v}.");
+                }
+            }
+            9 => {
+                let et = read!(u32);
+                let n = read!(u64);
+                if et == 8 {
+                    for _ in 0..n {
+                        read_string(&mut r)?;
+                    }
+                } else if et == 9 {
+                    return None; // nested arrays: give up, use the fallback
+                } else {
+                    let elen = scalar_len(et)?;
+                    let mut sum = 0u64;
+                    // Per-layer KV head counts (some hybrid models).
+                    let per_layer = want && key.ends_with(".attention.head_count_kv");
+                    for _ in 0..n {
+                        let mut v = [0u8; 8];
+                        r.read_exact(&mut v[..elen as usize]).ok()?;
+                        if per_layer {
+                            sum += u64::from_le_bytes(v);
+                        }
+                    }
+                    if per_layer {
+                        kv_heads_sum = Some(sum);
+                    }
+                }
+            }
+            _ => {
+                let len = scalar_len(t)?;
+                let mut v = [0u8; 8];
+                r.read_exact(&mut v[..len as usize]).ok()?;
+                let n = u64::from_le_bytes(v);
+                if want {
+                    let sub = &key[arch.len()..];
+                    match sub {
+                        "block_count" => layers = Some(n),
+                        "attention.head_count_kv" => kv_heads = Some(n),
+                        "attention.head_count" => heads = Some(n),
+                        "attention.key_length" => key_len = Some(n),
+                        "attention.value_length" => val_len = Some(n),
+                        "embedding_length" => embd = Some(n),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let layers = layers?;
+    let head_dim = key_len.or_else(|| Some(embd? / heads?))?;
+    let v_dim = val_len.unwrap_or(head_dim);
+    let kv_layers = kv_heads_sum.unwrap_or(kv_heads? * layers);
+    Some(kv_layers * (head_dim + v_dim) * 2)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -30,7 +153,18 @@ impl Fit {
     /// context on a machine with `total_ram` bytes. `n_ctx` matters: the same
     /// model can fit at a short context and thrash swap at a long one.
     pub fn of(model_size: u64, total_ram: u64, n_ctx: u32) -> Self {
-        let needed = model_size + overhead(model_size, n_ctx);
+        Self::of_model(model_size, None, total_ram, n_ctx)
+    }
+
+    /// Like `of`, but with the KV cost per token read from the file's own
+    /// header when available (see `kv_bytes_per_token`) — the size-based
+    /// guess called a 17 GB mixture-of-experts "too big" at 32k on a 32 GB
+    /// box when it really needs ~22 GB.
+    pub fn of_model(model_size: u64, kv_per_token: Option<u64>, total_ram: u64, n_ctx: u32) -> Self {
+        let needed = match kv_per_token {
+            Some(kv) => model_size + BASE_OVERHEAD + kv * n_ctx as u64,
+            None => model_size + overhead(model_size, n_ctx),
+        };
         if needed <= total_ram * 7 / 10 {
             Fit::Fits
         } else if needed <= total_ram * 9 / 10 {
@@ -262,7 +396,7 @@ pub fn catalog() -> Vec<CatalogEntry> {
 /// "Killed"), which on the last-model auto-load turns into a crash loop.
 pub fn safe_to_load(path: &Path, total_ram: u64, n_ctx: u32) -> bool {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    size > 0 && Fit::of(size, total_ram, n_ctx) != Fit::TooBig
+    size > 0 && Fit::of_model(size, kv_bytes_per_token(path), total_ram, n_ctx) != Fit::TooBig
 }
 
 /// The best chat and coding models this machine can comfortably run. Each is
@@ -292,6 +426,8 @@ pub struct LocalModel {
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
+    /// KV-cache bytes per token from the GGUF header, if it could be read.
+    pub kv_per_token: Option<u64>,
 }
 
 /// Fraction of the model's weights read per token. Dense models read
@@ -355,7 +491,13 @@ pub fn scan_local(dir: &Path) -> Vec<LocalModel> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                models.push(LocalModel { name, path, size });
+                let kv_per_token = kv_bytes_per_token(&path);
+                models.push(LocalModel {
+                    name,
+                    path,
+                    size,
+                    kv_per_token,
+                });
             }
         }
     }
@@ -427,6 +569,37 @@ mod tests {
         // A small model is unaffected by context at this scale.
         let small = 4 * 1024 * 1024 * 1024;
         assert_eq!(Fit::of(small, ram, 16384), Fit::Fits);
+        // With the header's real KV cost, a 17.3 GB MoE with 96 KB/token
+        // (Qwen3-Coder-30B-A3B) is fine at 32k on 32 GB: ~21.4 GB needed.
+        let moe = 17_300 * 1024 * 1024;
+        let ram32 = 32 * 1024 * 1024 * 1024;
+        assert_eq!(Fit::of(moe, ram32, 32768), Fit::TooBig); // the old guess
+        assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 32768), Fit::Fits);
+        assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 65_536), Fit::Tight);
+        assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 131_072), Fit::TooBig);
+    }
+
+    /// Reads the real header of a local model when one is on disk (the
+    /// developer's box), and is a no-op elsewhere.
+    #[test]
+    fn kv_per_token_from_gguf_header() {
+        let dir = crate::config::models_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.extension().is_some_and(|x| x == "gguf") {
+                continue;
+            }
+            let kv = kv_bytes_per_token(&p).expect("header parses");
+            // Any real LLM: between 1 KB (tiny) and 2 MB (huge dense) per token.
+            assert!((1024..=2 << 20).contains(&kv), "{}: {kv}", p.display());
+            if p.to_string_lossy().contains("Qwen3-Coder-30B-A3B") {
+                // 48 layers × 4 KV heads × 128 dims × (K+V) × f16
+                assert_eq!(kv, 48 * 4 * 128 * 2 * 2);
+            }
+        }
     }
 
     #[test]

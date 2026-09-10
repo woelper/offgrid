@@ -13,7 +13,9 @@ use crate::llm::{ChatMessage, LlmCmd, LlmEvent, Role};
 // Generous: with the write gate, a single fix cycle legitimately costs
 // three turns (gated write -> write -> check); 25 proved too tight in
 // practice.
-const MAX_ITERATIONS: usize = 40;
+// Generous on purpose: a plan-sized task on a small local model needs many
+// turns, and runaway loops are caught by the cycling/format checks below.
+const MAX_ITERATIONS: usize = 200;
 const MAX_FILE_READ: u64 = 50 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
@@ -382,12 +384,13 @@ fn run_loop(
             (task, messages, 0)
         }
         None => {
-            let saved = saved_run(workspace).ok_or("no saved run to resume")?;
+            let mut saved = saved_run(workspace).ok_or("no saved run to resume")?;
             let _ = tx.send(AgentEvent::Info(format!(
                 "resuming after {} turns: {}",
                 saved.turns,
                 saved.task.lines().next().unwrap_or_default()
             )));
+            upgrade_legacy_stubs(&mut saved.messages);
             (saved.task, saved.messages, saved.turns)
         }
     };
@@ -413,12 +416,27 @@ fn run_loop(
     // run burned 34 turns re-trying eframe API variants while the compiler
     // printed the exact fix three times).
     let mut cmd_fails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // The exact same tool call failing again and again (a real run sent
+    // one placeholder write nine times in a row): first break the template
+    // it is copying, then give up.
+    let mut same_fail: Option<(String, String)> = None;
+    let mut same_fail_count = 0usize;
     // Indices of web_search/fetch_url responses in `messages` — compaction
     // trims these last (expensive to re-acquire). Messages are only ever
     // edited in place, never removed, so indices stay valid.
     let mut web_msgs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Indices of assistant turns whose write_file call is still verbatim.
+    // The newest KEEP_FULL_WRITES stay intact so the model always sees real
+    // examples of its own calls; older ones get elided (see elide_write).
+    let mut intact_writes: Vec<usize> = Vec::new();
 
+    // Consecutive replies with a broken or narrated tool call. Reset by
+    // every parsable call, so an occasional slip does not eat a run-wide
+    // budget and silently end the session twenty turns later.
     let mut format_retries = 0usize;
+    let mut proceed_nudged = false;
+    // Why the loop ended early, for the history entry and the frontends.
+    let mut abort_reason: Option<String> = None;
     let mut compact_level = 0usize;
     let mut turns_taken = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
@@ -438,6 +456,25 @@ fn run_loop(
                      original task if they conflict:\n{note}"
                 ),
             });
+        }
+
+        // Full write_file turns are the model's best examples of its own
+        // calls, and every elided one is a template it may copy instead of
+        // writing code (a real run did so on every third write). So keep
+        // them verbatim as long as the window allows, and only when the
+        // transcript passes three quarters of it elide the oldest, down to
+        // KEEP_FULL_WRITES. Roughly three characters per token for code.
+        let mut elided = 0;
+        while intact_writes.len() > KEEP_FULL_WRITES
+            && messages.iter().map(|m| m.content.len() / 3 + 8).sum::<usize>()
+                > n_ctx as usize * 3 / 4
+        {
+            let idx = intact_writes.remove(0);
+            elide_write(&mut messages[idx]);
+            elided += 1;
+        }
+        if elided > 0 {
+            log.log("ELISION", &format!("{elided} older write_file turns elided to fit the window"));
         }
 
         // Temperature escalation: at 0.25 a small model reproduces the same
@@ -479,22 +516,33 @@ fn run_loop(
         if let Some(e) = gen_error {
             // On context overflow, compact progressively harder and retry
             // instead of aborting the run.
-            if e.starts_with("context window full") && compact_level < 2 {
-                compact_level += 1;
+            // Levels 1–2 trim; level 3 drops the middle of the transcript
+            // and can repeat as long as there is a middle left to drop, so
+            // a long session keeps going instead of dying at the window.
+            let can_compact = compact_level < 3 || messages.len() > 2 + COMPACT_KEEP_RECENT;
+            if e.starts_with("context window full") && can_compact {
+                compact_level = (compact_level + 1).min(3);
                 log.log("COMPACTION", &format!("level {}", compact_level));
-                compact_transcript(&mut messages, compact_level, &web_msgs);
+                compact_transcript(&mut messages, compact_level, &web_msgs, &files_touched);
+                if compact_level >= 3 {
+                    // Messages were removed: the index sets are stale.
+                    web_msgs.clear();
+                    intact_writes.clear();
+                }
                 let _ = tx.send(AgentEvent::Info(format!(
                     "context window full — compacting transcript (level {compact_level}) and retrying"
                 )));
                 continue;
             }
-            return Err(if e.starts_with("context window full") {
+            let e = if e.starts_with("context window full") {
                 format!(
                     "{e} — the task transcript is too long even after compaction; try a smaller task"
                 )
             } else {
                 e
-            });
+            };
+            log.log("ERROR", &e);
+            return Err(e);
         }
         let _ = tx.send(AgentEvent::TurnDone);
         log.log(
@@ -508,49 +556,81 @@ fn run_loop(
 
         let Some(call) = parse_tool_call(&response) else {
             // A reply that clearly tried to call a tool but could not be
-            // parsed gets one corrective nudge instead of ending the run.
+            // parsed, or that narrates a write instead of calling write_file
+            // (the model imitating the transcript stub that replaces its
+            // earlier write_file turns — observed in the wild), gets a
+            // corrective nudge. Three such replies in a row end the run as
+            // interrupted, never as "done": nothing was finished.
             let attempted = !dangling_tool_tag(&response)
                 && (response.contains("<tool_call>")
                     || (response.contains("\"name\"") && response.contains("\"arguments\"")));
-            if attempted && format_retries < 2 {
+            let fake_write = !attempted && claims_fake_write(&response);
+            if attempted || fake_write {
+                if format_retries >= 2 {
+                    let reason = format!(
+                        "{} consecutive replies with a broken or narrated tool call",
+                        format_retries + 1
+                    );
+                    log.log("GIVING UP", &reason);
+                    abort_reason = Some(reason);
+                    break;
+                }
                 format_retries += 1;
-                log.log(
-                    "PARSE FAILURE",
-                    "response looked like a tool call but did not parse; nudging model",
-                );
-                let _ = tx.send(AgentEvent::Info(
-                    "tool call could not be parsed — asking the model to retry".into(),
-                ));
-                messages.push(ChatMessage {
-                    role: Role::User,
-                    content: "Your tool call could not be parsed. Emit exactly one call as \
-                              <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
-                              with valid JSON — or, if the task is finished, reply with a \
-                              summary and no tool call."
-                        .into(),
-                });
+                if attempted {
+                    log.log(
+                        "PARSE FAILURE",
+                        "response looked like a tool call but did not parse; nudging model",
+                    );
+                    let _ = tx.send(AgentEvent::Info(
+                        "tool call could not be parsed — asking the model to retry".into(),
+                    ));
+                    messages.push(ChatMessage {
+                        role: Role::User,
+                        content: "Your tool call could not be parsed. Emit exactly one call as \
+                                  <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
+                                  with valid JSON — or, if the task is finished, reply with a \
+                                  summary and no tool call."
+                            .into(),
+                    });
+                } else {
+                    log.log(
+                        "FAKE WRITE",
+                        "response narrates a write but no tool was called; nudging model",
+                    );
+                    let _ = tx.send(AgentEvent::Info(
+                        "model claimed a write without calling a tool — asking it to really write"
+                            .into(),
+                    ));
+                    messages.push(ChatMessage {
+                        role: Role::User,
+                        content: "You described writing a file, but no tool call was made and \
+                                  nothing was written to disk. Emit a real <tool_call> for \
+                                  write_file with the complete file content — or, if the task \
+                                  is truly finished and verified, reply with only a summary."
+                            .into(),
+                    });
+                }
                 continue;
             }
-            // The model sometimes imitates the transcript stub that replaces
-            // its earlier write_file turns — narrating a write instead of
-            // calling the tool. Left alone this silently ends the run with
-            // nothing written (observed in the wild).
-            if claims_fake_write(&response) && format_retries < 2 {
-                format_retries += 1;
+            // Asking for permission or preferences ends the turn with no
+            // tool call, which reads as "finished" — a real run stopped
+            // after two turns with "Would you like me to begin?". Nobody
+            // is there to answer, so say so once and let it decide.
+            if asks_the_user(&response) && !proceed_nudged {
+                proceed_nudged = true;
                 log.log(
-                    "FAKE WRITE",
-                    "response narrates a write but no tool was called; nudging model",
+                    "ASKED USER",
+                    "model asked for confirmation instead of continuing; nudging model",
                 );
                 let _ = tx.send(AgentEvent::Info(
-                    "model claimed a write without calling a tool — asking it to really write"
-                        .into(),
+                    "model asked for permission — telling it to decide and continue".into(),
                 ));
                 messages.push(ChatMessage {
                     role: Role::User,
-                    content: "You described writing a file, but no tool call was made and \
-                              nothing was written to disk. Emit a real <tool_call> for \
-                              write_file with the complete file content — or, if the task \
-                              is truly finished and verified, reply with only a summary."
+                    content: "Nobody is watching this run, so questions cannot be answered. \
+                              Do not ask for confirmation or preferences: make the decision \
+                              yourself and continue the task with a tool call now. Reply \
+                              without a tool call only when the whole task is complete."
                         .into(),
                 });
                 continue;
@@ -582,11 +662,13 @@ fn run_loop(
                 append_history(workspace, "Done", task, summary, &files_touched);
             }
             clear_saved_run(workspace);
+            log.log("DONE", &format!("finished after {iteration} turns"));
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
             });
             return Ok(());
         };
+        format_retries = 0;
 
         log.log("TOOL CALL", &format!("{}: {}", call.name, call.arguments));
         let _ = tx.send(AgentEvent::ToolCall {
@@ -654,6 +736,51 @@ fn run_loop(
         {
             files_touched.push(path.to_string());
         }
+        if ok {
+            same_fail = None;
+            same_fail_count = 0;
+        } else {
+            let key = (call.name.clone(), call.arguments.to_string());
+            if same_fail.as_ref() == Some(&key) {
+                same_fail_count += 1;
+            } else {
+                same_fail = Some(key);
+                same_fail_count = 1;
+            }
+            if same_fail_count >= SAME_FAIL_GIVE_UP {
+                let reason = format!(
+                    "the same failing {} call was repeated {same_fail_count} times",
+                    call.name
+                );
+                log.log("GIVING UP", &reason);
+                abort_reason = Some(reason);
+                break;
+            }
+            if same_fail_count >= 3
+                && call.name == "write_file"
+                && call.arg("content").is_some_and(looks_like_placeholder)
+                && let Some(path) = call.arg("path")
+            {
+                // Remove every elided write of this path from the
+                // transcript: as long as one is in context, the model
+                // copies it instead of writing code.
+                let dropped = purge_elided_writes(&mut messages, path);
+                if dropped > 0 {
+                    web_msgs.clear();
+                    intact_writes.clear();
+                }
+                log.log(
+                    "PLACEHOLDER LOOP",
+                    &format!("{same_fail_count}× placeholder write of {path}; dropped {dropped} elided turns"),
+                );
+                output.push_str(&format!(
+                    "\n\n[guidance: you have sent this same failing call {same_fail_count} times. \
+                     The content is a transcript placeholder, not source code, and every \
+                     earlier write of {path} has now been removed from this transcript. \
+                     Write the COMPLETE file from scratch now, as real code.]"
+                ));
+            }
+        }
         // Freshness/verification bookkeeping for the write gate and the
         // unverified-finish guard.
         if ok {
@@ -714,27 +841,12 @@ fn run_loop(
                 }
             }
         }
-        // A successful write_file leaves a full copy of the file in the
-        // assistant's turn — the biggest context hog. Replace it with a
-        // bracketed editor-style note (NOT a syntactically valid tool call,
-        // and NOT first-person prose: the model imitates its own turns —
-        // a placeholder-shaped call once got written to disk verbatim, and
-        // prose like "(wrote N bytes …)" once got narrated instead of an
-        // actual call). claims_fake_write() catches imitations of this note.
-        if ok
-            && call.name == "write_file"
-            && let Some(last) = messages.last_mut()
-            && last.role == Role::Assistant
-            && let Some(pos) = last.content.find("<tool_call>")
+        // Remember where the full write_file turns are; they are elided
+        // lazily, before a generation, only once the transcript nears the
+        // window (see the top of the loop).
+        if ok && call.name == "write_file" && messages.last().is_some_and(|m| m.role == Role::Assistant)
         {
-            let note = format!(
-                "[transcript note: the full write_file call ({} bytes to {}) was removed \
-                 here to save context — the file is on disk; read_file shows it]",
-                call.arg("content").map(str::len).unwrap_or(0),
-                call.arg("path").unwrap_or("")
-            );
-            last.content.truncate(pos);
-            last.content.push_str(&note);
+            intact_writes.push(messages.len() - 1);
         }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
@@ -765,12 +877,16 @@ fn run_loop(
         let total = resumed_turns + turns_taken;
         let summary = if stop.load(Ordering::Relaxed) {
             format!("STOPPED by the user after {total} turns — task NOT finished (resumable).")
+        } else if let Some(reason) = &abort_reason {
+            format!("GAVE UP after {total} turns: {reason} — task NOT finished (resumable).")
         } else {
             format!(
                 "Hit the {MAX_ITERATIONS}-turn limit after {total} turns — task NOT \
                  finished (resumable)."
             )
         };
+        log.log("INTERRUPTED", &summary);
+        let _ = tx.send(AgentEvent::Info(summary.clone()));
         append_history(workspace, "Interrupted", task, &summary, &files_touched);
     }
     let _ = tx.send(AgentEvent::Done {
@@ -787,6 +903,99 @@ fn dangling_tool_tag(response: &str) -> bool {
     response.trim_end().ends_with("<tool_call>") && response.matches("<tool_call>").count() == 1
 }
 
+/// How many of the most recent write_file turns keep their full content.
+const KEEP_FULL_WRITES: usize = 2;
+
+/// Consecutive identical failing tool calls before the run gives up.
+const SAME_FAIL_GIVE_UP: usize = 6;
+
+/// Remove assistant turns whose (elided) write_file call targets `path`,
+/// together with the tool response that followed each. Returns how many
+/// turns were dropped. Indices into `messages` held elsewhere are stale
+/// afterwards.
+fn purge_elided_writes(messages: &mut Vec<ChatMessage>, path: &str) -> usize {
+    let mut dropped = 0;
+    let mut i = 2; // never the system prompt or the task
+    while i < messages.len() {
+        let is_target = messages[i].role == Role::Assistant
+            && messages[i].content.contains(ELIDED_CONTENT)
+            && parse_tool_call(&messages[i].content)
+                .is_some_and(|c| c.name == "write_file" && c.arg("path") == Some(path));
+        if !is_target {
+            i += 1;
+            continue;
+        }
+        messages.remove(i);
+        if i < messages.len()
+            && messages[i].role == Role::User
+            && messages[i].content.starts_with("<tool_response>")
+        {
+            messages.remove(i);
+        }
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Marker that replaces elided write_file content in the transcript.
+const ELIDED_CONTENT: &str = "elided from transcript";
+
+/// Replace the content of an assistant turn's write_file call with a short
+/// marker. The result is still a syntactically valid call: the model
+/// imitates its own turns, and an imitated *call* with the marker as content
+/// is rejected by write_file's placeholder guard as an ordinary tool error
+/// the model recovers from — whereas an imitated prose note ("[transcript
+/// note: … was removed]", the previous shape) was no tool call at all and
+/// repeatedly ended runs.
+fn elide_write(msg: &mut ChatMessage) {
+    let Some(pos) = msg.content.find("<tool_call>") else {
+        return;
+    };
+    let Some(call) = parse_tool_call(&msg.content[pos..]) else {
+        return;
+    };
+    let path = call.arg("path").unwrap_or("");
+    let bytes = call.arg("content").map(str::len).unwrap_or(0);
+    let stub = serde_json::json!({
+        "name": "write_file",
+        "arguments": {
+            "path": path,
+            "content": format!("[{ELIDED_CONTENT}: {bytes} bytes are on disk; read_file shows them]"),
+        }
+    });
+    msg.content.truncate(pos);
+    msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+}
+
+/// Saved runs checkpointed before elide_write existed carry the old prose
+/// stub ("[transcript note: the full write_file call (N bytes to P) was
+/// removed …]") — the very shape the model imitates. Rewrite those into
+/// the current valid-call form on resume.
+fn upgrade_legacy_stubs(messages: &mut [ChatMessage]) {
+    const HEAD: &str = "[transcript note: the full write_file call (";
+    for msg in messages.iter_mut().filter(|m| m.role == Role::Assistant) {
+        let Some(pos) = msg.content.find(HEAD) else {
+            continue;
+        };
+        let rest = &msg.content[pos + HEAD.len()..];
+        let Some((bytes, rest)) = rest.split_once(" bytes to ") else {
+            continue;
+        };
+        let Some((path, _)) = rest.split_once(") was removed") else {
+            continue;
+        };
+        let stub = serde_json::json!({
+            "name": "write_file",
+            "arguments": {
+                "path": path,
+                "content": format!("[{ELIDED_CONTENT}: {bytes} bytes are on disk; read_file shows them]"),
+            }
+        });
+        msg.content.truncate(pos);
+        msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+    }
+}
+
 /// Does a reply with no parsable tool call *narrate* a file write? Models
 /// imitate the transcript stubs that replace their earlier write_file turns
 /// ("(wrote 2211 bytes to … with the write_file tool)" was generated verbatim
@@ -796,6 +1005,35 @@ fn claims_fake_write(response: &str) -> bool {
     response.contains("transcript note")
         || (response.contains("(wrote ") && response.contains(" bytes"))
         || (response.contains("write_file tool") && !response.contains("<tool_call>"))
+}
+
+/// Does a reply with no tool call end by asking the user something —
+/// permission to start, a preference, "let me know"? Only the tail counts:
+/// a question in the middle of a finished summary is rhetorical.
+fn asks_the_user(response: &str) -> bool {
+    let tail = response
+        .trim_end()
+        .trim_end_matches("<tool_call>")
+        .trim_end();
+    let tail = &tail[tail.len().saturating_sub(300)..];
+    let tail = tail.to_lowercase();
+    tail.ends_with('?')
+        || [
+            "would you like",
+            "shall i",
+            "should i proceed",
+            "should i continue",
+            "do you want me",
+            "want me to",
+            "let me know if you",
+            "let me know whether",
+            "let me know how",
+            "ready to begin",
+            "ready to start",
+            "ready to proceed",
+        ]
+        .iter()
+        .any(|p| tail.contains(p))
 }
 
 /// Pull the last `help:` suggestion block out of compiler/tool output so the
@@ -843,7 +1081,10 @@ fn write_gate(
     }
     // Unreadable or oversized files can never be served (read_file caps at
     // the same limit), so gating them would block writes forever — waive.
+    // An empty file (models love `touch` before writing) has nothing to
+    // regress: gating it cost a real run eleven turns for nothing.
     let current = match std::fs::metadata(&path).map(|m| m.len()) {
+        Ok(0) => return None,
         Ok(len) if len <= MAX_FILE_READ => std::fs::read_to_string(&path).ok()?,
         _ => return None,
     };
@@ -877,11 +1118,36 @@ fn tool_output_ok(output: &str) -> bool {
 /// level 1, kept three times longer at level 2 (a compaction once erased
 /// freshly fetched docs facts, and the model promptly regressed to the wrong
 /// API it had just unlearned).
+/// Messages kept verbatim at the end of the transcript by a level-3 compaction.
+const COMPACT_KEEP_RECENT: usize = 6;
+
 fn compact_transcript(
-    messages: &mut [ChatMessage],
+    messages: &mut Vec<ChatMessage>,
     level: usize,
     web_msgs: &std::collections::HashSet<usize>,
+    files_touched: &[String],
 ) {
+    if level >= 3 && messages.len() > 2 + COMPACT_KEEP_RECENT {
+        let removed = messages.len() - 2 - COMPACT_KEEP_RECENT;
+        let files = if files_touched.is_empty() {
+            "none yet".to_string()
+        } else {
+            files_touched.join(", ")
+        };
+        messages.drain(2..2 + removed);
+        messages.insert(
+            2,
+            ChatMessage {
+                role: Role::User,
+                content: format!(
+                    "[transcript compacted: {removed} earlier messages were removed to fit \
+                     the context window. Files written so far: {files}. The workspace is \
+                     on disk — use list_files and read_file to re-orient, then continue \
+                     the task.]"
+                ),
+            },
+        );
+    }
     let len = messages.len();
     let keep_from = if level >= 2 {
         len.saturating_sub(1)
@@ -1111,6 +1377,8 @@ the write based on that content. Make the smallest change that fulfils the \
 task; when a compiler or tool suggests an exact fix, apply exactly that fix \
 instead of rewriting other parts. NEVER rewrite an existing file from \
 scratch unless the task explicitly asks for a rewrite.\n\
+This run is unattended: never ask the user a question or for permission. \
+Make reasonable decisions yourself and keep working until the task is complete.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 {history}\
@@ -1244,9 +1512,7 @@ pub fn escape_control_chars_in_strings(s: &str) -> String {
 /// known tools — used for the lenient fallbacks so ordinary JSON in a summary
 /// is not mistaken for a call.
 fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
-    let json: serde_json::Value = serde_json::from_str(s)
-        .or_else(|_| serde_json::from_str(&escape_control_chars_in_strings(s)))
-        .ok()?;
+    let json = parse_call_json(s)?;
     let name = json.get("name")?.as_str()?.to_string();
     if strict_names && !KNOWN_TOOLS.contains(&name.as_str()) {
         return None;
@@ -1256,6 +1522,73 @@ fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
         .cloned()
         .unwrap_or(serde_json::json!({}));
     Some(ToolCall { name, arguments })
+}
+
+/// Strict parse, then with control characters escaped, then with a dropped
+/// closing quote repaired — the three ways models mangle a call object.
+fn parse_call_json(s: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(s) {
+        return Some(v);
+    }
+    let escaped = escape_control_chars_in_strings(s);
+    if let Ok(v) = serde_json::from_str(&escaped) {
+        return Some(v);
+    }
+    close_unterminated_call(&escaped).and_then(|fixed| serde_json::from_str(&fixed).ok())
+}
+
+/// Models regularly drop the closing quote of a long string argument (the
+/// write_file content) and go straight to the closing braces — or escape
+/// that quote like the ones inside the content. Three real runs ended on
+/// exactly that. If `s` ends inside a string literal, terminate it and
+/// close the objects that are still open. None when `s` is not in that
+/// state (a genuinely different error must not be papered over).
+fn close_unterminated_call(s: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut body = s.trim_end().to_string();
+    if in_str {
+        // The trailing braces were meant as closers, not content: give back
+        // as many as there are open objects, keep any surplus as content.
+        let mut closers = 0;
+        while closers < depth && body.ends_with('}') {
+            body.pop();
+            closers += 1;
+        }
+        // `\"` at the very end is an over-escaped closing quote; a lone
+        // trailing `\` would escape the quote we are about to add.
+        if body.ends_with("\\\"") && !body.ends_with("\\\\\"") {
+            body.truncate(body.len() - 2);
+        }
+        if body.ends_with('\\') && !body.ends_with("\\\\") {
+            body.pop();
+        }
+        body.push('"');
+    }
+    body.push_str(&"}".repeat(depth));
+    Some(body)
 }
 
 /// Byte offset one past the end of the balanced JSON object starting at `s[0]`
@@ -1310,9 +1643,19 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
         "write_file" => resolve(workspace, call.arg("path").unwrap_or("")).and_then(|path| {
             let content = call.arg("content").unwrap_or("");
             if looks_like_placeholder(content) {
+                // Serve what is on disk: the model usually imitates the
+                // placeholder because the content it wants to edit was
+                // elided from its context.
+                let current = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.is_file() && m.len() <= MAX_FILE_READ)
+                    .and_then(|_| std::fs::read_to_string(&path).ok())
+                    .filter(|c| !c.is_empty())
+                    .map(|c| format!(" The file currently contains:\n---\n{c}\n---"))
+                    .unwrap_or_default();
                 return Err(format!(
                     "content looks like a placeholder ({content:?}), not real file \
-                     content — send the actual file content"
+                     content.{current} Resend write_file with the COMPLETE file content."
                 ));
             }
             if let Some(parent) = path.parent() {
@@ -1335,7 +1678,7 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
 /// (e.g. "[3519 bytes written to disk]", "...", "(content omitted)").
 fn looks_like_placeholder(content: &str) -> bool {
     let t = content.trim();
-    if t.contains("transcript note") {
+    if t.contains("transcript note") || t.contains(ELIDED_CONTENT) {
         return true;
     }
     if t.len() > 120 {
@@ -1857,6 +2200,51 @@ mod tests {
         assert!(parse_tool_call("All done, the tests pass.").is_none());
     }
 
+    /// Three real runs on a 30B coder ended on a write_file call whose
+    /// content string was never closed — or closed with an escaped quote —
+    /// before the trailing braces. Those must parse, with the content intact.
+    #[test]
+    fn repairs_unterminated_string_argument() {
+        // Dropped closing quote: the code's own `}` then straight to `}}`.
+        let r = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/lib.rs\", \
+                 \"content\": \"pub struct A;\nimpl A {\n    fn new() -> Self {\n        Self\n    }\n}}}</tool_call>";
+        let call = parse_tool_call(r).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(
+            call.arg("content"),
+            Some("pub struct A;\nimpl A {\n    fn new() -> Self {\n        Self\n    }\n}")
+        );
+        // Over-escaped closing quote and no closing tag at all.
+        let r = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"Cargo.toml\", \
+                 \"content\": \"[package]\nname = \\\"x\\\"\n\\\"}}";
+        let call = parse_tool_call(r).unwrap();
+        assert_eq!(call.arg("path"), Some("Cargo.toml"));
+        assert_eq!(call.arg("content"), Some("[package]\nname = \"x\"\n"));
+        // Well-formed or unrelated text is left alone.
+        assert!(close_unterminated_call("{\"name\": \"x\", \"arguments\": {}}").is_none());
+        assert!(close_unterminated_call("not json at all").is_none());
+    }
+
+    /// A reply that asks for permission has no tool call and used to end the
+    /// run as "done" — verbatim, a run stopped after two turns on this.
+    #[test]
+    fn detects_questions_to_the_user() {
+        assert!(asks_the_user(
+            "I've loaded and reviewed the plan.md file.\n\nI'm ready to begin implementing this \
+             plan, starting with Milestone 0 (Skeleton). Would you like me to begin implementing \
+             the skeleton components?\n<tool_call>"
+        ));
+        assert!(asks_the_user("Shall I proceed with the migration?"));
+        assert!(asks_the_user("Let me know if you want me to also add tests."));
+        assert!(!asks_the_user("All done: cargo test passes and the README is updated."));
+        // A rhetorical question early in a long finished summary is not a prompt.
+        let summary = format!(
+            "Why did it fail? The lock was stale.{}\nFixed and verified with cargo test.",
+            " ".repeat(300)
+        );
+        assert!(!asks_the_user(&summary));
+    }
+
     #[test]
     fn ignores_tool_call_inside_think() {
         let r = "<think>maybe <tool_call>{\"name\": \"x\"}</tool_call></think>Done.";
@@ -2214,6 +2602,98 @@ mod tests {
             "[transcript note: the full write_file call (2211 bytes to src/main.rs) was \
              removed here to save context — the file is on disk; read_file shows it]"
         ));
+        assert!(looks_like_placeholder(
+            "[elided from transcript: 153 bytes are on disk; read_file shows them]"
+        ));
+    }
+
+    /// An elided write stays a valid write_file call for the same path, and
+    /// its content is exactly what the placeholder guard rejects — so an
+    /// imitation becomes a tool error, not a run-ending format failure.
+    #[test]
+    fn elided_write_is_a_valid_but_rejected_call() {
+        let mut msg = ChatMessage {
+            role: Role::Assistant,
+            content: "Creating the manifest.\n<tool_call>{\"name\": \"write_file\", \"arguments\": \
+                      {\"path\": \"Cargo.toml\", \"content\": \"[package]\\nname = \\\"x\\\"\\n\"}}</tool_call>"
+                .into(),
+        };
+        elide_write(&mut msg);
+        assert!(msg.content.starts_with("Creating the manifest.\n<tool_call>"));
+        let call = parse_tool_call(&msg.content).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arg("path"), Some("Cargo.toml"));
+        let content = call.arg("content").unwrap();
+        assert!(content.contains("21 bytes"), "{content}");
+        assert!(looks_like_placeholder(content));
+        // Not a narrated write either: the nudge path must not fire on it.
+        assert!(!claims_fake_write(&msg.content));
+        // A turn without a call is left alone.
+        let mut plain = ChatMessage { role: Role::Assistant, content: "Done.".into() };
+        elide_write(&mut plain);
+        assert_eq!(plain.content, "Done.");
+    }
+
+    /// Once the model copies an elided write instead of writing code, the
+    /// template has to go: purge drops exactly the elided turns for that
+    /// path (and their tool responses), leaving everything else.
+    #[test]
+    fn purge_drops_only_elided_writes_of_the_path() {
+        let msg = |role, content: &str| ChatMessage {
+            role,
+            content: content.into(),
+        };
+        let mut w = msg(
+            Role::Assistant,
+            "Writing it.\n<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.rs\", \"content\": \"fn a() {}\"}}</tool_call>",
+        );
+        elide_write(&mut w);
+        let mut other = msg(
+            Role::Assistant,
+            "Writing b.\n<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"b.rs\", \"content\": \"fn b() {}\"}}</tool_call>",
+        );
+        elide_write(&mut other);
+        let mut messages = vec![
+            msg(Role::System, "sys"),
+            msg(Role::User, "task"),
+            w.clone(),
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            other,
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            w,
+            msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
+            msg(Role::Assistant, "Now checking.\n<tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"cargo check\"}}</tool_call>"),
+        ];
+        assert_eq!(purge_elided_writes(&mut messages, "a.rs"), 2);
+        assert_eq!(messages.len(), 5);
+        assert!(messages[2].content.contains("b.rs"));
+        assert!(messages[4].content.contains("cargo check"));
+        // A second purge finds nothing.
+        assert_eq!(purge_elided_writes(&mut messages, "a.rs"), 0);
+    }
+
+    /// A run saved under the old stub shape resumes with valid calls.
+    #[test]
+    fn resume_upgrades_legacy_stubs() {
+        let mut messages = vec![
+            ChatMessage { role: Role::User, content: "task".into() },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "Let me fix it:\n[transcript note: the full write_file call (282 bytes to \
+                          forge-rules/src/lib.rs) was removed here to save context — the file is \
+                          on disk; read_file shows it]"
+                    .into(),
+            },
+            ChatMessage { role: Role::User, content: "<tool_response>wrote 282 bytes</tool_response>".into() },
+        ];
+        upgrade_legacy_stubs(&mut messages);
+        let call = parse_tool_call(&messages[1].content).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arg("path"), Some("forge-rules/src/lib.rs"));
+        assert!(call.arg("content").unwrap().contains("282 bytes"));
+        assert!(messages[1].content.starts_with("Let me fix it:\n<tool_call>"));
+        assert!(!claims_fake_write(&messages[1].content));
+        assert_eq!(messages[2].content, "<tool_response>wrote 282 bytes</tool_response>");
     }
 
     #[test]
@@ -2364,15 +2844,45 @@ mod tests {
             },
         ];
         let no_web = std::collections::HashSet::new();
-        compact_transcript(&mut messages, 1, &no_web);
+        compact_transcript(&mut messages, 1, &no_web, &[]);
         // index 0/1 (system + task) are never touched; index 2+ within range is
         assert!(messages[2].content == "a" || messages[2].content.len() <= 400);
         assert_eq!(messages[3].content, long); // within the keep window at level 1
-        compact_transcript(&mut messages, 2, &no_web);
+        compact_transcript(&mut messages, 2, &no_web, &[]);
         assert!(messages[3].content.contains("[older tool output trimmed]"));
         assert!(messages[3].content.len() < 500);
         assert_eq!(messages[0].content, "sys"); // system prompt untouched
         assert_eq!(messages[5].content, "task"); // last message untouched
+    }
+
+    /// Level 3 drops the middle of the transcript: system prompt, task and
+    /// the newest turns survive, with one note in between so the model knows
+    /// what it built. A real 97-turn run died at the window with levels 1–2
+    /// only trimming messages, never removing any.
+    #[test]
+    fn level_three_compaction_drops_the_middle() {
+        let msg = |role, content: &str| ChatMessage {
+            role,
+            content: content.into(),
+        };
+        let mut messages = vec![msg(Role::System, "sys"), msg(Role::User, "task")];
+        for i in 0..20 {
+            messages.push(msg(Role::Assistant, &format!("turn {i}")));
+            messages.push(msg(Role::User, &format!("<tool_response>r{i}</tool_response>")));
+        }
+        let no_web = std::collections::HashSet::new();
+        let files = vec!["src/main.rs".to_string(), "Cargo.toml".to_string()];
+        compact_transcript(&mut messages, 3, &no_web, &files);
+        assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);
+        assert_eq!(messages[0].content, "sys");
+        assert_eq!(messages[1].content, "task");
+        assert!(messages[2].content.starts_with("[transcript compacted: 34 earlier messages"));
+        assert!(messages[2].content.contains("src/main.rs, Cargo.toml"));
+        assert_eq!(messages[3].content, "turn 17");
+        assert_eq!(messages.last().unwrap().content, "<tool_response>r19</tool_response>");
+        // Nothing left to drop: a second pass is a no-op on the shape.
+        compact_transcript(&mut messages, 3, &no_web, &files);
+        assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);
     }
 
     #[test]
@@ -2393,10 +2903,10 @@ mod tests {
             msg(Role::Assistant, "d"),
         ];
         let web: std::collections::HashSet<usize> = [3].into();
-        compact_transcript(&mut messages, 1, &web);
+        compact_transcript(&mut messages, 1, &web, &[]);
         assert!(messages[2].content.contains("[older tool output trimmed]"));
         assert_eq!(messages[3].content, long); // web result spared at level 1
-        compact_transcript(&mut messages, 2, &web);
+        compact_transcript(&mut messages, 2, &web, &[]);
         assert!(messages[3].content.contains("[older tool output trimmed]"));
         // …and keeps ~3x more than an ordinary result at level 2.
         assert!(messages[3].content.len() > messages[2].content.len() + 500);
