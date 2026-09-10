@@ -384,12 +384,13 @@ fn run_loop(
             (task, messages, 0)
         }
         None => {
-            let saved = saved_run(workspace).ok_or("no saved run to resume")?;
+            let mut saved = saved_run(workspace).ok_or("no saved run to resume")?;
             let _ = tx.send(AgentEvent::Info(format!(
                 "resuming after {} turns: {}",
                 saved.turns,
                 saved.task.lines().next().unwrap_or_default()
             )));
+            upgrade_legacy_stubs(&mut saved.messages);
             (saved.task, saved.messages, saved.turns)
         }
     };
@@ -861,6 +862,35 @@ fn elide_write(msg: &mut ChatMessage) {
     });
     msg.content.truncate(pos);
     msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+}
+
+/// Saved runs checkpointed before elide_write existed carry the old prose
+/// stub ("[transcript note: the full write_file call (N bytes to P) was
+/// removed …]") — the very shape the model imitates. Rewrite those into
+/// the current valid-call form on resume.
+fn upgrade_legacy_stubs(messages: &mut [ChatMessage]) {
+    const HEAD: &str = "[transcript note: the full write_file call (";
+    for msg in messages.iter_mut().filter(|m| m.role == Role::Assistant) {
+        let Some(pos) = msg.content.find(HEAD) else {
+            continue;
+        };
+        let rest = &msg.content[pos + HEAD.len()..];
+        let Some((bytes, rest)) = rest.split_once(" bytes to ") else {
+            continue;
+        };
+        let Some((path, _)) = rest.split_once(") was removed") else {
+            continue;
+        };
+        let stub = serde_json::json!({
+            "name": "write_file",
+            "arguments": {
+                "path": path,
+                "content": format!("[{ELIDED_CONTENT}: {bytes} bytes are on disk; read_file shows them]"),
+            }
+        });
+        msg.content.truncate(pos);
+        msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+    }
 }
 
 /// Does a reply with no parsable tool call *narrate* a file write? Models
@@ -2461,6 +2491,30 @@ mod tests {
         let mut plain = ChatMessage { role: Role::Assistant, content: "Done.".into() };
         elide_write(&mut plain);
         assert_eq!(plain.content, "Done.");
+    }
+
+    /// A run saved under the old stub shape resumes with valid calls.
+    #[test]
+    fn resume_upgrades_legacy_stubs() {
+        let mut messages = vec![
+            ChatMessage { role: Role::User, content: "task".into() },
+            ChatMessage {
+                role: Role::Assistant,
+                content: "Let me fix it:\n[transcript note: the full write_file call (282 bytes to \
+                          forge-rules/src/lib.rs) was removed here to save context — the file is \
+                          on disk; read_file shows it]"
+                    .into(),
+            },
+            ChatMessage { role: Role::User, content: "<tool_response>wrote 282 bytes</tool_response>".into() },
+        ];
+        upgrade_legacy_stubs(&mut messages);
+        let call = parse_tool_call(&messages[1].content).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arg("path"), Some("forge-rules/src/lib.rs"));
+        assert!(call.arg("content").unwrap().contains("282 bytes"));
+        assert!(messages[1].content.starts_with("Let me fix it:\n<tool_call>"));
+        assert!(!claims_fake_write(&messages[1].content));
+        assert_eq!(messages[2].content, "<tool_response>wrote 282 bytes</tool_response>");
     }
 
     #[test]
