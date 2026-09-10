@@ -810,7 +810,13 @@ impl OffgridApp {
                 for (i, model) in locals.iter().enumerate() {
                     let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
                     let can_load = !loaded && !self.model_loading;
-                    let badge = Fit::of(model.size, self.hardware.total_ram, self.n_ctx()).badge();
+                    let badge = Fit::of_model(
+                        model.size,
+                        model.kv_per_token,
+                        self.hardware.total_ram,
+                        self.n_ctx(),
+                    )
+                    .badge();
                     let mut clicked_load = false;
                     let mut clicked_delete = false;
                     list_row(

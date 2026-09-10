@@ -248,9 +248,14 @@ impl Tui {
     /// The same verdict the desktop app shows as badges: RAM fit and
     /// estimated speed, e.g. "fits · ~12 t/s".
     fn gauge(&self, name: &str, size: u64) -> String {
+        self.gauge_kv(name, size, None)
+    }
+
+    /// `gauge` with the header-derived KV cost of a local file.
+    fn gauge_kv(&self, name: &str, size: u64, kv_per_token: Option<u64>) -> String {
         format!(
             "{} · {}",
-            Fit::of(size, self.hardware.total_ram, self.n_ctx()).label(),
+            Fit::of_model(size, kv_per_token, self.hardware.total_ram, self.n_ctx()).label(),
             models::fmt_tok_s(models::est_tokens_per_sec(
                 name,
                 size,
@@ -313,7 +318,7 @@ impl Tui {
                         "{marker} {:<48} {:>9}  {}",
                         m.name.chars().take(48).collect::<String>(),
                         crate::hardware::fmt_bytes(m.size),
-                        self.gauge(&m.name, m.size),
+                        self.gauge_kv(&m.name, m.size, m.kv_per_token),
                     ));
                 }
             }
@@ -1039,7 +1044,9 @@ impl Tui {
         if let Some(m) = self.models.get(self.selected) {
             // Loading past physical RAM kills the whole process (llama.cpp
             // aborts), so refuse instead of terminating a headless session.
-            if Fit::of(m.size, self.hardware.total_ram, self.n_ctx()) == Fit::TooBig {
+            if Fit::of_model(m.size, m.kv_per_token, self.hardware.total_ram, self.n_ctx())
+                == Fit::TooBig
+            {
                 self.status = format!(
                     "{} won't fit: needs more than the {} of RAM here",
                     m.name,
