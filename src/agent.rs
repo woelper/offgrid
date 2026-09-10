@@ -13,7 +13,9 @@ use crate::llm::{ChatMessage, LlmCmd, LlmEvent, Role};
 // Generous: with the write gate, a single fix cycle legitimately costs
 // three turns (gated write -> write -> check); 25 proved too tight in
 // practice.
-const MAX_ITERATIONS: usize = 40;
+// Generous on purpose: a plan-sized task on a small local model needs many
+// turns, and runaway loops are caught by the cycling/format checks below.
+const MAX_ITERATIONS: usize = 200;
 const MAX_FILE_READ: u64 = 50 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
@@ -418,7 +420,13 @@ fn run_loop(
     // edited in place, never removed, so indices stay valid.
     let mut web_msgs: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // Consecutive replies with a broken or narrated tool call. Reset by
+    // every parsable call, so an occasional slip does not eat a run-wide
+    // budget and silently end the session twenty turns later.
     let mut format_retries = 0usize;
+    let mut proceed_nudged = false;
+    // Why the loop ended early, for the history entry and the frontends.
+    let mut abort_reason: Option<String> = None;
     let mut compact_level = 0usize;
     let mut turns_taken = 0usize;
     for iteration in 1..=MAX_ITERATIONS {
@@ -488,13 +496,15 @@ fn run_loop(
                 )));
                 continue;
             }
-            return Err(if e.starts_with("context window full") {
+            let e = if e.starts_with("context window full") {
                 format!(
                     "{e} — the task transcript is too long even after compaction; try a smaller task"
                 )
             } else {
                 e
-            });
+            };
+            log.log("ERROR", &e);
+            return Err(e);
         }
         let _ = tx.send(AgentEvent::TurnDone);
         log.log(
@@ -508,49 +518,81 @@ fn run_loop(
 
         let Some(call) = parse_tool_call(&response) else {
             // A reply that clearly tried to call a tool but could not be
-            // parsed gets one corrective nudge instead of ending the run.
+            // parsed, or that narrates a write instead of calling write_file
+            // (the model imitating the transcript stub that replaces its
+            // earlier write_file turns — observed in the wild), gets a
+            // corrective nudge. Three such replies in a row end the run as
+            // interrupted, never as "done": nothing was finished.
             let attempted = !dangling_tool_tag(&response)
                 && (response.contains("<tool_call>")
                     || (response.contains("\"name\"") && response.contains("\"arguments\"")));
-            if attempted && format_retries < 2 {
+            let fake_write = !attempted && claims_fake_write(&response);
+            if attempted || fake_write {
+                if format_retries >= 2 {
+                    let reason = format!(
+                        "{} consecutive replies with a broken or narrated tool call",
+                        format_retries + 1
+                    );
+                    log.log("GIVING UP", &reason);
+                    abort_reason = Some(reason);
+                    break;
+                }
                 format_retries += 1;
-                log.log(
-                    "PARSE FAILURE",
-                    "response looked like a tool call but did not parse; nudging model",
-                );
-                let _ = tx.send(AgentEvent::Info(
-                    "tool call could not be parsed — asking the model to retry".into(),
-                ));
-                messages.push(ChatMessage {
-                    role: Role::User,
-                    content: "Your tool call could not be parsed. Emit exactly one call as \
-                              <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
-                              with valid JSON — or, if the task is finished, reply with a \
-                              summary and no tool call."
-                        .into(),
-                });
+                if attempted {
+                    log.log(
+                        "PARSE FAILURE",
+                        "response looked like a tool call but did not parse; nudging model",
+                    );
+                    let _ = tx.send(AgentEvent::Info(
+                        "tool call could not be parsed — asking the model to retry".into(),
+                    ));
+                    messages.push(ChatMessage {
+                        role: Role::User,
+                        content: "Your tool call could not be parsed. Emit exactly one call as \
+                                  <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
+                                  with valid JSON — or, if the task is finished, reply with a \
+                                  summary and no tool call."
+                            .into(),
+                    });
+                } else {
+                    log.log(
+                        "FAKE WRITE",
+                        "response narrates a write but no tool was called; nudging model",
+                    );
+                    let _ = tx.send(AgentEvent::Info(
+                        "model claimed a write without calling a tool — asking it to really write"
+                            .into(),
+                    ));
+                    messages.push(ChatMessage {
+                        role: Role::User,
+                        content: "You described writing a file, but no tool call was made and \
+                                  nothing was written to disk. Emit a real <tool_call> for \
+                                  write_file with the complete file content — or, if the task \
+                                  is truly finished and verified, reply with only a summary."
+                            .into(),
+                    });
+                }
                 continue;
             }
-            // The model sometimes imitates the transcript stub that replaces
-            // its earlier write_file turns — narrating a write instead of
-            // calling the tool. Left alone this silently ends the run with
-            // nothing written (observed in the wild).
-            if claims_fake_write(&response) && format_retries < 2 {
-                format_retries += 1;
+            // Asking for permission or preferences ends the turn with no
+            // tool call, which reads as "finished" — a real run stopped
+            // after two turns with "Would you like me to begin?". Nobody
+            // is there to answer, so say so once and let it decide.
+            if asks_the_user(&response) && !proceed_nudged {
+                proceed_nudged = true;
                 log.log(
-                    "FAKE WRITE",
-                    "response narrates a write but no tool was called; nudging model",
+                    "ASKED USER",
+                    "model asked for confirmation instead of continuing; nudging model",
                 );
                 let _ = tx.send(AgentEvent::Info(
-                    "model claimed a write without calling a tool — asking it to really write"
-                        .into(),
+                    "model asked for permission — telling it to decide and continue".into(),
                 ));
                 messages.push(ChatMessage {
                     role: Role::User,
-                    content: "You described writing a file, but no tool call was made and \
-                              nothing was written to disk. Emit a real <tool_call> for \
-                              write_file with the complete file content — or, if the task \
-                              is truly finished and verified, reply with only a summary."
+                    content: "Nobody is watching this run, so questions cannot be answered. \
+                              Do not ask for confirmation or preferences: make the decision \
+                              yourself and continue the task with a tool call now. Reply \
+                              without a tool call only when the whole task is complete."
                         .into(),
                 });
                 continue;
@@ -582,11 +624,13 @@ fn run_loop(
                 append_history(workspace, "Done", task, summary, &files_touched);
             }
             clear_saved_run(workspace);
+            log.log("DONE", &format!("finished after {iteration} turns"));
             let _ = tx.send(AgentEvent::Done {
                 iterations: iteration,
             });
             return Ok(());
         };
+        format_retries = 0;
 
         log.log("TOOL CALL", &format!("{}: {}", call.name, call.arguments));
         let _ = tx.send(AgentEvent::ToolCall {
@@ -765,12 +809,16 @@ fn run_loop(
         let total = resumed_turns + turns_taken;
         let summary = if stop.load(Ordering::Relaxed) {
             format!("STOPPED by the user after {total} turns — task NOT finished (resumable).")
+        } else if let Some(reason) = &abort_reason {
+            format!("GAVE UP after {total} turns: {reason} — task NOT finished (resumable).")
         } else {
             format!(
                 "Hit the {MAX_ITERATIONS}-turn limit after {total} turns — task NOT \
                  finished (resumable)."
             )
         };
+        log.log("INTERRUPTED", &summary);
+        let _ = tx.send(AgentEvent::Info(summary.clone()));
         append_history(workspace, "Interrupted", task, &summary, &files_touched);
     }
     let _ = tx.send(AgentEvent::Done {
@@ -796,6 +844,35 @@ fn claims_fake_write(response: &str) -> bool {
     response.contains("transcript note")
         || (response.contains("(wrote ") && response.contains(" bytes"))
         || (response.contains("write_file tool") && !response.contains("<tool_call>"))
+}
+
+/// Does a reply with no tool call end by asking the user something —
+/// permission to start, a preference, "let me know"? Only the tail counts:
+/// a question in the middle of a finished summary is rhetorical.
+fn asks_the_user(response: &str) -> bool {
+    let tail = response
+        .trim_end()
+        .trim_end_matches("<tool_call>")
+        .trim_end();
+    let tail = &tail[tail.len().saturating_sub(300)..];
+    let tail = tail.to_lowercase();
+    tail.ends_with('?')
+        || [
+            "would you like",
+            "shall i",
+            "should i proceed",
+            "should i continue",
+            "do you want me",
+            "want me to",
+            "let me know if you",
+            "let me know whether",
+            "let me know how",
+            "ready to begin",
+            "ready to start",
+            "ready to proceed",
+        ]
+        .iter()
+        .any(|p| tail.contains(p))
 }
 
 /// Pull the last `help:` suggestion block out of compiler/tool output so the
@@ -1111,6 +1188,8 @@ the write based on that content. Make the smallest change that fulfils the \
 task; when a compiler or tool suggests an exact fix, apply exactly that fix \
 instead of rewriting other parts. NEVER rewrite an existing file from \
 scratch unless the task explicitly asks for a rewrite.\n\
+This run is unattended: never ask the user a question or for permission. \
+Make reasonable decisions yourself and keep working until the task is complete.\n\
 When the task is complete, reply with a short summary and NO tool call.\n\
 {agents}\
 {history}\
@@ -1244,9 +1323,7 @@ pub fn escape_control_chars_in_strings(s: &str) -> String {
 /// known tools — used for the lenient fallbacks so ordinary JSON in a summary
 /// is not mistaken for a call.
 fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
-    let json: serde_json::Value = serde_json::from_str(s)
-        .or_else(|_| serde_json::from_str(&escape_control_chars_in_strings(s)))
-        .ok()?;
+    let json = parse_call_json(s)?;
     let name = json.get("name")?.as_str()?.to_string();
     if strict_names && !KNOWN_TOOLS.contains(&name.as_str()) {
         return None;
@@ -1256,6 +1333,73 @@ fn call_from_json(s: &str, strict_names: bool) -> Option<ToolCall> {
         .cloned()
         .unwrap_or(serde_json::json!({}));
     Some(ToolCall { name, arguments })
+}
+
+/// Strict parse, then with control characters escaped, then with a dropped
+/// closing quote repaired — the three ways models mangle a call object.
+fn parse_call_json(s: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(s) {
+        return Some(v);
+    }
+    let escaped = escape_control_chars_in_strings(s);
+    if let Ok(v) = serde_json::from_str(&escaped) {
+        return Some(v);
+    }
+    close_unterminated_call(&escaped).and_then(|fixed| serde_json::from_str(&fixed).ok())
+}
+
+/// Models regularly drop the closing quote of a long string argument (the
+/// write_file content) and go straight to the closing braces — or escape
+/// that quote like the ones inside the content. Three real runs ended on
+/// exactly that. If `s` ends inside a string literal, terminate it and
+/// close the objects that are still open. None when `s` is not in that
+/// state (a genuinely different error must not be papered over).
+fn close_unterminated_call(s: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut body = s.trim_end().to_string();
+    if in_str {
+        // The trailing braces were meant as closers, not content: give back
+        // as many as there are open objects, keep any surplus as content.
+        let mut closers = 0;
+        while closers < depth && body.ends_with('}') {
+            body.pop();
+            closers += 1;
+        }
+        // `\"` at the very end is an over-escaped closing quote; a lone
+        // trailing `\` would escape the quote we are about to add.
+        if body.ends_with("\\\"") && !body.ends_with("\\\\\"") {
+            body.truncate(body.len() - 2);
+        }
+        if body.ends_with('\\') && !body.ends_with("\\\\") {
+            body.pop();
+        }
+        body.push('"');
+    }
+    body.push_str(&"}".repeat(depth));
+    Some(body)
 }
 
 /// Byte offset one past the end of the balanced JSON object starting at `s[0]`
@@ -1855,6 +1999,51 @@ mod tests {
     #[test]
     fn no_tool_call_in_plain_reply() {
         assert!(parse_tool_call("All done, the tests pass.").is_none());
+    }
+
+    /// Three real runs on a 30B coder ended on a write_file call whose
+    /// content string was never closed — or closed with an escaped quote —
+    /// before the trailing braces. Those must parse, with the content intact.
+    #[test]
+    fn repairs_unterminated_string_argument() {
+        // Dropped closing quote: the code's own `}` then straight to `}}`.
+        let r = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"src/lib.rs\", \
+                 \"content\": \"pub struct A;\nimpl A {\n    fn new() -> Self {\n        Self\n    }\n}}}</tool_call>";
+        let call = parse_tool_call(r).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(
+            call.arg("content"),
+            Some("pub struct A;\nimpl A {\n    fn new() -> Self {\n        Self\n    }\n}")
+        );
+        // Over-escaped closing quote and no closing tag at all.
+        let r = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"Cargo.toml\", \
+                 \"content\": \"[package]\nname = \\\"x\\\"\n\\\"}}";
+        let call = parse_tool_call(r).unwrap();
+        assert_eq!(call.arg("path"), Some("Cargo.toml"));
+        assert_eq!(call.arg("content"), Some("[package]\nname = \"x\"\n"));
+        // Well-formed or unrelated text is left alone.
+        assert!(close_unterminated_call("{\"name\": \"x\", \"arguments\": {}}").is_none());
+        assert!(close_unterminated_call("not json at all").is_none());
+    }
+
+    /// A reply that asks for permission has no tool call and used to end the
+    /// run as "done" — verbatim, a run stopped after two turns on this.
+    #[test]
+    fn detects_questions_to_the_user() {
+        assert!(asks_the_user(
+            "I've loaded and reviewed the plan.md file.\n\nI'm ready to begin implementing this \
+             plan, starting with Milestone 0 (Skeleton). Would you like me to begin implementing \
+             the skeleton components?\n<tool_call>"
+        ));
+        assert!(asks_the_user("Shall I proceed with the migration?"));
+        assert!(asks_the_user("Let me know if you want me to also add tests."));
+        assert!(!asks_the_user("All done: cargo test passes and the README is updated."));
+        // A rhetorical question early in a long finished summary is not a prompt.
+        let summary = format!(
+            "Why did it fail? The lock was stale.{}\nFixed and verified with cargo test.",
+            " ".repeat(300)
+        );
+        assert!(!asks_the_user(&summary));
     }
 
     #[test]

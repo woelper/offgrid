@@ -36,6 +36,12 @@ struct RunInfo {
     log: Option<String>,
     /// Completed model turns.
     iterations: usize,
+    /// Last informational line from the run (compaction, nudges, why it
+    /// was cut short).
+    note: Option<String>,
+    /// How the run ended, once it has: "finished after N turns" or
+    /// "error: ...". None while running.
+    outcome: Option<String>,
 }
 
 /// Shared request-handler context. `agent_busy`/`agent_stop` serialize remote
@@ -269,6 +275,8 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                     "text": state.as_ref().map(|s| s.text.clone()),
                     "iterations": info.iterations,
                     "log": info.log,
+                    "note": info.note,
+                    "outcome": info.outcome,
                 }),
             ));
         }
@@ -424,7 +432,16 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                                 info.lock().unwrap().log = std::path::Path::new(path)
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string());
+                            } else {
+                                info.lock().unwrap().note = Some(text);
                             }
+                        }
+                        crate::agent::AgentEvent::Done { iterations } => {
+                            info.lock().unwrap().outcome =
+                                Some(format!("finished after {iterations} turns"));
+                        }
+                        crate::agent::AgentEvent::Error(e) => {
+                            info.lock().unwrap().outcome = Some(format!("error: {e}"));
                         }
                         crate::agent::AgentEvent::Token(t) => {
                             tokens += 1;
