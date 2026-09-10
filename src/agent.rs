@@ -463,6 +463,9 @@ struct Run<'a> {
     /// Consecutive replies with a broken or narrated tool call.
     format_retries: usize,
     proceed_nudged: bool,
+    /// Whether the model has already been asked, once, to re-check the task
+    /// against what is on disk before its "done" is taken at face value.
+    completion_checked: bool,
     abort_reason: Option<String>,
     compact_level: usize,
     turns_taken: usize,
@@ -545,6 +548,7 @@ impl<'a> Run<'a> {
             intact_writes: Vec::new(),
             format_retries: 0,
             proceed_nudged: false,
+            completion_checked: false,
             abort_reason: None,
             compact_level: 0,
             turns_taken: 0,
@@ -808,6 +812,30 @@ impl<'a> Run<'a> {
                           so the changes are unverified. Run the project's check, build, \
                           or tests with run_command now and fix any errors. Only finish \
                           after the command succeeds."
+                    .into(),
+            });
+            return NoCall::Nudged;
+        }
+        // Models declare victory early: a run that had built the skeleton
+        // milestone summarised the whole five-milestone plan as fulfilled.
+        // Once per run, make it compare the task with what is on disk before
+        // accepting the finish.
+        if !self.completion_checked {
+            self.completion_checked = true;
+            self.log.log(
+                "COMPLETION CHECK",
+                "model declared the task done; asking it to re-check once",
+            );
+            let _ = self.tx.send(AgentEvent::Info(
+                "model says it is done — asking it to re-check the task once".into(),
+            ));
+            Arc::make_mut(&mut self.messages).push(ChatMessage {
+                role: Role::User,
+                content: "Before finishing, re-read the original task and compare it, \
+                          point by point, with what is actually on disk. If any part is \
+                          not implemented and verified yet, continue with the next \
+                          missing part now, using a tool call. Reply without a tool call \
+                          only if everything the task asked for is truly done."
                     .into(),
             });
             return NoCall::Nudged;
