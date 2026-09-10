@@ -419,6 +419,10 @@ fn run_loop(
     // trims these last (expensive to re-acquire). Messages are only ever
     // edited in place, never removed, so indices stay valid.
     let mut web_msgs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Indices of assistant turns whose write_file call is still verbatim.
+    // The newest KEEP_FULL_WRITES stay intact so the model always sees real
+    // examples of its own calls; older ones get elided (see elide_write).
+    let mut intact_writes: Vec<usize> = Vec::new();
 
     // Consecutive replies with a broken or narrated tool call. Reset by
     // every parsable call, so an occasional slip does not eat a run-wide
@@ -759,26 +763,17 @@ fn run_loop(
             }
         }
         // A successful write_file leaves a full copy of the file in the
-        // assistant's turn — the biggest context hog. Replace it with a
-        // bracketed editor-style note (NOT a syntactically valid tool call,
-        // and NOT first-person prose: the model imitates its own turns —
-        // a placeholder-shaped call once got written to disk verbatim, and
-        // prose like "(wrote N bytes …)" once got narrated instead of an
-        // actual call). claims_fake_write() catches imitations of this note.
-        if ok
-            && call.name == "write_file"
-            && let Some(last) = messages.last_mut()
-            && last.role == Role::Assistant
-            && let Some(pos) = last.content.find("<tool_call>")
+        // assistant's turn — the biggest context hog. Older ones get their
+        // content elided, but the newest few stay verbatim: once every
+        // write in context was a stub, a real run produced fifteen
+        // imitations of the stub instead of calls (see elide_write).
+        if ok && call.name == "write_file" && messages.last().is_some_and(|m| m.role == Role::Assistant)
         {
-            let note = format!(
-                "[transcript note: the full write_file call ({} bytes to {}) was removed \
-                 here to save context — the file is on disk; read_file shows it]",
-                call.arg("content").map(str::len).unwrap_or(0),
-                call.arg("path").unwrap_or("")
-            );
-            last.content.truncate(pos);
-            last.content.push_str(&note);
+            intact_writes.push(messages.len() - 1);
+            while intact_writes.len() > KEEP_FULL_WRITES {
+                let idx = intact_writes.remove(0);
+                elide_write(&mut messages[idx]);
+            }
         }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
@@ -833,6 +828,39 @@ fn run_loop(
 /// run.
 fn dangling_tool_tag(response: &str) -> bool {
     response.trim_end().ends_with("<tool_call>") && response.matches("<tool_call>").count() == 1
+}
+
+/// How many of the most recent write_file turns keep their full content.
+const KEEP_FULL_WRITES: usize = 2;
+
+/// Marker that replaces elided write_file content in the transcript.
+const ELIDED_CONTENT: &str = "elided from transcript";
+
+/// Replace the content of an assistant turn's write_file call with a short
+/// marker. The result is still a syntactically valid call: the model
+/// imitates its own turns, and an imitated *call* with the marker as content
+/// is rejected by write_file's placeholder guard as an ordinary tool error
+/// the model recovers from — whereas an imitated prose note ("[transcript
+/// note: … was removed]", the previous shape) was no tool call at all and
+/// repeatedly ended runs.
+fn elide_write(msg: &mut ChatMessage) {
+    let Some(pos) = msg.content.find("<tool_call>") else {
+        return;
+    };
+    let Some(call) = parse_tool_call(&msg.content[pos..]) else {
+        return;
+    };
+    let path = call.arg("path").unwrap_or("");
+    let bytes = call.arg("content").map(str::len).unwrap_or(0);
+    let stub = serde_json::json!({
+        "name": "write_file",
+        "arguments": {
+            "path": path,
+            "content": format!("[{ELIDED_CONTENT}: {bytes} bytes are on disk; read_file shows them]"),
+        }
+    });
+    msg.content.truncate(pos);
+    msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
 }
 
 /// Does a reply with no parsable tool call *narrate* a file write? Models
@@ -1479,7 +1507,7 @@ fn execute(call: &ToolCall, workspace: &Path, web_tools: bool) -> String {
 /// (e.g. "[3519 bytes written to disk]", "...", "(content omitted)").
 fn looks_like_placeholder(content: &str) -> bool {
     let t = content.trim();
-    if t.contains("transcript note") {
+    if t.contains("transcript note") || t.contains(ELIDED_CONTENT) {
         return true;
     }
     if t.len() > 120 {
@@ -2403,6 +2431,36 @@ mod tests {
             "[transcript note: the full write_file call (2211 bytes to src/main.rs) was \
              removed here to save context — the file is on disk; read_file shows it]"
         ));
+        assert!(looks_like_placeholder(
+            "[elided from transcript: 153 bytes are on disk; read_file shows them]"
+        ));
+    }
+
+    /// An elided write stays a valid write_file call for the same path, and
+    /// its content is exactly what the placeholder guard rejects — so an
+    /// imitation becomes a tool error, not a run-ending format failure.
+    #[test]
+    fn elided_write_is_a_valid_but_rejected_call() {
+        let mut msg = ChatMessage {
+            role: Role::Assistant,
+            content: "Creating the manifest.\n<tool_call>{\"name\": \"write_file\", \"arguments\": \
+                      {\"path\": \"Cargo.toml\", \"content\": \"[package]\\nname = \\\"x\\\"\\n\"}}</tool_call>"
+                .into(),
+        };
+        elide_write(&mut msg);
+        assert!(msg.content.starts_with("Creating the manifest.\n<tool_call>"));
+        let call = parse_tool_call(&msg.content).unwrap();
+        assert_eq!(call.name, "write_file");
+        assert_eq!(call.arg("path"), Some("Cargo.toml"));
+        let content = call.arg("content").unwrap();
+        assert!(content.contains("21 bytes"), "{content}");
+        assert!(looks_like_placeholder(content));
+        // Not a narrated write either: the nudge path must not fire on it.
+        assert!(!claims_fake_write(&msg.content));
+        // A turn without a call is left alone.
+        let mut plain = ChatMessage { role: Role::Assistant, content: "Done.".into() };
+        elide_write(&mut plain);
+        assert_eq!(plain.content, "Done.");
     }
 
     #[test]
