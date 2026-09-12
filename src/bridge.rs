@@ -218,7 +218,7 @@ fn answer_chat(
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if cmd_tx
         .send(LlmCmd::Generate {
-            messages,
+            messages: Arc::new(messages),
             reply: reply_tx,
             temp: 0.7,
             n_ctx,
@@ -386,18 +386,35 @@ fn run_agent(
     );
     let msg_id = send_message_id(base, token, chat_id, &format!("{head}\n\nstarting…"));
     // Remote runs auto-approve: nobody is at the approval prompt.
-    let run = if resuming {
-        match crate::agent::resume(workspace, cmd_tx, true, web_tools, n_ctx) {
-            Some(run) => run,
-            None => {
-                send_message(base, token, chat_id, "Nothing to resume.");
-                return;
-            }
+    let run = match crate::agent::launch(
+        active,
+        crate::agent::RunSource::Telegram,
+        workspace,
+        if resuming {
+            None
+        } else {
+            Some(task.to_string())
+        },
+        cmd_tx,
+        true,
+        web_tools,
+        n_ctx,
+    ) {
+        Ok(run) => run,
+        Err(crate::agent::LaunchError::NothingToResume) => {
+            send_message(base, token, chat_id, "Nothing to resume.");
+            return;
         }
-    } else {
-        crate::agent::start(workspace, task.to_string(), cmd_tx, true, web_tools, n_ctx)
+        Err(crate::agent::LaunchError::Busy(summary)) => {
+            send_message(
+                base,
+                token,
+                chat_id,
+                &format!("Busy — {summary}. /stop aborts it."),
+            );
+            return;
+        }
     };
-    crate::agent::claim(active, crate::agent::RunSource::Telegram, task, &run);
 
     let mut lines: Vec<String> = Vec::new();
     let mut tokens = 0usize;

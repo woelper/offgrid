@@ -378,48 +378,38 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 ));
                 return;
             }
-            if let Some(summary) = crate::agent::run_summary(&ctx.active) {
-                let _ = request.respond(json_response(
-                    409,
-                    json!({"error": {"message": format!("busy — {summary}")}}),
-                ));
-                return;
-            }
             // Remote runs always auto-approve commands: there is no one at
             // the approval prompt. That is why LAN mode is opt-in.
-            let run = if resuming {
-                match crate::agent::resume(
-                    workspace.clone(),
-                    ctx.cmd_tx.clone(),
-                    true,
-                    web_tools,
-                    n_ctx,
-                ) {
-                    Some(run) => run,
-                    None => {
-                        let _ = request.respond(json_response(
-                            409,
-                            json!({"error": {"message": "no saved run to resume"}}),
-                        ));
-                        return;
-                    }
-                }
-            } else {
-                crate::agent::start(
-                    workspace.clone(),
-                    task.unwrap_or_default().to_string(),
-                    ctx.cmd_tx.clone(),
-                    true,
-                    web_tools,
-                    n_ctx,
-                )
-            };
-            crate::agent::claim(
+            let run = match crate::agent::launch(
                 &ctx.active,
                 crate::agent::RunSource::Api,
-                task.unwrap_or("(resumed)"),
-                &run,
-            );
+                workspace.clone(),
+                if resuming {
+                    None
+                } else {
+                    Some(task.unwrap_or_default().to_string())
+                },
+                ctx.cmd_tx.clone(),
+                true,
+                web_tools,
+                n_ctx,
+            ) {
+                Ok(run) => run,
+                Err(crate::agent::LaunchError::NothingToResume) => {
+                    let _ = request.respond(json_response(
+                        409,
+                        json!({"error": {"message": "no saved run to resume"}}),
+                    ));
+                    return;
+                }
+                Err(crate::agent::LaunchError::Busy(summary)) => {
+                    let _ = request.respond(json_response(
+                        409,
+                        json!({"error": {"message": format!("busy — {summary}")}}),
+                    ));
+                    return;
+                }
+            };
             *ctx.agent_info.lock().unwrap() = RunInfo::default();
             let active = ctx.active.clone();
             let info = ctx.agent_info.clone();
@@ -574,7 +564,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 );
             } else if cmd_tx
                 .send(LlmCmd::Generate {
-                    messages,
+                    messages: Arc::new(messages),
                     reply: reply_tx,
                     temp,
                     n_ctx,

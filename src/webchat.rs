@@ -76,7 +76,7 @@ pub fn spawn(
 
         if cmd_tx
             .send(LlmCmd::Generate {
-                messages,
+                messages: Arc::new(messages),
                 reply: event_tx.clone(),
                 temp,
                 n_ctx,
@@ -162,7 +162,7 @@ fn run_turn(
     let (tx, rx) = std::sync::mpsc::channel();
     cmd_tx
         .send(LlmCmd::Generate {
-            messages: messages.to_vec(),
+            messages: Arc::new(messages.to_vec()),
             reply: tx,
             temp: ROUTER_TEMP,
             n_ctx,

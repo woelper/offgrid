@@ -192,6 +192,26 @@ pub fn snapshot(conv: &Conversation) -> Vec<ChatMessage> {
     conv.lock().unwrap().clone()
 }
 
+/// Cheap change detector for the shared conversation: enough for a frontend to
+/// tell whether its cached [`snapshot`] is stale without cloning every message
+/// on every frame. Order- and length-sensitive (FNV over roles and content
+/// lengths), so trimming the oldest turn while appending a new one is seen
+/// even when the message count is unchanged.
+pub fn fingerprint(conv: &Conversation) -> u64 {
+    let c = conv.lock().unwrap();
+    let mut h = 0xcbf29ce484222325u64;
+    for m in c.iter() {
+        let role = match &m.role {
+            Role::System => 1u64,
+            Role::User => 2,
+            Role::Assistant => 3,
+        };
+        h = (h ^ role).wrapping_mul(0x100000001b3);
+        h = (h ^ m.content.len() as u64).wrapping_mul(0x100000001b3);
+    }
+    h ^ c.len() as u64
+}
+
 pub fn clear(conv: &Conversation) {
     conv.lock().unwrap().clear();
 }

@@ -2,6 +2,7 @@
 //! the LLM worker. Tool calls are prompt-based (`<tool_call>{json}</tool_call>`,
 //! the format Qwen models are trained on) so any GGUF chat model can be used.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -311,6 +312,55 @@ pub fn resume(
     ))
 }
 
+/// Why a run could not be launched.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// Another frontend already owns the single run slot. Carries its summary.
+    Busy(String),
+    /// The workspace holds no interrupted run to resume.
+    NothingToResume,
+}
+
+/// The one way every frontend starts an agent run: `task == Some` starts
+/// fresh, `None` resumes the workspace's saved run. Claims the single run slot
+/// before returning, so a caller cannot forget to and the run is visible to
+/// every other frontend (`/stop`, `/status`) from the moment it starts.
+#[allow(clippy::too_many_arguments)]
+pub fn launch(
+    active: &ActiveRun,
+    source: RunSource,
+    workspace: PathBuf,
+    task: Option<String>,
+    cmd_tx: Sender<LlmCmd>,
+    auto_approve: bool,
+    web_tools: bool,
+    n_ctx: u32,
+) -> Result<AgentRun, LaunchError> {
+    if let Some(summary) = run_summary(active) {
+        return Err(LaunchError::Busy(summary));
+    }
+    // A human label for the slot: the task's first line, or the saved run's.
+    let label = match &task {
+        Some(task) => task.lines().next().unwrap_or(task).to_string(),
+        None => saved_run(&workspace)
+            .and_then(|s| s.task.lines().next().map(str::to_string))
+            .unwrap_or_else(|| "(resumed)".into()),
+    };
+    let run = match task {
+        Some(task) => start(workspace, task, cmd_tx, auto_approve, web_tools, n_ctx),
+        None => resume(workspace, cmd_tx, auto_approve, web_tools, n_ctx)
+            .ok_or(LaunchError::NothingToResume)?,
+    };
+    if !claim(active, source, &label, &run) {
+        // Lost the race for the slot: stop the orphan so it cannot run untracked.
+        run.stop.store(true, Ordering::Relaxed);
+        return Err(LaunchError::Busy(
+            run_summary(active).unwrap_or_else(|| "another run".into()),
+        ));
+    }
+    Ok(run)
+}
+
 fn spawn(
     workspace: PathBuf,
     task: Option<String>,
@@ -349,107 +399,208 @@ fn spawn(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_loop(
-    workspace: &Path,
-    task: Option<String>,
-    cmd_tx: &Sender<LlmCmd>,
-    tx: &Sender<AgentEvent>,
-    stop: &AtomicBool,
-    auto_approve: &AtomicBool,
-    inbox: &Inbox,
+/// Outcome of one generation request.
+enum Gen {
+    /// The model produced a reply.
+    Reply(String),
+    /// The context was full, the transcript was compacted, retry the turn.
+    Compacted,
+}
+
+/// What to do after a reply that contained no tool call.
+enum NoCall {
+    /// A corrective turn was appended; keep going.
+    Nudged,
+    /// The task finished cleanly.
+    Done,
+    /// Too many malformed replies; stop and record why.
+    GiveUp(String),
+}
+
+/// Whether the turn loop should continue or stop.
+#[derive(PartialEq, Eq)]
+enum Step {
+    Continue,
+    Break,
+}
+
+/// One agent run: the transcript, the loop-breaker state and the helpers that
+/// advance a single turn. A struct rather than a 500-line function so each
+/// phase — generate, handle a reply, execute a call — reads on its own.
+struct Run<'a> {
+    workspace: &'a Path,
+    task: String,
+    cmd_tx: &'a Sender<LlmCmd>,
+    tx: &'a Sender<AgentEvent>,
+    stop: &'a AtomicBool,
+    auto_approve: &'a AtomicBool,
+    inbox: &'a Inbox,
     web_tools: bool,
     n_ctx: u32,
-) -> Result<(), String> {
-    let mut log = SessionLog::new();
-    let _ = tx.send(AgentEvent::Info(format!(
-        "session log: {}",
-        log.path.display()
-    )));
-    // A resume picks up the saved transcript; anything else starts fresh.
-    // Files are already on disk and the counters restart harmlessly — the
-    // transcript is the whole state.
-    let (task, mut messages, resumed_turns) = match task {
-        Some(task) => {
-            let messages = vec![
-                ChatMessage {
-                    role: Role::System,
-                    content: system_prompt(workspace, web_tools),
-                },
-                ChatMessage {
-                    role: Role::User,
-                    content: task.clone(),
-                },
-            ];
-            (task, messages, 0)
+    log: SessionLog,
+    messages: Arc<Vec<ChatMessage>>,
+    resumed_turns: usize,
+
+    /// Paths written during the run, for the history entry.
+    files_touched: Vec<String>,
+    /// Paths read since their last write; overwriting one not in here is
+    /// rejected (see `write_gate`).
+    fresh_reads: HashSet<PathBuf>,
+    /// False while file changes have not been followed by a successful
+    /// `run_command`; finishing in that state gets one corrective nudge.
+    verified_since_write: bool,
+    verify_nudged: bool,
+    /// Consecutive failures per exact command string.
+    cmd_fails: HashMap<String, usize>,
+    /// The exact same tool call failing again and again: first break the
+    /// template it is copying, then give up.
+    same_fail: Option<(String, String)>,
+    same_fail_count: usize,
+    /// Indices of web tool responses; compaction trims these last.
+    web_msgs: HashSet<usize>,
+    /// Indices of assistant turns whose `write_file` call is still verbatim.
+    intact_writes: Vec<usize>,
+    /// Consecutive replies with a broken or narrated tool call.
+    format_retries: usize,
+    proceed_nudged: bool,
+    abort_reason: Option<String>,
+    compact_level: usize,
+    turns_taken: usize,
+}
+
+impl<'a> Run<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        workspace: &'a Path,
+        task: Option<String>,
+        cmd_tx: &'a Sender<LlmCmd>,
+        tx: &'a Sender<AgentEvent>,
+        stop: &'a AtomicBool,
+        auto_approve: &'a AtomicBool,
+        inbox: &'a Inbox,
+        web_tools: bool,
+        n_ctx: u32,
+    ) -> Result<Self, String> {
+        let mut log = SessionLog::new();
+        let _ = tx.send(AgentEvent::Info(format!(
+            "session log: {}",
+            log.path.display()
+        )));
+        // A resume picks up the saved transcript; anything else starts fresh.
+        // Files are already on disk and the counters restart harmlessly — the
+        // transcript is the whole state.
+        let (task, messages, resumed_turns) = match task {
+            Some(task) => {
+                let messages = vec![
+                    ChatMessage {
+                        role: Role::System,
+                        content: system_prompt(workspace, web_tools),
+                    },
+                    ChatMessage {
+                        role: Role::User,
+                        content: task.clone(),
+                    },
+                ];
+                (task, messages, 0)
+            }
+            None => {
+                let mut saved = saved_run(workspace).ok_or("no saved run to resume")?;
+                let _ = tx.send(AgentEvent::Info(format!(
+                    "resuming after {} turns: {}",
+                    saved.turns,
+                    saved.task.lines().next().unwrap_or_default()
+                )));
+                upgrade_legacy_stubs(&mut saved.messages);
+                (saved.task, saved.messages, saved.turns)
+            }
+        };
+        log.log("SYSTEM PROMPT", &messages[0].content);
+        log.log("TASK", &task);
+        if recent_history(workspace).is_some() {
+            let _ = tx.send(AgentEvent::Info(
+                "project history from earlier sessions injected into context".into(),
+            ));
         }
-        None => {
-            let mut saved = saved_run(workspace).ok_or("no saved run to resume")?;
-            let _ = tx.send(AgentEvent::Info(format!(
-                "resuming after {} turns: {}",
-                saved.turns,
-                saved.task.lines().next().unwrap_or_default()
-            )));
-            upgrade_legacy_stubs(&mut saved.messages);
-            (saved.task, saved.messages, saved.turns)
-        }
-    };
-    let task = task.as_str();
-    log.log("SYSTEM PROMPT", &messages[0].content);
-    log.log("TASK", task);
-    if recent_history(workspace).is_some() {
-        let _ = tx.send(AgentEvent::Info(
-            "project history from earlier sessions injected into context".into(),
-        ));
+        Ok(Self {
+            workspace,
+            task,
+            cmd_tx,
+            tx,
+            stop,
+            auto_approve,
+            inbox,
+            web_tools,
+            n_ctx,
+            log,
+            messages: Arc::new(messages),
+            resumed_turns,
+            files_touched: Vec::new(),
+            fresh_reads: HashSet::new(),
+            verified_since_write: true,
+            verify_nudged: false,
+            cmd_fails: HashMap::new(),
+            same_fail: None,
+            same_fail_count: 0,
+            web_msgs: HashSet::new(),
+            intact_writes: Vec::new(),
+            format_retries: 0,
+            proceed_nudged: false,
+            abort_reason: None,
+            compact_level: 0,
+            turns_taken: 0,
+        })
     }
-    let mut files_touched: Vec<String> = Vec::new();
-    // Paths the model has read since their last write. Overwriting a file
-    // that is not in here is rejected (see write_gate).
-    let mut fresh_reads: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    // False while file changes have not been followed by a successful
-    // run_command — finishing in that state gets one corrective nudge.
-    let mut verified_since_write = true;
-    let mut verify_nudged = false;
 
-    // Consecutive failures per exact command string. A command failing over
-    // and over means the model is cycling through from-memory guesses (a real
-    // run burned 34 turns re-trying eframe API variants while the compiler
-    // printed the exact fix three times).
-    let mut cmd_fails: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    // The exact same tool call failing again and again (a real run sent
-    // one placeholder write nine times in a row): first break the template
-    // it is copying, then give up.
-    let mut same_fail: Option<(String, String)> = None;
-    let mut same_fail_count = 0usize;
-    // Indices of web_search/fetch_url responses in `messages` — compaction
-    // trims these last (expensive to re-acquire). Messages are only ever
-    // edited in place, never removed, so indices stay valid.
-    let mut web_msgs: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    // Indices of assistant turns whose write_file call is still verbatim.
-    // The newest KEEP_FULL_WRITES stay intact so the model always sees real
-    // examples of its own calls; older ones get elided (see elide_write).
-    let mut intact_writes: Vec<usize> = Vec::new();
+    fn run(&mut self) -> Result<(), String> {
+        for iteration in 1..=MAX_ITERATIONS {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
+            self.turns_taken = iteration;
+            self.drain_inbox();
+            self.elide_old_writes();
 
-    // Consecutive replies with a broken or narrated tool call. Reset by
-    // every parsable call, so an occasional slip does not eat a run-wide
-    // budget and silently end the session twenty turns later.
-    let mut format_retries = 0usize;
-    let mut proceed_nudged = false;
-    // Why the loop ended early, for the history entry and the frontends.
-    let mut abort_reason: Option<String> = None;
-    let mut compact_level = 0usize;
-    let mut turns_taken = 0usize;
-    for iteration in 1..=MAX_ITERATIONS {
-        if stop.load(Ordering::Relaxed) {
-            break;
+            let response = match self.generate()? {
+                Gen::Reply(response) => response,
+                Gen::Compacted => continue,
+            };
+            self.log.log(
+                &format!("MODEL RESPONSE (turn {iteration}, raw)"),
+                &response,
+            );
+            Arc::make_mut(&mut self.messages).push(ChatMessage {
+                role: Role::Assistant,
+                content: response.clone(),
+            });
+
+            let Some(call) = parse_tool_call(&response) else {
+                match self.handle_no_call(&response, iteration) {
+                    NoCall::Nudged => continue,
+                    NoCall::Done => return Ok(()),
+                    NoCall::GiveUp(reason) => {
+                        self.abort_reason = Some(reason);
+                        break;
+                    }
+                }
+            };
+            self.format_retries = 0;
+            if self.execute_call(&call) == Step::Break {
+                break;
+            }
         }
-        turns_taken = iteration;
-        // Instructions that arrived mid-run join the transcript here, where
-        // they read as the user speaking up between turns.
-        for note in inbox.lock().unwrap().drain(..) {
-            log.log("STEERING", &note);
-            let _ = tx.send(AgentEvent::Info(format!("new instruction: {note}")));
-            messages.push(ChatMessage {
+        self.finish();
+        Ok(())
+    }
+
+    /// Instructions that arrived mid-run join the transcript here, where they
+    /// read as the user speaking up between turns.
+    fn drain_inbox(&mut self) {
+        for note in self.inbox.lock().unwrap().drain(..) {
+            self.log.log("STEERING", &note);
+            let _ = self
+                .tx
+                .send(AgentEvent::Info(format!("new instruction: {note}")));
+            Arc::make_mut(&mut self.messages).push(ChatMessage {
                 role: Role::User,
                 content: format!(
                     "New instruction from the user — this takes priority over the \
@@ -457,39 +608,47 @@ fn run_loop(
                 ),
             });
         }
+    }
 
-        // Full write_file turns are the model's best examples of its own
-        // calls, and every elided one is a template it may copy instead of
-        // writing code (a real run did so on every third write). So keep
-        // them verbatim as long as the window allows, and only when the
-        // transcript passes three quarters of it elide the oldest, down to
-        // KEEP_FULL_WRITES. Roughly three characters per token for code.
+    /// Full `write_file` turns are the model's best examples of its own calls,
+    /// and every elided one is a template it may copy instead of writing code.
+    /// Keep them verbatim as long as the window allows, and only when the
+    /// transcript passes three quarters of it elide the oldest, down to
+    /// `KEEP_FULL_WRITES`. Roughly three characters per token for code.
+    fn elide_old_writes(&mut self) {
         let mut elided = 0;
-        while intact_writes.len() > KEEP_FULL_WRITES
-            && messages.iter().map(|m| m.content.len() / 3 + 8).sum::<usize>()
-                > n_ctx as usize * 3 / 4
+        while self.intact_writes.len() > KEEP_FULL_WRITES
+            && self.messages.iter().map(|m| m.content.len() / 3 + 8).sum::<usize>()
+                > self.n_ctx as usize * 3 / 4
         {
-            let idx = intact_writes.remove(0);
-            elide_write(&mut messages[idx]);
+            let idx = self.intact_writes.remove(0);
+            elide_write(&mut Arc::make_mut(&mut self.messages)[idx]);
             elided += 1;
         }
         if elided > 0 {
-            log.log("ELISION", &format!("{elided} older write_file turns elided to fit the window"));
+            self.log.log(
+                "ELISION",
+                &format!("{elided} older write_file turns elided to fit the window"),
+            );
         }
+    }
 
+    /// Send one generation request and pump its events, handling a context
+    /// overflow by compacting and asking the caller to retry.
+    fn generate(&mut self) -> Result<Gen, String> {
         // Temperature escalation: at 0.25 a small model reproduces the same
         // wrong pattern almost deterministically. Once a command has failed
         // three times in a row, add sampling variety to break the loop.
-        let stuck = cmd_fails.values().copied().max().unwrap_or(0);
+        let stuck = self.cmd_fails.values().copied().max().unwrap_or(0);
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        cmd_tx
+        self.cmd_tx
             .send(LlmCmd::Generate {
-                messages: messages.clone(),
+                messages: self.messages.clone(),
                 reply: reply_tx,
-                // Low temperature: agent runs need valid JSON and careful
-                // code much more than they need creative variety.
+                // Low temperature: agent runs need valid JSON and careful code
+                // much more than they need creative variety.
                 temp: if stuck >= 3 { 0.6 } else { 0.25 },
-                n_ctx,
+                n_ctx: self.n_ctx,
             })
             .map_err(|_| "LLM worker unavailable".to_string())?;
 
@@ -499,7 +658,7 @@ fn run_loop(
             match event {
                 LlmEvent::Token(t) => {
                     response.push_str(&t);
-                    let _ = tx.send(AgentEvent::Token(t));
+                    let _ = self.tx.send(AgentEvent::Token(t));
                 }
                 LlmEvent::GenDone => break,
                 LlmEvent::Error(e) => gen_error = Some(e),
@@ -508,7 +667,7 @@ fn run_loop(
                     gen_tokens,
                     ..
                 } => {
-                    let _ = tx.send(AgentEvent::Ctx(prompt_tokens + gen_tokens));
+                    let _ = self.tx.send(AgentEvent::Ctx(prompt_tokens + gen_tokens));
                 }
                 _ => {}
             }
@@ -516,23 +675,27 @@ fn run_loop(
         if let Some(e) = gen_error {
             // On context overflow, compact progressively harder and retry
             // instead of aborting the run.
-            // Levels 1–2 trim; level 3 drops the middle of the transcript
-            // and can repeat as long as there is a middle left to drop, so
-            // a long session keeps going instead of dying at the window.
-            let can_compact = compact_level < 3 || messages.len() > 2 + COMPACT_KEEP_RECENT;
+            let can_compact = self.compact_level < 3 || self.messages.len() > 2 + COMPACT_KEEP_RECENT;
             if e.starts_with("context window full") && can_compact {
-                compact_level = (compact_level + 1).min(3);
-                log.log("COMPACTION", &format!("level {}", compact_level));
-                compact_transcript(&mut messages, compact_level, &web_msgs, &files_touched);
-                if compact_level >= 3 {
+                self.compact_level = (self.compact_level + 1).min(3);
+                self.log
+                    .log("COMPACTION", &format!("level {}", self.compact_level));
+                compact_transcript(
+                    Arc::make_mut(&mut self.messages),
+                    self.compact_level,
+                    &self.web_msgs,
+                    &self.files_touched,
+                );
+                if self.compact_level >= 3 {
                     // Messages were removed: the index sets are stale.
-                    web_msgs.clear();
-                    intact_writes.clear();
+                    self.web_msgs.clear();
+                    self.intact_writes.clear();
                 }
-                let _ = tx.send(AgentEvent::Info(format!(
-                    "context window full — compacting transcript (level {compact_level}) and retrying"
+                let _ = self.tx.send(AgentEvent::Info(format!(
+                    "context window full — compacting transcript (level {}) and retrying",
+                    self.compact_level
                 )));
-                continue;
+                return Ok(Gen::Compacted);
             }
             let e = if e.starts_with("context window full") {
                 format!(
@@ -541,165 +704,161 @@ fn run_loop(
             } else {
                 e
             };
-            log.log("ERROR", &e);
+            self.log.log("ERROR", &e);
             return Err(e);
         }
-        let _ = tx.send(AgentEvent::TurnDone);
-        log.log(
-            &format!("MODEL RESPONSE (turn {iteration}, raw)"),
-            &response,
-        );
-        messages.push(ChatMessage {
-            role: Role::Assistant,
-            content: response.clone(),
-        });
+        let _ = self.tx.send(AgentEvent::TurnDone);
+        Ok(Gen::Reply(response))
+    }
 
-        let Some(call) = parse_tool_call(&response) else {
-            // A reply that clearly tried to call a tool but could not be
-            // parsed, or that narrates a write instead of calling write_file
-            // (the model imitating the transcript stub that replaces its
-            // earlier write_file turns — observed in the wild), gets a
-            // corrective nudge. Three such replies in a row end the run as
-            // interrupted, never as "done": nothing was finished.
-            let attempted = !dangling_tool_tag(&response)
-                && (response.contains("<tool_call>")
-                    || (response.contains("\"name\"") && response.contains("\"arguments\"")));
-            let fake_write = !attempted && claims_fake_write(&response);
-            if attempted || fake_write {
-                if format_retries >= 2 {
-                    let reason = format!(
-                        "{} consecutive replies with a broken or narrated tool call",
-                        format_retries + 1
-                    );
-                    log.log("GIVING UP", &reason);
-                    abort_reason = Some(reason);
-                    break;
-                }
-                format_retries += 1;
-                if attempted {
-                    log.log(
-                        "PARSE FAILURE",
-                        "response looked like a tool call but did not parse; nudging model",
-                    );
-                    let _ = tx.send(AgentEvent::Info(
-                        "tool call could not be parsed — asking the model to retry".into(),
-                    ));
-                    messages.push(ChatMessage {
-                        role: Role::User,
-                        content: "Your tool call could not be parsed. Emit exactly one call as \
-                                  <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
-                                  with valid JSON — or, if the task is finished, reply with a \
-                                  summary and no tool call."
-                            .into(),
-                    });
-                } else {
-                    log.log(
-                        "FAKE WRITE",
-                        "response narrates a write but no tool was called; nudging model",
-                    );
-                    let _ = tx.send(AgentEvent::Info(
-                        "model claimed a write without calling a tool — asking it to really write"
-                            .into(),
-                    ));
-                    messages.push(ChatMessage {
-                        role: Role::User,
-                        content: "You described writing a file, but no tool call was made and \
-                                  nothing was written to disk. Emit a real <tool_call> for \
-                                  write_file with the complete file content — or, if the task \
-                                  is truly finished and verified, reply with only a summary."
-                            .into(),
-                    });
-                }
-                continue;
-            }
-            // Asking for permission or preferences ends the turn with no
-            // tool call, which reads as "finished" — a real run stopped
-            // after two turns with "Would you like me to begin?". Nobody
-            // is there to answer, so say so once and let it decide.
-            if asks_the_user(&response) && !proceed_nudged {
-                proceed_nudged = true;
-                log.log(
-                    "ASKED USER",
-                    "model asked for confirmation instead of continuing; nudging model",
+    /// A reply with no tool call: nudge for a malformed one, or finish.
+    fn handle_no_call(&mut self, response: &str, iteration: usize) -> NoCall {
+        // A reply that clearly tried to call a tool but could not be parsed,
+        // or that narrates a write instead of calling write_file (the model
+        // imitating the transcript stub that replaces its earlier write_file
+        // turns — observed in the wild), gets a corrective nudge. Three such
+        // replies in a row end the run as interrupted, never as "done":
+        // nothing was finished.
+        let attempted = !dangling_tool_tag(response)
+            && (response.contains("<tool_call>")
+                || (response.contains("\"name\"") && response.contains("\"arguments\"")));
+        let fake_write = !attempted && claims_fake_write(response);
+        if attempted || fake_write {
+            if self.format_retries >= 2 {
+                let reason = format!(
+                    "{} consecutive replies with a broken or narrated tool call",
+                    self.format_retries + 1
                 );
-                let _ = tx.send(AgentEvent::Info(
-                    "model asked for permission — telling it to decide and continue".into(),
+                self.log.log("GIVING UP", &reason);
+                return NoCall::GiveUp(reason);
+            }
+            self.format_retries += 1;
+            if attempted {
+                self.log.log(
+                    "PARSE FAILURE",
+                    "response looked like a tool call but did not parse; nudging model",
+                );
+                let _ = self.tx.send(AgentEvent::Info(
+                    "tool call could not be parsed — asking the model to retry".into(),
                 ));
-                messages.push(ChatMessage {
+                Arc::make_mut(&mut self.messages).push(ChatMessage {
                     role: Role::User,
-                    content: "Nobody is watching this run, so questions cannot be answered. \
-                              Do not ask for confirmation or preferences: make the decision \
-                              yourself and continue the task with a tool call now. Reply \
-                              without a tool call only when the whole task is complete."
+                    content: "Your tool call could not be parsed. Emit exactly one call as \
+                              <tool_call>{\"name\": \"tool_name\", \"arguments\": {...}}</tool_call> \
+                              with valid JSON — or, if the task is finished, reply with a \
+                              summary and no tool call."
                         .into(),
                 });
-                continue;
-            }
-            // Finishing with unverified changes: files were written but no
-            // run_command has succeeded since. One nudge, then let it end.
-            if !verified_since_write && !verify_nudged {
-                verify_nudged = true;
-                log.log(
-                    "UNVERIFIED FINISH",
-                    "model tried to finish with unverified file changes; nudging model",
+            } else {
+                self.log.log(
+                    "FAKE WRITE",
+                    "response narrates a write but no tool was called; nudging model",
                 );
-                let _ = tx.send(AgentEvent::Info(
-                    "files were changed but never verified — asking the model to run a check"
-                        .into(),
+                let _ = self.tx.send(AgentEvent::Info(
+                    "model claimed a write without calling a tool — asking it to really write".into(),
                 ));
-                messages.push(ChatMessage {
+                Arc::make_mut(&mut self.messages).push(ChatMessage {
                     role: Role::User,
-                    content: "You have written files since the last successful run_command, \
-                              so the changes are unverified. Run the project's check, build, \
-                              or tests with run_command now and fix any errors. Only finish \
-                              after the command succeeds."
+                    content: "You described writing a file, but no tool call was made and \
+                              nothing was written to disk. Emit a real <tool_call> for \
+                              write_file with the complete file content — or, if the task \
+                              is truly finished and verified, reply with only a summary."
                         .into(),
                 });
-                continue;
             }
-            let summary = response.trim_end().trim_end_matches("<tool_call>").trim();
-            if !summary.is_empty() {
-                append_history(workspace, "Done", task, summary, &files_touched);
-            }
-            clear_saved_run(workspace);
-            log.log("DONE", &format!("finished after {iteration} turns"));
-            let _ = tx.send(AgentEvent::Done {
-                iterations: iteration,
+            return NoCall::Nudged;
+        }
+        // Asking for permission or preferences ends the turn with no tool
+        // call, which reads as "finished" — a real run stopped after two turns
+        // with "Would you like me to begin?". Nobody is there to answer, so
+        // say so once and let it decide.
+        if asks_the_user(response) && !self.proceed_nudged {
+            self.proceed_nudged = true;
+            self.log.log(
+                "ASKED USER",
+                "model asked for confirmation instead of continuing; nudging model",
+            );
+            let _ = self.tx.send(AgentEvent::Info(
+                "model asked for permission — telling it to decide and continue".into(),
+            ));
+            Arc::make_mut(&mut self.messages).push(ChatMessage {
+                role: Role::User,
+                content: "Nobody is watching this run, so questions cannot be answered. \
+                          Do not ask for confirmation or preferences: make the decision \
+                          yourself and continue the task with a tool call now. Reply \
+                          without a tool call only when the whole task is complete."
+                    .into(),
             });
-            return Ok(());
-        };
-        format_retries = 0;
+            return NoCall::Nudged;
+        }
+        // Finishing with unverified changes: files were written but no
+        // run_command has succeeded since. One nudge, then let it end.
+        if !self.verified_since_write && !self.verify_nudged {
+            self.verify_nudged = true;
+            self.log.log(
+                "UNVERIFIED FINISH",
+                "model tried to finish with unverified file changes; nudging model",
+            );
+            let _ = self.tx.send(AgentEvent::Info(
+                "files were changed but never verified — asking the model to run a check".into(),
+            ));
+            Arc::make_mut(&mut self.messages).push(ChatMessage {
+                role: Role::User,
+                content: "You have written files since the last successful run_command, \
+                          so the changes are unverified. Run the project's check, build, \
+                          or tests with run_command now and fix any errors. Only finish \
+                          after the command succeeds."
+                    .into(),
+            });
+            return NoCall::Nudged;
+        }
+        let summary = response.trim_end().trim_end_matches("<tool_call>").trim();
+        if !summary.is_empty() {
+            append_history(self.workspace, "Done", &self.task, summary, &self.files_touched);
+        }
+        clear_saved_run(self.workspace);
+        self.log
+            .log("DONE", &format!("finished after {iteration} turns"));
+        let _ = self.tx.send(AgentEvent::Done {
+            iterations: iteration,
+        });
+        NoCall::Done
+    }
 
-        log.log("TOOL CALL", &format!("{}: {}", call.name, call.arguments));
-        let _ = tx.send(AgentEvent::ToolCall {
+    /// Execute one parsed tool call and fold its output back into the
+    /// transcript, updating the loop-breaker and verification state.
+    fn execute_call(&mut self, call: &ToolCall) -> Step {
+        self.log
+            .log("TOOL CALL", &format!("{}: {}", call.name, call.arguments));
+        let _ = self.tx.send(AgentEvent::ToolCall {
             name: call.name.clone(),
             summary: call.summary(),
         });
 
-        let output = if let Some(gate) = write_gate(&call, workspace, &fresh_reads) {
-            // The gate served the file's content — that counts as a read,
-            // so the model's immediate retry of the write goes through.
-            if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
-                fresh_reads.insert(p);
+        let output = if let Some(gate) = write_gate(call, self.workspace, &self.fresh_reads) {
+            // The gate served the file's content — that counts as a read, so
+            // the model's immediate retry of the write goes through.
+            if let Ok(p) = resolve(self.workspace, call.arg("path").unwrap_or("")) {
+                self.fresh_reads.insert(p);
             }
             gate
-        } else if call.name == "run_command" && !auto_approve.load(Ordering::Relaxed) {
+        } else if call.name == "run_command" && !self.auto_approve.load(Ordering::Relaxed) {
             let command = call.arg("command").unwrap_or_default().to_string();
             let (approve_tx, approve_rx) = std::sync::mpsc::channel();
-            let _ = tx.send(AgentEvent::NeedsApproval {
+            let _ = self.tx.send(AgentEvent::NeedsApproval {
                 command,
                 reply: approve_tx,
             });
             match approve_rx.recv() {
-                Ok(true) => execute(&call, workspace, web_tools),
+                Ok(true) => execute(call, self.workspace, self.web_tools),
                 Ok(false) => "Command denied by the user.".to_string(),
-                Err(_) => break, // UI went away / run aborted
+                Err(_) => return Step::Break, // UI went away / run aborted
             }
         } else {
-            execute(&call, workspace, web_tools)
+            execute(call, self.workspace, self.web_tools)
         };
-        if stop.load(Ordering::Relaxed) {
-            break;
+        if self.stop.load(Ordering::Relaxed) {
+            return Step::Break;
         }
 
         let mut output = output;
@@ -732,52 +891,56 @@ fn run_loop(
         if ok
             && call.name == "write_file"
             && let Some(path) = call.arg("path")
-            && !files_touched.iter().any(|f| f == path)
+            && !self.files_touched.iter().any(|f| f == path)
         {
-            files_touched.push(path.to_string());
+            self.files_touched.push(path.to_string());
         }
         if ok {
-            same_fail = None;
-            same_fail_count = 0;
+            self.same_fail = None;
+            self.same_fail_count = 0;
         } else {
             let key = (call.name.clone(), call.arguments.to_string());
-            if same_fail.as_ref() == Some(&key) {
-                same_fail_count += 1;
+            if self.same_fail.as_ref() == Some(&key) {
+                self.same_fail_count += 1;
             } else {
-                same_fail = Some(key);
-                same_fail_count = 1;
+                self.same_fail = Some(key);
+                self.same_fail_count = 1;
             }
-            if same_fail_count >= SAME_FAIL_GIVE_UP {
+            if self.same_fail_count >= SAME_FAIL_GIVE_UP {
                 let reason = format!(
-                    "the same failing {} call was repeated {same_fail_count} times",
-                    call.name
+                    "the same failing {} call was repeated {} times",
+                    call.name, self.same_fail_count
                 );
-                log.log("GIVING UP", &reason);
-                abort_reason = Some(reason);
-                break;
+                self.log.log("GIVING UP", &reason);
+                self.abort_reason = Some(reason);
+                return Step::Break;
             }
-            if same_fail_count >= 3
+            if self.same_fail_count >= 3
                 && call.name == "write_file"
                 && call.arg("content").is_some_and(looks_like_placeholder)
                 && let Some(path) = call.arg("path")
             {
-                // Remove every elided write of this path from the
-                // transcript: as long as one is in context, the model
-                // copies it instead of writing code.
-                let dropped = purge_elided_writes(&mut messages, path);
+                // Remove every elided write of this path from the transcript:
+                // as long as one is in context, the model copies it instead
+                // of writing code.
+                let dropped = purge_elided_writes(Arc::make_mut(&mut self.messages), path);
                 if dropped > 0 {
-                    web_msgs.clear();
-                    intact_writes.clear();
+                    self.web_msgs.clear();
+                    self.intact_writes.clear();
                 }
-                log.log(
+                self.log.log(
                     "PLACEHOLDER LOOP",
-                    &format!("{same_fail_count}× placeholder write of {path}; dropped {dropped} elided turns"),
+                    &format!(
+                        "{same_fail_count}× placeholder write of {path}; dropped {dropped} elided turns",
+                        same_fail_count = self.same_fail_count
+                    ),
                 );
                 output.push_str(&format!(
-                    "\n\n[guidance: you have sent this same failing call {same_fail_count} times. \
+                    "\n\n[guidance: you have sent this same failing call {} times. \
                      The content is a transcript placeholder, not source code, and every \
                      earlier write of {path} has now been removed from this transcript. \
-                     Write the COMPLETE file from scratch now, as real code.]"
+                     Write the COMPLETE file from scratch now, as real code.]",
+                    self.same_fail_count
                 ));
             }
         }
@@ -786,21 +949,21 @@ fn run_loop(
         if ok {
             match call.name.as_str() {
                 "read_file" => {
-                    if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
-                        fresh_reads.insert(p);
+                    if let Ok(p) = resolve(self.workspace, call.arg("path").unwrap_or("")) {
+                        self.fresh_reads.insert(p);
                     }
                 }
                 "write_file" => {
-                    if let Ok(p) = resolve(workspace, call.arg("path").unwrap_or("")) {
-                        fresh_reads.remove(&p);
+                    if let Ok(p) = resolve(self.workspace, call.arg("path").unwrap_or("")) {
+                        self.fresh_reads.remove(&p);
                     }
-                    verified_since_write = false;
+                    self.verified_since_write = false;
                 }
-                // A timed-out command (e.g. a GUI smoke test) is a fine
-                // signal but not *verification* — that still takes a check
-                // or test that actually exits successfully.
+                // A timed-out command (e.g. a GUI smoke test) is a fine signal
+                // but not *verification* — that still takes a check or test
+                // that actually exits successfully.
                 "run_command" if !output.contains(TIMEOUT_KILL_NOTE) => {
-                    verified_since_write = true;
+                    self.verified_since_write = true;
                 }
                 _ => {}
             }
@@ -811,9 +974,9 @@ fn run_loop(
         if call.name == "run_command" {
             let command = call.arg("command").unwrap_or("").to_string();
             if ok {
-                cmd_fails.remove(&command);
+                self.cmd_fails.remove(&command);
             } else {
-                let n = cmd_fails.entry(command).or_insert(0);
+                let n = self.cmd_fails.entry(command).or_insert(0);
                 *n += 1;
                 if *n >= 3 {
                     let help = extract_help_suggestion(&output)
@@ -824,7 +987,7 @@ fn run_loop(
                             )
                         })
                         .unwrap_or_default();
-                    let web = if web_tools {
+                    let web = if self.web_tools {
                         " You have web access: call web_search with the first error \
                          line and the library name/version to find the correct usage, \
                          and fetch docs at the EXACT version your project pins — never \
@@ -843,56 +1006,97 @@ fn run_loop(
         }
         // Remember where the full write_file turns are; they are elided
         // lazily, before a generation, only once the transcript nears the
-        // window (see the top of the loop).
-        if ok && call.name == "write_file" && messages.last().is_some_and(|m| m.role == Role::Assistant)
+        // window (see `elide_old_writes`).
+        if ok
+            && call.name == "write_file"
+            && self.messages.last().is_some_and(|m| m.role == Role::Assistant)
         {
-            intact_writes.push(messages.len() - 1);
+            self.intact_writes.push(self.messages.len() - 1);
         }
         if output.is_empty() {
             // Commands like cp/rm succeed silently — say so explicitly, for
             // both the transcript and the model.
             output = "(no output — completed successfully)".to_string();
         }
-        log.log(&format!("TOOL RESULT (ok={ok})"), &output);
-        let _ = tx.send(AgentEvent::ToolResult {
+        self.log
+            .log(&format!("TOOL RESULT (ok={ok})"), &output);
+        let _ = self.tx.send(AgentEvent::ToolResult {
             output: output.clone(),
             ok,
         });
-        messages.push(ChatMessage {
+        Arc::make_mut(&mut self.messages).push(ChatMessage {
             role: Role::User,
             content: format!("<tool_response>\n{output}\n</tool_response>"),
         });
         if matches!(call.name.as_str(), "web_search" | "fetch_url") && ok {
-            web_msgs.insert(messages.len() - 1);
+            self.web_msgs.insert(self.messages.len() - 1);
         }
         // Checkpoint: the transcript on disk is what a resume picks up.
-        save_run(workspace, task, resumed_turns + turns_taken, &messages);
+        save_run(
+            self.workspace,
+            &self.task,
+            self.resumed_turns + self.turns_taken,
+            &self.messages,
+        );
+        Step::Continue
     }
 
-    // Stopped or out of turns: the clean-finish path above writes its own
-    // entry, so anything reaching here is unfinished. Record it anyway —
-    // otherwise the next run sees changed files with no idea why, which is
-    // worse than knowing the work was cut short.
-    if turns_taken > 0 {
-        let total = resumed_turns + turns_taken;
-        let summary = if stop.load(Ordering::Relaxed) {
-            format!("STOPPED by the user after {total} turns — task NOT finished (resumable).")
-        } else if let Some(reason) = &abort_reason {
-            format!("GAVE UP after {total} turns: {reason} — task NOT finished (resumable).")
-        } else {
-            format!(
-                "Hit the {MAX_ITERATIONS}-turn limit after {total} turns — task NOT \
-                 finished (resumable)."
-            )
-        };
-        log.log("INTERRUPTED", &summary);
-        let _ = tx.send(AgentEvent::Info(summary.clone()));
-        append_history(workspace, "Interrupted", task, &summary, &files_touched);
+    /// Stopped or out of turns: the clean-finish path writes its own entry, so
+    /// anything reaching here is unfinished. Record it anyway — otherwise the
+    /// next run sees changed files with no idea why.
+    fn finish(&mut self) {
+        if self.turns_taken > 0 {
+            let total = self.resumed_turns + self.turns_taken;
+            let summary = if self.stop.load(Ordering::Relaxed) {
+                format!("STOPPED by the user after {total} turns — task NOT finished (resumable).")
+            } else if let Some(reason) = &self.abort_reason {
+                format!("GAVE UP after {total} turns: {reason} — task NOT finished (resumable).")
+            } else {
+                format!(
+                    "Hit the {MAX_ITERATIONS}-turn limit after {total} turns — task NOT \
+                     finished (resumable)."
+                )
+            };
+            self.log.log("INTERRUPTED", &summary);
+            let _ = self.tx.send(AgentEvent::Info(summary.clone()));
+            append_history(
+                self.workspace,
+                "Interrupted",
+                &self.task,
+                &summary,
+                &self.files_touched,
+            );
+        }
+        let _ = self.tx.send(AgentEvent::Done {
+            iterations: self.turns_taken,
+        });
     }
-    let _ = tx.send(AgentEvent::Done {
-        iterations: turns_taken,
-    });
-    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop(
+    workspace: &Path,
+    task: Option<String>,
+    cmd_tx: &Sender<LlmCmd>,
+    tx: &Sender<AgentEvent>,
+    stop: &AtomicBool,
+    auto_approve: &AtomicBool,
+    inbox: &Inbox,
+    web_tools: bool,
+    n_ctx: u32,
+) -> Result<(), String> {
+    Run::new(
+        workspace,
+        task,
+        cmd_tx,
+        tx,
+        stop,
+        auto_approve,
+        inbox,
+        web_tools,
+        n_ctx,
+    )?
+    .run()
 }
 
 /// A bare trailing `<tool_call>` with nothing after it — a tic some models

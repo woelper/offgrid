@@ -39,6 +39,13 @@ fn tool_icon(name: &str) -> egui::ImageSource<'static> {
     }
 }
 
+fn launch_error_text(e: agent::LaunchError) -> String {
+    match e {
+        agent::LaunchError::Busy(summary) => format!("Another run is active ({summary})"),
+        agent::LaunchError::NothingToResume => "Nothing to resume".into(),
+    }
+}
+
 /// Cheap virtualization for long, variable-height lists: rows scrolled out
 /// of view are replaced by spacers of their last measured height, so
 /// markdown parsing and syntax highlighting only run for visible rows.
@@ -175,6 +182,10 @@ pub struct OffgridApp {
     /// pre-pass runs and no tokens are streaming yet.
     web_note: Option<String>,
     hl_memo: HighlightMemo,
+    /// The conversation as of `chat_fp`. Refreshed only when the fingerprint
+    /// changes, so unchanged frames do not deep-clone every message.
+    chat_snapshot: Vec<llm::ChatMessage>,
+    chat_fp: u64,
 }
 
 impl OffgridApp {
@@ -270,6 +281,8 @@ impl OffgridApp {
             chat_web: false,
             web_note: None,
             hl_memo: HighlightMemo::default(),
+            chat_snapshot: Vec::new(),
+            chat_fp: 0,
         };
         if app.config.server_enabled {
             app.start_server();
@@ -557,7 +570,7 @@ impl OffgridApp {
             );
         } else {
             let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
-                messages: session::snapshot(&self.chat),
+                messages: Arc::new(session::snapshot(&self.chat)),
                 reply: self.llm.event_tx.clone(),
                 temp: 0.7,
                 n_ctx: self.n_ctx(),
@@ -778,7 +791,7 @@ impl OffgridApp {
                 |ui| {
                     ui.horizontal(|ui| {
                         if self.model_loading {
-                            ui.spinner();
+                            theme::spinner(ui);
                             ui.label("loading model…");
                         } else if let Some(name) = self.loaded_model.clone() {
                             theme::icon(ui, theme::icons().model.clone(), 18.0);
@@ -856,39 +869,62 @@ impl OffgridApp {
                     }
                 }
 
+                // A transfer that failed this session and an orphaned `.part`
+                // from an earlier one need the same decision, so they share one
+                // list instead of two near-identical UI blocks.
+                struct NeedsAction {
+                    file: String,
+                    repo: String,
+                    path: String,
+                    size: u64,
+                    status: String,
+                    /// True for a failure (`bad` colour) vs. an interrupt (`warn`).
+                    failed: bool,
+                    /// Index into `self.downloads`, to drop it on discard.
+                    active: Option<usize>,
+                }
+                let mut needs_action: Vec<NeedsAction> = Vec::new();
+                for (i, dl) in self.downloads.iter().enumerate() {
+                    if let Some(err) = &dl.failed {
+                        needs_action.push(NeedsAction {
+                            file: dl.file.clone(),
+                            repo: dl.repo.clone(),
+                            path: dl.path.clone(),
+                            size: dl.total,
+                            status: format!("interrupted: {err}"),
+                            failed: true,
+                            active: Some(i),
+                        });
+                    }
+                }
+                for part in &self.interrupted {
+                    if self.is_downloading(&part.file) {
+                        continue;
+                    }
+                    needs_action.push(NeedsAction {
+                        file: part.file.clone(),
+                        repo: part.meta.repo.clone(),
+                        path: part.meta.path.clone(),
+                        size: part.meta.size,
+                        status: format!(
+                            "interrupted — {} of {} downloaded",
+                            fmt_bytes(part.bytes),
+                            fmt_bytes(part.meta.size)
+                        ),
+                        failed: false,
+                        active: None,
+                    });
+                }
+
                 let mut resume: Option<(String, String, u64)> = None;
                 let mut discard: Option<usize> = None;
-                for (i, dl) in self.downloads.iter().enumerate() {
+                // Live downloads first: name, rate and ETA over a progress bar.
+                for dl in self.downloads.iter().filter(|d| d.failed.is_none()) {
                     let frac = if dl.total > 0 {
                         dl.bytes as f32 / dl.total as f32
                     } else {
                         0.0
                     };
-                    if let Some(err) = &dl.failed {
-                        ui.horizontal(|ui| {
-                            theme::icon(ui, theme::icons().download.clone(), 16.0);
-                            ui.add(egui::Label::new(&dl.file).truncate());
-                            ui.colored_label(
-                                theme::skin().bad,
-                                format!("interrupted: {err}"),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if theme::button(ui, None, "Discard").clicked() {
-                                        discard = Some(i);
-                                    }
-                                    if theme::button(ui, None, "Resume").clicked() {
-                                        resume =
-                                            Some((dl.repo.clone(), dl.path.clone(), dl.total));
-                                    }
-                                },
-                            );
-                        });
-                        theme::progress_bar(ui, frac);
-                        ui.add_space(4.0);
-                        continue;
-                    }
                     let elapsed = dl.started.elapsed().as_secs_f32();
                     let speed = dl.bytes.saturating_sub(dl.resumed_from) as f32 / elapsed.max(0.1);
                     let eta = if speed > 1.0 && dl.total > dl.bytes {
@@ -913,9 +949,32 @@ impl OffgridApp {
                     theme::progress_bar(ui, frac);
                     ui.add_space(4.0);
                 }
+                for (i, row) in needs_action.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        theme::icon(ui, theme::icons().download.clone(), 16.0);
+                        ui.add(egui::Label::new(&row.file).truncate());
+                        let color = if row.failed {
+                            theme::skin().bad
+                        } else {
+                            theme::skin().warn
+                        };
+                        ui.colored_label(color, &row.status);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::button(ui, None, "Discard").clicked() {
+                                discard = Some(i);
+                            }
+                            if theme::button(ui, None, "Resume").clicked() {
+                                resume = Some((row.repo.clone(), row.path.clone(), row.size));
+                            }
+                        });
+                    });
+                }
                 if let Some(i) = discard {
-                    let dl = self.downloads.remove(i);
-                    hub::discard_part(&self.models_dir, &dl.file);
+                    let row = &needs_action[i];
+                    if let Some(active) = row.active {
+                        self.downloads.remove(active);
+                    }
+                    hub::discard_part(&self.models_dir, &row.file);
                     self.rescan();
                 }
                 if let Some((repo, path, size)) = resume {
@@ -923,47 +982,6 @@ impl OffgridApp {
                         .retain(|d| file_basename(&d.path) != file_basename(&path));
                     self.downloads
                         .push(hub::start_download(&repo, &path, size, &self.models_dir));
-                }
-
-                // Partial downloads left over from earlier sessions.
-                let mut resume_part: Option<hub::PartMeta> = None;
-                let mut discard_part: Option<String> = None;
-                for part in &self.interrupted {
-                    if self.is_downloading(&part.file) {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        theme::icon(ui, theme::icons().download.clone(), 16.0);
-                        ui.add(egui::Label::new(&part.file).truncate());
-                        ui.colored_label(
-                            theme::skin().warn,
-                            format!(
-                                "interrupted — {} of {} downloaded",
-                                fmt_bytes(part.bytes),
-                                fmt_bytes(part.meta.size)
-                            ),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::button(ui, None, "Discard").clicked() {
-                                discard_part = Some(part.file.clone());
-                            }
-                            if theme::button(ui, None, "Resume").clicked() {
-                                resume_part = Some(part.meta.clone());
-                            }
-                        });
-                    });
-                }
-                if let Some(file) = discard_part {
-                    hub::discard_part(&self.models_dir, &file);
-                    self.rescan();
-                }
-                if let Some(meta) = resume_part {
-                    self.downloads.push(hub::start_download(
-                        &meta.repo,
-                        &meta.path,
-                        meta.size,
-                        &self.models_dir,
-                    ));
                     self.rescan();
                 }
             });
@@ -1011,7 +1029,7 @@ impl OffgridApp {
                             if downloaded {
                                 ui.weak("downloaded");
                             } else if downloading {
-                                ui.spinner();
+                                theme::spinner(ui);
                             } else {
                                 clicked_download = Self::download_button(ui);
                             }
@@ -1051,7 +1069,7 @@ impl OffgridApp {
                         );
                     }
                     if self.search_pending {
-                        ui.spinner();
+                        theme::spinner(ui);
                     }
                 });
                 ui.weak(
@@ -1134,7 +1152,7 @@ impl OffgridApp {
                                             if self.is_downloaded(&f.name) {
                                                 ui.weak("downloaded");
                                             } else if self.is_downloading(&f.name) {
-                                                ui.spinner();
+                                                theme::spinner(ui);
                                             } else if Self::download_button(ui) {
                                                 self.start_download(&repo.id, &f.name, f.size);
                                             }
@@ -1143,7 +1161,7 @@ impl OffgridApp {
                                     });
                             }
                             None => {
-                                ui.spinner();
+                                theme::spinner(ui);
                             }
                         }
                     });
@@ -1173,7 +1191,7 @@ impl OffgridApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if self.generating {
-                        ui.spinner();
+                        theme::spinner(ui);
                         if let Some(note) = &self.web_note {
                             // Pre-pass in flight: no tokens yet, so report the
                             // web activity instead of a misleading 0 tok/s.
@@ -1237,14 +1255,20 @@ impl OffgridApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            // Refresh the cached snapshot only when the conversation actually
+            // changed; the bridge mutating it mid-draw is fine, we pick the
+            // change up on the next frame via the fingerprint.
+            let fp = session::fingerprint(&self.chat);
+            if fp != self.chat_fp {
+                self.chat_snapshot = session::snapshot(&self.chat);
+                self.chat_fp = fp;
+            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut culler = std::mem::take(&mut self.chat_culler);
-                    // Cloned once per frame: the bridge may append to this
-                    // conversation from its own thread while we draw.
-                    let messages = session::snapshot(&self.chat);
+                    let messages = std::mem::take(&mut self.chat_snapshot);
                     culler.begin(ui, messages.len());
                     let len = messages.len();
                     for (i, msg) in messages.iter().enumerate() {
@@ -1267,6 +1291,7 @@ impl OffgridApp {
                         });
                     }
                     self.chat_culler = culler;
+                    self.chat_snapshot = messages;
                 });
         });
     }
@@ -1408,16 +1433,19 @@ impl OffgridApp {
                     self.agent_current.clear();
                     self.live_tokens = 0;
                     self.live_start = None;
-                    let run = agent::start(
+                    match agent::launch(
+                        &self.active_run,
+                        agent::RunSource::Ui,
                         ws,
-                        task.clone(),
+                        Some(task),
                         self.llm.cmd_tx.clone(),
                         self.agent_auto_approve,
                         self.config.web_tools,
                         self.n_ctx(),
-                    );
-                    agent::claim(&self.active_run, agent::RunSource::Ui, &task, &run);
-                    self.agent_run = Some(run);
+                    ) {
+                        Ok(run) => self.agent_run = Some(run),
+                        Err(e) => self.last_error = Some(launch_error_text(e)),
+                    }
                 }
                 // An interrupted run left its transcript behind: offer to
                 // pick it up instead of re-explaining the task.
@@ -1431,21 +1459,27 @@ impl OffgridApp {
                         .add_enabled(self.loaded_model.is_some(), egui::Button::new(label))
                         .on_hover_text(format!("Continue the interrupted run:\n{first}"))
                         .clicked()
-                        && let Some(run) = agent::resume(
+                    {
+                        match agent::launch(
+                            &self.active_run,
+                            agent::RunSource::Ui,
                             ws,
+                            None,
                             self.llm.cmd_tx.clone(),
                             self.agent_auto_approve,
                             self.config.web_tools,
                             self.n_ctx(),
-                        )
-                    {
-                        agent::claim(&self.active_run, agent::RunSource::Ui, &first, &run);
-                        self.agent_transcript
-                            .push(AgentItem::Info(format!("resuming: {first}")));
-                        self.agent_current.clear();
-                        self.live_tokens = 0;
-                        self.live_start = None;
-                        self.agent_run = Some(run);
+                        ) {
+                            Ok(run) => {
+                                self.agent_transcript
+                                    .push(AgentItem::Info(format!("resuming: {first}")));
+                                self.agent_current.clear();
+                                self.live_tokens = 0;
+                                self.live_start = None;
+                                self.agent_run = Some(run);
+                            }
+                            Err(e) => self.last_error = Some(launch_error_text(e)),
+                        }
                     }
                 }
                 if running {
@@ -1458,7 +1492,7 @@ impl OffgridApp {
                             let _ = reply.send(false);
                         }
                     }
-                    ui.spinner();
+                    theme::spinner(ui);
                     if let Some(start) = self.live_start {
                         let secs = start.elapsed().as_secs_f32().max(0.001);
                         ui.weak(format!("{:.1} tok/s", self.live_tokens as f32 / secs));

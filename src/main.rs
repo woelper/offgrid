@@ -254,10 +254,10 @@ fn smoke(agent_mode: bool) {
     handle
         .cmd_tx
         .send(llm::LlmCmd::Generate {
-            messages: vec![llm::ChatMessage {
+            messages: Arc::new(vec![llm::ChatMessage {
                 role: llm::Role::User,
                 content: "Reply with exactly: hello from offgrid".into(),
-            }],
+            }]),
             reply: reply_tx,
             temp: 0.7,
             n_ctx: llm::DEFAULT_N_CTX,

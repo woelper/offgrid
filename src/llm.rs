@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 /// Default context window; configurable in Settings. Prompt decoding is
 /// chunked, so a large window costs KV-cache memory but not batch memory.
@@ -43,9 +45,11 @@ pub enum LlmCmd {
     Load(PathBuf),
     Unload,
     /// Generation events (Token/GenDone/Error) are sent to `reply`, so the
-    /// chat UI and API server requests can share one worker.
+    /// chat UI and API server requests can share one worker. The messages are
+    /// shared rather than copied: the caller (the agent loop) is usually the
+    /// only owner, so it can grow them in place between turns.
     Generate {
-        messages: Vec<ChatMessage>,
+        messages: Arc<Vec<ChatMessage>>,
         reply: Sender<LlmEvent>,
         /// Sampling temperature: ~0.7 for chat, lower (~0.25) for agent/tool
         /// use where malformed JSON and sloppy code are costly.
@@ -103,43 +107,80 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
             return;
         }
     };
-    let mut model: Option<LlamaModel> = None;
-
-    for cmd in cmd_rx {
+    // A `LlamaContext` borrows its model, so the two cannot live in one struct.
+    // Instead, a load runs `run_model` in the model's scope; the command that
+    // needs a different model is handed back here to be replayed.
+    let mut pending: Option<LlmCmd> = None;
+    loop {
+        let cmd = match pending.take() {
+            Some(cmd) => cmd,
+            None => match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => return,
+            },
+        };
         match cmd {
+            LlmCmd::Unload => {
+                let _ = tx.send(LlmEvent::Unloaded);
+            }
+            // No model: fail the request rather than silently dropping it.
+            LlmCmd::Generate { reply, .. } => {
+                let _ = reply.send(LlmEvent::Error("no model loaded".into()));
+                let _ = reply.send(LlmEvent::GenDone);
+            }
             LlmCmd::Load(path) => {
-                model = None; // free the old model before loading the new one
+                // Free the old model before loading the new one.
                 let params = LlamaModelParams::default();
                 match LlamaModel::load_from_file(&backend, &path, &params) {
-                    Ok(m) => {
-                        model = Some(m);
+                    Ok(model) => {
                         let name = path
                             .file_stem()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_default();
                         let _ = tx.send(LlmEvent::Loaded(name));
+                        pending = run_model(&model, &backend, &cmd_rx, &stop, n_threads);
+                        if pending.is_none() {
+                            return;
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(LlmEvent::Error(format!("failed to load model: {e}")));
                     }
                 }
             }
-            LlmCmd::Unload => {
-                model = None;
-                let _ = tx.send(LlmEvent::Unloaded);
-            }
+        }
+    }
+}
+
+/// Serve one loaded model until a command needs the model replaced. Returns
+/// the command that ended the session (`Load`/`Unload`), or `None` if the
+/// command channel closed.
+fn run_model(
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    cmd_rx: &Receiver<LlmCmd>,
+    stop: &AtomicBool,
+    n_threads: usize,
+) -> Option<LlmCmd> {
+    let mut session = Session::default();
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            LlmCmd::Load(_) | LlmCmd::Unload => return Some(cmd),
             LlmCmd::Generate {
                 messages,
                 reply,
                 temp,
                 n_ctx,
             } => {
-                let Some(model) = &model else {
-                    let _ = reply.send(LlmEvent::Error("no model loaded".into()));
-                    continue;
-                };
-                if let Err(e) = generate(
-                    &backend, model, &messages, &reply, &stop, n_threads, temp, n_ctx,
+                if let Err(e) = session.generate(
+                    model,
+                    backend,
+                    &messages,
+                    &reply,
+                    stop,
+                    n_threads,
+                    temp,
+                    n_ctx,
                 ) {
                     let _ = reply.send(LlmEvent::Error(e));
                 }
@@ -147,65 +188,135 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
             }
         }
     }
+    None
 }
 
+/// Per-model inference state that outlives a single generation: the context
+/// and the exact token sequence currently evaluated in its KV cache. A new
+/// prompt usually shares a long prefix with the last one (the agent loop only
+/// appends turns), so only the tail has to be decoded.
+#[derive(Default)]
+struct Session<'m> {
+    ctx: Option<LlamaContext<'m>>,
+    cache: Vec<LlamaToken>,
+    n_ctx: u32,
+}
+
+impl<'m> Session<'m> {
+    #[allow(clippy::too_many_arguments)]
+    fn generate(
+        &mut self,
+        model: &'m LlamaModel,
+        backend: &LlamaBackend,
+        messages: &[ChatMessage],
+        tx: &Sender<LlmEvent>,
+        stop: &AtomicBool,
+        n_threads: usize,
+        temp: f32,
+        n_ctx: u32,
+    ) -> Result<(), String> {
+        let n_ctx = n_ctx.max(2048);
+        let chat: Vec<LlamaChatMessage> = messages
+            .iter()
+            .map(|m| LlamaChatMessage::new(m.role.as_str().to_string(), m.content.clone()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        // Old GGUF files (pre-2024) carry no embedded chat template. Fall back
+        // to ChatML — llama.cpp resolves the name to its built-in template. Not
+        // the format those models were trained on, but a workable degradation.
+        let template = match model.chat_template(None) {
+            Ok(t) => t,
+            Err(_) => LlamaChatTemplate::new("chatml")
+                .map_err(|e| format!("chat template fallback failed: {e}"))?,
+        };
+        let prompt = model
+            .apply_chat_template(&template, &chat, true)
+            .map_err(|e| e.to_string())?;
+
+        let tokens = model
+            .str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| e.to_string())?;
+        if tokens.is_empty() {
+            return Err("prompt tokenised to nothing".into());
+        }
+        if tokens.len() as u32 >= n_ctx - 256 {
+            // Callers match on this prefix to offer their own remedy.
+            return Err(format!(
+                "context window full ({} tokens, limit {})",
+                tokens.len(),
+                n_ctx
+            ));
+        }
+
+        // (Re)create the context only when the requested window changed;
+        // otherwise its KV cache is still useful for the prefix reuse below.
+        if self.ctx.is_none() || self.n_ctx != n_ctx {
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(n_ctx))
+                .with_n_batch(N_BATCH)
+                .with_n_threads(n_threads as i32)
+                .with_n_threads_batch(n_threads as i32);
+            self.ctx = Some(
+                model
+                    .new_context(backend, ctx_params)
+                    .map_err(|e| e.to_string())?,
+            );
+            self.n_ctx = n_ctx;
+            self.cache.clear();
+        }
+        // Split the borrow so the context and the token cache can be used
+        // together (they are distinct fields).
+        let Session { ctx, cache, .. } = self;
+        let ctx = ctx.as_mut().expect("context created above");
+
+        // Longest prefix already in the cache, leaving one token to decode so
+        // the sampler always gets fresh logits for the final position.
+        let mut common = reusable_prefix(cache, &tokens);
+        if common < cache.len()
+            && ctx
+                .kv_cache_seq_rm(0, Some(common as u32), None)
+                .is_err()
+        {
+            // The backend cannot drop a partial sequence (sliding-window or
+            // recurrent models): start the cache over.
+            ctx.clear_kv_cache();
+            cache.clear();
+            common = 0;
+        }
+        cache.truncate(common);
+
+        // If any decode fails, the cache no longer matches the context, so the
+        // next call must start over rather than reuse a stale prefix.
+        let result = decode_and_generate(ctx, cache, model, tx, stop, temp, n_ctx, &tokens, common);
+        if result.is_err() {
+            ctx.clear_kv_cache();
+            cache.clear();
+        }
+        result
+    }
+}
+
+/// Decode the prompt tail past `common` and stream the answer, keeping `cache`
+/// (the tokens evaluated in `ctx`) up to date as generation proceeds.
 #[allow(clippy::too_many_arguments)]
-fn generate(
-    backend: &LlamaBackend,
+fn decode_and_generate(
+    ctx: &mut LlamaContext<'_>,
+    cache: &mut Vec<LlamaToken>,
     model: &LlamaModel,
-    messages: &[ChatMessage],
     tx: &Sender<LlmEvent>,
     stop: &AtomicBool,
-    n_threads: usize,
     temp: f32,
     n_ctx: u32,
+    tokens: &[LlamaToken],
+    common: usize,
 ) -> Result<(), String> {
-    let n_ctx = n_ctx.max(2048);
-    let chat: Vec<LlamaChatMessage> = messages
-        .iter()
-        .map(|m| LlamaChatMessage::new(m.role.as_str().to_string(), m.content.clone()))
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())?;
-    // Old GGUF files (pre-2024) carry no embedded chat template. Fall back to
-    // ChatML — llama.cpp resolves the name to its built-in template. Not the
-    // format those models were trained on, but a workable degradation.
-    let template = match model.chat_template(None) {
-        Ok(t) => t,
-        Err(_) => LlamaChatTemplate::new("chatml")
-            .map_err(|e| format!("chat template fallback failed: {e}"))?,
-    };
-    let prompt = model
-        .apply_chat_template(&template, &chat, true)
-        .map_err(|e| e.to_string())?;
-
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .map_err(|e| e.to_string())?;
-    if tokens.len() as u32 >= n_ctx - 256 {
-        // Callers match on this prefix to offer their own remedy.
-        return Err(format!(
-            "context window full ({} tokens, limit {})",
-            tokens.len(),
-            n_ctx
-        ));
-    }
-
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(n_ctx))
-        .with_n_batch(N_BATCH)
-        .with_n_threads(n_threads as i32)
-        .with_n_threads_batch(n_threads as i32);
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .map_err(|e| e.to_string())?;
-
-    // Decode the prompt in chunks so batch memory stays bounded no matter
-    // how large the context window is.
+    // Decode only the tokens past the shared prefix, in chunks so batch memory
+    // stays bounded no matter how large the window is.
     let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
     let prompt_start = std::time::Instant::now();
     let last_idx = tokens.len() - 1;
-    let mut pos = 0usize;
-    for chunk in tokens.chunks(N_BATCH as usize) {
+    let mut pos = common;
+    for chunk in tokens[common..].chunks(N_BATCH as usize) {
         batch.clear();
         for token in chunk {
             batch
@@ -216,6 +327,7 @@ fn generate(
         ctx.decode(&mut batch).map_err(|e| e.to_string())?;
     }
     let prompt_secs = prompt_start.elapsed().as_secs_f32();
+    cache.extend_from_slice(&tokens[common..]);
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -233,7 +345,7 @@ fn generate(
     let gen_start = std::time::Instant::now();
     let mut gen_tokens = 0usize;
     while (n_cur as u32) < n_ctx && !stop.load(Ordering::Relaxed) {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+        let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {
             break;
@@ -246,6 +358,7 @@ fn generate(
                 let _ = tx.send(LlmEvent::Token(text));
             }
         }
+        cache.push(token);
         batch.clear();
         batch
             .add(token, n_cur, &[0], true)
@@ -260,6 +373,17 @@ fn generate(
         gen_secs: gen_start.elapsed().as_secs_f32(),
     });
     Ok(())
+}
+
+/// Leading tokens shared by the cached sequence and the new prompt, capped so
+/// at least one token is decoded (the sampler needs fresh logits).
+fn reusable_prefix(cache: &[LlamaToken], tokens: &[LlamaToken]) -> usize {
+    cache
+        .iter()
+        .zip(tokens)
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(tokens.len().saturating_sub(1))
 }
 
 /// Extract the valid UTF-8 prefix from `pending`, leaving incomplete trailing
@@ -282,5 +406,36 @@ fn drain_valid_utf8(pending: &mut Vec<u8>) -> String {
             pending.drain(..consumed);
             s
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().copied().map(LlamaToken).collect()
+    }
+
+    #[test]
+    fn prefix_reuse_keeps_only_the_shared_head() {
+        // Same opening, different tail: only the shared head is reusable.
+        assert_eq!(reusable_prefix(&toks(&[1, 2, 3, 4]), &toks(&[1, 2, 9])), 2);
+    }
+
+    #[test]
+    fn prefix_reuse_always_leaves_one_token_to_decode() {
+        // Fully cached prompt still decodes its last token for fresh logits.
+        assert_eq!(reusable_prefix(&toks(&[1, 2, 3]), &toks(&[1, 2, 3])), 2);
+        // A single-token prompt can never be fully reused.
+        assert_eq!(reusable_prefix(&toks(&[7]), &toks(&[7])), 0);
+    }
+
+    #[test]
+    fn prefix_reuse_handles_empty_cache_and_divergence() {
+        assert_eq!(reusable_prefix(&[], &toks(&[1, 2, 3])), 0);
+        assert_eq!(reusable_prefix(&toks(&[1, 2, 3]), &toks(&[4, 5])), 0);
+        // Cache longer than the new prompt: capping keeps a token to decode.
+        assert_eq!(reusable_prefix(&toks(&[1, 2, 3, 4]), &toks(&[1, 2])), 1);
     }
 }

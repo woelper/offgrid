@@ -270,11 +270,7 @@ impl Tui {
             let note = match &dl.failed {
                 Some(e) => format!("failed: {e} — download it again to resume"),
                 None => {
-                    let pct = if dl.total > 0 {
-                        dl.bytes * 100 / dl.total
-                    } else {
-                        0
-                    };
+                    let pct = dl.bytes.saturating_mul(100).checked_div(dl.total).unwrap_or(0);
                     format!(
                         "{pct}% · {} of {}",
                         crate::hardware::fmt_bytes(dl.bytes),
@@ -736,7 +732,7 @@ impl Tui {
             );
         } else {
             let _ = self.llm.cmd_tx.send(LlmCmd::Generate {
-                messages: session::snapshot(&self.chat),
+                messages: Arc::new(session::snapshot(&self.chat)),
                 reply: self.llm.event_tx.clone(),
                 temp: 0.7,
                 n_ctx,
@@ -755,42 +751,28 @@ impl Tui {
             self.status = "no model loaded".into();
             return;
         }
-        if let Some(summary) = agent::run_summary(&self.active) {
-            self.status = format!("busy — {summary}");
-            return;
-        }
         if !resuming {
             self.agent_ctx_used = 0;
         }
         let n_ctx = self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX);
-        let run = if resuming {
-            match agent::resume(
-                ws,
-                self.llm.cmd_tx.clone(),
-                true,
-                self.config.web_tools,
-                n_ctx,
-            ) {
-                Some(run) => run,
-                None => {
-                    self.status = "nothing to resume".into();
-                    return;
-                }
+        match agent::launch(
+            &self.active,
+            agent::RunSource::Tui,
+            ws,
+            if resuming { None } else { Some(task.clone()) },
+            self.llm.cmd_tx.clone(),
+            true,
+            self.config.web_tools,
+            n_ctx,
+        ) {
+            Ok(run) => {
+                self.transcript.push(format!("▶ {task}"));
+                self.tab = Tab::Code;
+                self.run = Some(run);
             }
-        } else {
-            agent::start(
-                ws,
-                task.clone(),
-                self.llm.cmd_tx.clone(),
-                true,
-                self.config.web_tools,
-                n_ctx,
-            )
-        };
-        agent::claim(&self.active, agent::RunSource::Tui, &task, &run);
-        self.transcript.push(format!("▶ {task}"));
-        self.tab = Tab::Code;
-        self.run = Some(run);
+            Err(agent::LaunchError::Busy(summary)) => self.status = format!("busy — {summary}"),
+            Err(agent::LaunchError::NothingToResume) => self.status = "nothing to resume".into(),
+        }
     }
 
     /// Download the proposed chat or coding model for this hardware.

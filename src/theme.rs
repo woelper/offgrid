@@ -305,9 +305,9 @@ pub fn bold_family() -> egui::FontFamily {
 
 /// Whether the fonts currently in effect bind the bold family. `set_fonts`
 /// only lands at the next frame start, so the frame that first applies a skin
-/// still lays out with the previous definitions; drawing bold text in it
-/// would ask epaint for a family it cannot find (a panic). Callers that apply
-/// the skin mid-frame should skip drawing until this is true.
+/// still lays out with the previous definitions; the UI snapshot test waits
+/// for this before drawing, or it would ask epaint for a family it cannot find.
+#[cfg(test)]
 pub fn fonts_ready(ctx: &egui::Context) -> bool {
     ctx.fonts(|f| f.definitions().families.contains_key(&bold_family()))
 }
@@ -334,82 +334,96 @@ fn bind_bold(fonts: &mut egui::FontDefinitions, name: &str, data: egui::FontData
     fonts.families.insert(bold_family(), family);
 }
 
-/// System font of the skin (Noto Sans = Haiku's UI font), mono for code.
-/// The egui defaults stay in the family lists as fallbacks.
-fn install_fonts(ctx: &egui::Context) {
+/// A skin's font face: the family name to register it under plus its bytes.
+type Face = (&'static str, &'static [u8]);
+
+/// Install a skin's proportional, mono and bold faces. Every skin must bind
+/// the bold family (`bind_bold`) or epaint panics when bold text is drawn.
+fn install_fonts(ctx: &egui::Context, regular: Face, mono: Face, bold: Face) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "NotoSans".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Regular.ttf")).into(),
-    );
-    fonts.font_data.insert(
-        "NotoSansMono".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf"))
-            .into(),
-    );
+    fonts
+        .font_data
+        .insert(regular.0.into(), egui::FontData::from_static(regular.1).into());
+    fonts
+        .font_data
+        .insert(mono.0.into(), egui::FontData::from_static(mono.1).into());
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
-        .insert(0, "NotoSans".into());
+        .insert(0, regular.0.into());
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
-        .insert(0, "NotoSansMono".into());
-    bind_bold(
-        &mut fonts,
-        "NotoSansBold",
-        egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Bold.ttf")),
-    );
+        .insert(0, mono.0.into());
+    bind_bold(&mut fonts, bold.0, egui::FontData::from_static(bold.1));
     ctx.set_fonts(fonts);
 }
 
-fn install_fonts_material(ctx: &egui::Context) {
+/// The stock skin keeps egui's own faces; it only needs the bold family bound
+/// so `**strong**` and headings have a real face to fall back to.
+fn install_bold_only(ctx: &egui::Context, bold: Face) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "PlexSans".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"))
-            .into(),
-    );
-    fonts.font_data.insert(
-        "PlexMono".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"))
-            .into(),
-    );
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, "PlexSans".into());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .insert(0, "PlexMono".into());
-    bind_bold(
-        &mut fonts,
-        "PlexSansBold",
-        egui::FontData::from_static(include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf")),
-    );
+    bind_bold(&mut fonts, bold.0, egui::FontData::from_static(bold.1));
     ctx.set_fonts(fonts);
+}
+
+/// The parts of the custom skins that are identical: fills, selection,
+/// button corners and text colour, and the Bold heading family. Skin-specific
+/// widget colours are applied by the caller afterwards.
+fn base_style(style: &mut egui::Style, s: &Skin, text: Color32, window_radius: u8) {
+    let mut v = egui::Visuals::light();
+    v.override_text_color = Some(text);
+    v.panel_fill = s.panel;
+    v.window_fill = s.panel;
+    v.faint_bg_color = s.faint;
+    v.extreme_bg_color = Color32::WHITE; // text edit / code backgrounds
+    v.hyperlink_color = s.accent;
+    v.selection.bg_fill = s.selection;
+    v.selection.stroke = Stroke::new(1.0, s.accent);
+    v.window_corner_radius = CornerRadius::same(window_radius);
+    let radius = CornerRadius::same(s.button_radius);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = radius;
+        w.fg_stroke = Stroke::new(1.0, text);
+    }
+    style.visuals = v;
+    // Headings in the real Bold face; egui's default is the regular weight.
+    if let Some(h) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
+        h.family = bold_family();
+    }
+    style.spacing.button_padding = s.button_padding;
 }
 
 fn apply_material(ctx: &egui::Context) {
     let s = skin();
-    install_fonts_material(ctx);
+    install_fonts(
+        ctx,
+        (
+            "PlexSans",
+            include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+        ),
+        (
+            "PlexMono",
+            include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+        ),
+        (
+            "PlexSansBold",
+            include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf"),
+        ),
+    );
     ctx.set_theme(egui::Theme::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
-    let mut v = egui::Visuals::light();
-    v.override_text_color = Some(Color32::from_rgb(0x30, 0x34, 0x3c));
-    v.panel_fill = s.panel;
-    v.window_fill = s.panel;
-    v.faint_bg_color = s.faint;
-    v.extreme_bg_color = Color32::WHITE;
-    v.hyperlink_color = s.accent;
-    v.selection.bg_fill = s.selection;
-    v.selection.stroke = Stroke::new(1.0, s.accent);
-    v.window_corner_radius = CornerRadius::same(12);
+    let text = Color32::from_rgb(0x30, 0x34, 0x3c);
+    base_style(&mut style, s, text, 12);
+    let v = &mut style.visuals;
     // Flat, borderless controls.
     for w in [
         &mut v.widgets.inactive,
@@ -417,14 +431,10 @@ fn apply_material(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(s.button_radius);
         w.bg_stroke = Stroke::NONE;
         w.expansion = 0.0;
-        w.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
     }
-    v.widgets.noninteractive.corner_radius = CornerRadius::same(s.button_radius);
     v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x34, 0x3c));
     v.widgets.inactive.bg_fill = s.control;
     v.widgets.inactive.weak_bg_fill = s.control;
     v.widgets.hovered.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
@@ -433,12 +443,6 @@ fn apply_material(ctx: &egui::Context) {
     v.widgets.active.weak_bg_fill = s.selection;
     v.widgets.open.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
     v.widgets.open.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
-    style.visuals = v;
-    // Headings in the real Bold face; egui's default is the regular weight.
-    if let Some(h) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
-        h.family = bold_family();
-    }
-    style.spacing.button_padding = s.button_padding;
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     ctx.set_style_of(egui::Theme::Light, style.clone());
     ctx.set_style_of(egui::Theme::Dark, style);
@@ -452,13 +456,13 @@ pub fn apply(ctx: &egui::Context) {
     if kind() == SkinKind::EguiDefault {
         // Stock egui: default fonts, default style, light theme. egui ships no
         // bold face, so the bold family still needs binding (see bind_bold).
-        let mut fonts = egui::FontDefinitions::default();
-        bind_bold(
-            &mut fonts,
-            "NotoSansBold",
-            egui::FontData::from_static(include_bytes!("../assets/fonts/NotoSans-Bold.ttf")),
+        install_bold_only(
+            ctx,
+            (
+                "NotoSansBold",
+                include_bytes!("../assets/fonts/NotoSans-Bold.ttf"),
+            ),
         );
-        ctx.set_fonts(fonts);
         ctx.set_style_of(
             egui::Theme::Light,
             egui::Style {
@@ -477,33 +481,25 @@ pub fn apply(ctx: &egui::Context) {
         return;
     }
     let s = skin();
-    install_fonts(ctx);
+    install_fonts(
+        ctx,
+        (
+            "NotoSans",
+            include_bytes!("../assets/fonts/NotoSans-Regular.ttf"),
+        ),
+        (
+            "NotoSansMono",
+            include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf"),
+        ),
+        (
+            "NotoSansBold",
+            include_bytes!("../assets/fonts/NotoSans-Bold.ttf"),
+        ),
+    );
     ctx.set_theme(egui::Theme::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    base_style(&mut style, s, Color32::BLACK, 4);
     let v = &mut style.visuals;
-    *v = egui::Visuals::light();
-
-    v.override_text_color = Some(Color32::BLACK);
-    v.panel_fill = s.panel;
-    v.window_fill = s.panel;
-    v.faint_bg_color = s.faint;
-    v.extreme_bg_color = Color32::WHITE; // text edit / code backgrounds
-    v.hyperlink_color = s.accent;
-    v.selection.bg_fill = s.selection;
-    v.selection.stroke = Stroke::new(1.0, s.accent);
-    v.window_corner_radius = CornerRadius::same(4);
-
-    let radius = CornerRadius::same(s.button_radius);
-    for w in [
-        &mut v.widgets.noninteractive,
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-    ] {
-        w.corner_radius = radius;
-        w.fg_stroke = Stroke::new(1.0, Color32::BLACK);
-    }
     v.widgets.noninteractive.bg_fill = s.panel;
     v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
     v.widgets.inactive.bg_fill = s.control;
@@ -518,12 +514,6 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.open.bg_fill = s.control;
     v.widgets.open.weak_bg_fill = s.control;
     v.widgets.open.bg_stroke = Stroke::new(1.0, s.control_border);
-
-    // Headings in the real Bold face; egui's default is the regular weight.
-    if let Some(h) = style.text_styles.get_mut(&egui::TextStyle::Heading) {
-        h.family = bold_family();
-    }
-    style.spacing.button_padding = s.button_padding;
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     ctx.set_style_of(egui::Theme::Light, style.clone());
     ctx.set_style_of(egui::Theme::Dark, style);
@@ -732,6 +722,36 @@ pub fn group<R>(
 
 pub fn icon(ui: &mut egui::Ui, source: egui::ImageSource<'static>, size: f32) {
     ui.add(egui::Image::new(source).fit_to_exact_size(egui::vec2(size, size)));
+}
+
+/// Like `egui::Spinner`, but asks for the next repaint on a fixed cadence
+/// instead of every vsync frame. `egui`'s spinner calls `request_repaint()`
+/// continuously, which pins the whole UI at display rate; while a model
+/// streams that means re-parsing every visible markdown message ~60×/s.
+/// 80 ms still reads as motion and cuts the redraws by roughly 7×.
+pub fn spinner(ui: &mut egui::Ui) {
+    let size = ui.spacing().interact_size.y.max(12.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(80));
+    let color = ui.visuals().strong_text_color();
+    let radius = (rect.height().min(rect.width()) / 2.0) - 2.0;
+    let n_points = (radius.round() as u32).clamp(8, 128);
+    let time = ui.input(|i| i.time);
+    let start_angle = time * std::f64::consts::TAU;
+    let end_angle = start_angle + 240f64.to_radians() * time.sin();
+    let points: Vec<egui::Pos2> = (0..n_points)
+        .map(|i| {
+            let angle = egui::emath::lerp(start_angle..=end_angle, i as f64 / n_points as f64);
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
 }
 
 /// Paint a rectangle with a vertical gradient using a mesh with per-vertex
