@@ -137,6 +137,39 @@ strong text and headings use the `bold` font family that `theme.rs` binds to
 each skin's Bold face. Cargo picks it up via `[patch.crates-io]`; nothing to
 install.
 
+## GPU offload
+
+Off by default. Build with `--features vulkan` and llama.cpp gets the Vulkan
+backend compiled in — one backend for NVIDIA, AMD and Intel alike, where CUDA
+would cover one vendor. It needs the Vulkan SDK at build time (`glslc`
+compiles ggml's shaders); the resulting binary still runs fine on machines
+with no usable GPU, it just stays on the CPU.
+
+```sh
+sudo apt install libvulkan-dev glslc          # debian/ubuntu
+cargo run --release --features vulkan
+```
+
+On Windows, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) so
+`VULKAN_SDK` is set, or take the `-vulkan` zip from the releases page.
+
+What it changes, once a card is found:
+
+- **Settings → System** names the card and its VRAM.
+- **Loading a model** reads the layer count and KV-cache size out of the GGUF
+  header and hands the GPU as many layers as fit in free VRAM, keeping some
+  back for compute buffers. Current model reports the split — "all 32 layers
+  on NVIDIA GeForce RTX 2070 SUPER", "23 of 48 layers on …". llama.cpp's own
+  default is *all layers*, which aborts the load when they do not fit.
+- **Recommendations and tok/s estimates** size against the card: the suggested
+  model is the largest that fits *entirely* in VRAM, because a model split
+  with system RAM is read over the PCIe bus every token and runs at roughly
+  system-RAM speed anyway.
+
+Apple Silicon and integrated GPUs share one memory pool, so there is no
+separate budget to compute — those keep llama.cpp's own split. Metal is built
+in on macOS with or without this feature.
+
 ## macOS releases
 
 The `.app` is ad-hoc signed but not notarized, because Apple charges rent for
@@ -183,6 +216,6 @@ cp tests/snapshots/offgrid.png assets/screenshot.png
 
 ## Roadmap
 
-- GPU offload (vulkan/cuda features plus VRAM-aware recommendations)
+- GPU offload: CUDA and ROCm backends (Vulkan is in — see above)
 - Persistent conversations
 - Agent: edit/patch tool, diff view, multi-task memory

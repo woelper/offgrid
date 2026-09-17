@@ -12,6 +12,15 @@ icon = ["assets/icons/Alert_Idea.png"]
 category = "Developer Tool"
 short_description = "Fully local LLM prepper tool"
 
+[features]
+# GPU offload through Vulkan — one backend for every vendor (NVIDIA, AMD,
+# Intel), unlike CUDA or ROCm. Off by default: building it needs the Vulkan
+# SDK (glslc compiles ggml's shaders, and on Windows VULKAN_SDK must be set),
+# while a plain `cargo build` should keep working with nothing installed.
+# A binary built with it still runs where there is no usable GPU — llama.cpp
+# finds no Vulkan device and everything stays on the CPU.
+vulkan = ["llama-cpp-2/vulkan"]
+
 [dependencies]
 crossterm = "0.29.0"
 directories = "6.0.0"

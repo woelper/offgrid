@@ -207,8 +207,12 @@ impl OffgridApp {
         if let Some(last) = &config.last_model
             && last.exists()
         {
-            if models::safe_to_load(last, hardware.total_ram, config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX)) {
-                let _ = llm.cmd_tx.send(LlmCmd::Load(last.clone()));
+            let n_ctx = config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX);
+            if models::safe_to_load(last, hardware.total_ram, n_ctx) {
+                let _ = llm.cmd_tx.send(LlmCmd::Load {
+                    path: last.clone(),
+                    n_ctx,
+                });
                 model_loading = true;
             } else {
                 // Don't re-load a model that won't fit — that is what crashed
@@ -542,7 +546,10 @@ impl OffgridApp {
 
     fn load_model(&mut self, path: PathBuf) {
         self.config.last_model = Some(path.clone());
-        let _ = self.llm.cmd_tx.send(LlmCmd::Load(path));
+        let _ = self.llm.cmd_tx.send(LlmCmd::Load {
+            path,
+            n_ctx: self.n_ctx(),
+        });
         self.model_loading = true;
     }
 
@@ -672,9 +679,10 @@ impl OffgridApp {
                 self.hardware.physical_cores,
                 fmt_bytes(self.hardware.total_ram)
             ));
+            ui.label(format!("GPU: {}", self.hardware.gpu_summary()));
             ui.weak(format!(
-                "Measured memory bandwidth: {}/s — this drives the tok/s estimates \
-                 in the model lists.",
+                "Measured memory bandwidth: {}/s — this, and how much of a model \
+                 fits in VRAM, drives the tok/s estimates in the model lists.",
                 fmt_bytes(self.hardware.mem_bandwidth)
             ));
         });
@@ -808,6 +816,18 @@ impl OffgridApp {
                             ui.weak("No model loaded — pick one below.");
                         }
                     });
+                    // Where the weights actually ended up — the only place
+                    // that reports a partial offload, which is the difference
+                    // between 40 tok/s and 4.
+                    let accel = self
+                        .llm
+                        .accel
+                        .lock()
+                        .map(|a| a.clone())
+                        .unwrap_or_default();
+                    if !accel.is_empty() && !self.model_loading && self.loaded_model.is_some() {
+                        ui.weak(accel);
+                    }
                 },
             );
 
@@ -846,7 +866,7 @@ impl OffgridApp {
                         models::fmt_tok_s(models::est_tokens_per_sec(
                             &model.name,
                             model.size,
-                            self.hardware.mem_bandwidth,
+                            self.hardware.bandwidth_for(model.size, self.n_ctx()),
                         )),
                         badge,
                         |ui| {
@@ -987,7 +1007,11 @@ impl OffgridApp {
             });
 
             theme::group(ui, "Get models", Some(theme::icons().depot.clone()), |ui| {
-                let proposals = models::propose(self.hardware.total_ram, self.n_ctx());
+                let proposals = models::propose(
+                    self.hardware.total_ram,
+                    self.hardware.dedicated_vram(),
+                    self.n_ctx(),
+                );
                 if proposals.chat.is_some() || proposals.code.is_some() {
                     ui.label("Recommended for your hardware:");
                     if let Some(chat) = &proposals.chat {
@@ -1022,7 +1046,7 @@ impl OffgridApp {
                         models::fmt_tok_s(models::est_tokens_per_sec(
                             entry.file,
                             entry.size,
-                            self.hardware.mem_bandwidth,
+                            self.hardware.bandwidth_for(entry.size, self.n_ctx()),
                         )),
                         badge,
                         |ui| {
@@ -1132,7 +1156,7 @@ impl OffgridApp {
                                                 models::est_tokens_per_sec(
                                                     &f.name,
                                                     f.size,
-                                                    self.hardware.mem_bandwidth,
+                                                    self.hardware.bandwidth_for(f.size, self.n_ctx()),
                                                 ),
                                             ));
                                             self.fit_badge(ui, f.size);

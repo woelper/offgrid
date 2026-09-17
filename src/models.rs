@@ -13,8 +13,17 @@ use eframe::egui;
 /// called it merely "tight". The factors below put that case just over the
 /// "too big" line, while a short context or a small model stays comfortable.
 fn overhead(model_size: u64, n_ctx: u32) -> u64 {
-    let kv = (model_size / 12) * (n_ctx as u64) / 4096;
-    BASE_OVERHEAD + kv
+    BASE_OVERHEAD + kv_size(model_size, None, n_ctx)
+}
+
+/// KV-cache bytes for an `n_ctx` context: exact when the file's header gave
+/// us a per-token cost, otherwise the size-derived guess `overhead` is
+/// calibrated around.
+pub fn kv_size(model_size: u64, kv_per_token: Option<u64>, n_ctx: u32) -> u64 {
+    match kv_per_token {
+        Some(kv) => kv * n_ctx as u64,
+        None => (model_size / 12) * (n_ctx as u64) / 4096,
+    }
 }
 
 /// Compute/activation buffers beyond weights and KV cache, ~1 GB.
@@ -26,6 +35,20 @@ const BASE_OVERHEAD: u64 = 1024 * 1024 * 1024;
 /// needs ~100 KB/token, a dense model of the same file size several times
 /// that — so the size-based guess in `overhead` is only the fallback.
 pub fn kv_bytes_per_token(path: &Path) -> Option<u64> {
+    gguf_dims(path).map(|d| d.kv_bytes_per_token)
+}
+
+/// What the GGUF header tells us about a model's shape.
+#[derive(Clone, Copy, Debug)]
+pub struct GgufDims {
+    /// Transformer blocks — how many pieces the weights split into when only
+    /// part of the model goes to the GPU.
+    pub layers: u64,
+    pub kv_bytes_per_token: u64,
+}
+
+/// Read `layers` and the KV cost per token out of a GGUF file's header.
+pub fn gguf_dims(path: &Path) -> Option<GgufDims> {
     use std::io::Read as _;
     let mut r = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut buf = [0u8; 8];
@@ -138,7 +161,48 @@ pub fn kv_bytes_per_token(path: &Path) -> Option<u64> {
     let head_dim = key_len.or_else(|| Some(embd? / heads?))?;
     let v_dim = val_len.unwrap_or(head_dim);
     let kv_layers = kv_heads_sum.unwrap_or(kv_heads? * layers);
-    Some(kv_layers * (head_dim + v_dim) * 2)
+    Some(GgufDims {
+        layers,
+        kv_bytes_per_token: kv_layers * (head_dim + v_dim) * 2,
+    })
+}
+
+/// Working memory a GPU needs on top of weights and KV cache: ggml's compute
+/// buffers for the largest batch, plus what the driver and desktop already
+/// hold beyond what it reported as free. Guessing low here costs an
+/// out-of-memory abort during load, guessing high costs a layer or two, so
+/// this leans high.
+pub const GPU_OVERHEAD: u64 = 768 * 1024 * 1024;
+
+/// How many layers to hand the GPU: as many as fit in `vram` alongside their
+/// share of the KV cache. A result above `dims.layers` means everything, the
+/// output layer included — that is llama.cpp's "all layers".
+///
+/// The per-layer cost divides the whole file by the layer count, so the
+/// embedding and output tensors are spread over the layers instead of being
+/// counted separately. That overstates a layer slightly, which is the safe
+/// direction: we offload one fewer layer rather than one too many.
+pub fn gpu_layers(model_size: u64, dims: &GgufDims, n_ctx: u32, vram: u64) -> u32 {
+    let layers = dims.layers.max(1);
+    let per_layer = (model_size + dims.kv_bytes_per_token * n_ctx as u64) / layers;
+    if per_layer == 0 {
+        return 0;
+    }
+    let budget = vram.saturating_sub(GPU_OVERHEAD);
+    let n = u32::try_from((budget / per_layer).min(layers + 1)).unwrap_or(u32::MAX);
+    // A handful of layers on the card is not worth the per-token round trip
+    // between host and device it costs — keep the whole model in RAM.
+    if n < MIN_OFFLOAD_LAYERS { 0 } else { n }
+}
+
+/// Below this many layers, offloading buys less than the transfers cost.
+const MIN_OFFLOAD_LAYERS: u32 = 4;
+
+/// Does the whole model — weights, KV cache and compute buffers — fit in
+/// `vram`? Everything on the GPU is the case worth aiming for: it runs an
+/// order of magnitude faster than the same model split with system RAM.
+pub fn fits_vram(model_size: u64, kv_per_token: Option<u64>, n_ctx: u32, vram: u64) -> bool {
+    model_size + GPU_OVERHEAD + kv_size(model_size, kv_per_token, n_ctx) <= vram
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -400,24 +464,38 @@ pub fn safe_to_load(path: &Path, total_ram: u64, n_ctx: u32) -> bool {
 }
 
 /// The best chat and coding models this machine can comfortably run. Each is
-/// the largest catalog entry of that kind that still fits — size stands in for
-/// quality within the curated list. Either may be None on a very small box.
+/// the largest catalog entry of that kind that still fits — in VRAM when
+/// there is a GPU, otherwise in RAM. Size stands in for quality within the
+/// curated list. Either may be None on a very small box.
 pub struct Proposals {
     pub chat: Option<CatalogEntry>,
     pub code: Option<CatalogEntry>,
 }
 
-pub fn propose(total_ram: u64, n_ctx: u32) -> Proposals {
+/// `vram` is the dedicated VRAM of a discrete GPU, when there is one.
+pub fn propose(total_ram: u64, vram: Option<u64>, n_ctx: u32) -> Proposals {
     let fits = |e: &CatalogEntry| Fit::of(e.size, total_ram, n_ctx) == Fit::Fits;
+    // With a GPU, the largest model that fits *entirely* in VRAM beats a
+    // bigger one that spills into system RAM: the spilled part is read over
+    // the PCIe bus at DDR speed every single token, and the whole model runs
+    // at that speed. Fall back to the RAM rule when nothing fits the card.
+    let pick = |code_only: bool| {
+        let of_kind = || {
+            catalog()
+                .into_iter()
+                .filter(|e| !code_only || e.use_.codes())
+                .filter(fits)
+        };
+        vram.and_then(|v| {
+            of_kind()
+                .filter(|e| fits_vram(e.size, None, n_ctx, v))
+                .max_by_key(|e| e.size)
+        })
+        .or_else(|| of_kind().max_by_key(|e| e.size))
+    };
     Proposals {
-        chat: catalog()
-            .into_iter()
-            .filter(fits)
-            .max_by_key(|e| e.size),
-        code: catalog()
-            .into_iter()
-            .filter(|e| e.use_.codes() && fits(e))
-            .max_by_key(|e| e.size),
+        chat: pick(false),
+        code: pick(true),
     }
 }
 
@@ -533,12 +611,66 @@ mod tests {
         assert!(moe > dense * 1.5);
     }
 
+    /// An 8 GB card (a 2070 Super, say) in a 32 GB box: the pick is the
+    /// largest model that fits the *card*, not the largest that fits RAM —
+    /// a 7B living entirely in VRAM beats a 19 GB model reading most of
+    /// itself over PCIe every token. Nothing in the catalog codes and fits
+    /// 8 GB, so the coding pick still falls back to the RAM rule.
+    #[test]
+    fn proposals_prefer_what_fits_in_vram() {
+        let ctx = 16384;
+        let ram = 64 * 1024 * 1024 * 1024;
+        let vram = 8 * 1024 * 1024 * 1024;
+
+        let with_gpu = propose(ram, Some(vram), ctx);
+        for pick in [with_gpu.chat.clone().unwrap(), with_gpu.code.unwrap()] {
+            assert!(
+                fits_vram(pick.size, None, ctx, vram),
+                "{} does not fit an 8 GB card",
+                pick.name
+            );
+        }
+
+        // Same box without the card: the RAM rule, unchanged — and it reaches
+        // for the 19 GB model the card could never hold.
+        let cpu_only = propose(ram, None, ctx).chat.unwrap();
+        assert!(cpu_only.size > with_gpu.chat.unwrap().size);
+    }
+
+    /// Layer counting is what keeps a load from aborting with an
+    /// out-of-memory error. A 4.4 GB 7B and its 2 GB of KV cache still fit an
+    /// 8 GB card whole; a 19 GB MoE on the same card can only go part-way.
+    #[test]
+    fn gpu_layers_fill_the_card() {
+        let ctx = 16384;
+        let gb = 1024 * 1024 * 1024;
+        let small = GgufDims {
+            layers: 32,
+            kv_bytes_per_token: 131_072, // 7B-class: 32 layers x 8 KV heads
+        };
+        let big = GgufDims {
+            layers: 48,
+            kv_bytes_per_token: 98_304, // 30B MoE: only 4 KV heads a layer
+        };
+
+        // Everything, output layer included — llama.cpp's "all".
+        assert!(gpu_layers(4_372_812_000, &small, ctx, 8 * gb) > small.layers as u32);
+
+        let partial = gpu_layers(18_556_689_568, &big, ctx, 8 * gb);
+        assert!(
+            (10..big.layers as u32).contains(&partial),
+            "expected part of the 30B on an 8 GB card, got {partial}"
+        );
+        // Room for the compute buffers and little else: stay on the CPU.
+        assert_eq!(gpu_layers(4_372_812_000, &small, ctx, gb), 0);
+    }
+
     #[test]
     fn proposals_scale_with_ram() {
         let ctx = 16384;
         // A tiny box: chat gets the largest fitting small model, and nothing
         // big enough to code comfortably may be available.
-        let small = propose(4 * 1024 * 1024 * 1024, ctx);
+        let small = propose(4 * 1024 * 1024 * 1024, None, ctx);
         assert!(small.chat.is_some());
         assert!(
             small.chat.as_ref().unwrap().size <= 3_000_000_000,
@@ -547,12 +679,12 @@ mod tests {
 
         // A large box: chat and code both resolve, and each is the biggest
         // fitting entry of its kind — here the 30B coder for both.
-        let big = propose(64 * 1024 * 1024 * 1024, ctx);
+        let big = propose(64 * 1024 * 1024 * 1024, None, ctx);
         assert_eq!(big.chat.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
         assert_eq!(big.code.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
 
         // The coding pick, when present, is always a code-capable entry.
-        if let Some(code) = propose(8 * 1024 * 1024 * 1024, ctx).code {
+        if let Some(code) = propose(8 * 1024 * 1024 * 1024, None, ctx).code {
             assert!(code.use_.codes());
         }
     }

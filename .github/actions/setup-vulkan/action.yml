@@ -1,0 +1,32 @@
+name: Set up Vulkan
+description: >
+  Install what ggml needs to compile its Vulkan backend: the headers and
+  loader, plus glslc, which compiles the backend's shaders during the build.
+  The runners have no GPU — this is for building, not running.
+
+inputs:
+  version:
+    description: LunarG SDK version to install (Windows only).
+    default: "1.4.309.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Vulkan headers and glslc (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libvulkan-dev glslc
+
+    - name: Vulkan SDK (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        VULKAN_VERSION: ${{ inputs.version }}
+      run: |
+        curl.exe -o "$env:RUNNER_TEMP/vulkan-sdk.exe" -L `
+          "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+        & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"

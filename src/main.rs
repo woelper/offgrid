@@ -180,7 +180,13 @@ fn web_probe(model_match: &str, question: &str) {
         llama_cpp_2::LogOptions::default().with_logs_enabled(false),
     );
     let handle = llm::spawn_worker(hardware::HardwareProfile::detect().physical_cores);
-    handle.cmd_tx.send(llm::LlmCmd::Load(path)).unwrap();
+    handle
+        .cmd_tx
+        .send(llm::LlmCmd::Load {
+            path,
+            n_ctx: llm::DEFAULT_N_CTX,
+        })
+        .unwrap();
     loop {
         match handle.event_rx.recv().unwrap() {
             llm::LlmEvent::Loaded(n) => {
@@ -261,7 +267,13 @@ fn smoke(agent_mode: bool) {
     }
 
     let handle = llm::spawn_worker(hardware::HardwareProfile::detect().physical_cores);
-    handle.cmd_tx.send(llm::LlmCmd::Load(path)).unwrap();
+    handle
+        .cmd_tx
+        .send(llm::LlmCmd::Load {
+            path,
+            n_ctx: llm::DEFAULT_N_CTX,
+        })
+        .unwrap();
     let name = loop {
         match handle.event_rx.recv().unwrap() {
             llm::LlmEvent::Loaded(n) => break n,

@@ -259,7 +259,7 @@ impl Tui {
             models::fmt_tok_s(models::est_tokens_per_sec(
                 name,
                 size,
-                self.hardware.mem_bandwidth
+                self.hardware.bandwidth_for(size, self.n_ctx())
             ))
         )
     }
@@ -287,9 +287,23 @@ impl Tui {
             ModelsView::Local => {
                 lines.push("↑/↓ select · Enter load · u unload · d delete · /search <query> for Hugging Face".into());
                 // Dynamic proposals: what this machine can comfortably run.
-                let p = models::propose(self.hardware.total_ram, self.n_ctx());
+                let p = models::propose(
+                    self.hardware.total_ram,
+                    self.hardware.dedicated_vram(),
+                    self.n_ctx(),
+                );
                 if p.chat.is_some() || p.code.is_some() {
                     lines.push(String::new());
+                    // Name the accelerator the picks were sized for — on a
+                    // headless box this line is the only sign a GPU is in use.
+                    if let Some(gpu) = self.hardware.gpu {
+                        lines.push(format!(
+                            "GPU: {} ({}, {})",
+                            gpu.name,
+                            gpu.backend,
+                            crate::hardware::fmt_bytes(gpu.vram_total)
+                        ));
+                    }
                     lines.push("Recommended for your hardware (/get chat · /get code):".into());
                     if let Some(c) = &p.chat {
                         lines.push(format!("  chat  {}  ({})", c.name, self.gauge(c.file, c.size)));
@@ -492,7 +506,12 @@ impl Tui {
                 LlmEvent::Loaded(name) => {
                     self.loading = false;
                     *self.loaded_shared.lock().unwrap() = Some(name.clone());
-                    self.status = format!("loaded {name}");
+                    let accel = self.llm.accel.lock().map(|a| a.clone()).unwrap_or_default();
+                    self.status = if accel.is_empty() {
+                        format!("loaded {name}")
+                    } else {
+                        format!("loaded {name} — {accel}")
+                    };
                     self.loaded = Some(name);
                 }
                 LlmEvent::Unloaded => {
@@ -777,7 +796,11 @@ impl Tui {
 
     /// Download the proposed chat or coding model for this hardware.
     fn get_proposal(&mut self, kind: &str) {
-        let p = models::propose(self.hardware.total_ram, self.n_ctx());
+        let p = models::propose(
+            self.hardware.total_ram,
+            self.hardware.dedicated_vram(),
+            self.n_ctx(),
+        );
         let entry = match kind {
             "chat" => p.chat,
             "code" | "coding" => p.code,
@@ -1039,7 +1062,10 @@ impl Tui {
             }
             self.loading = true;
             self.status = format!("loading {}…", m.name);
-            let _ = self.llm.cmd_tx.send(LlmCmd::Load(m.path.clone()));
+            let _ = self.llm.cmd_tx.send(LlmCmd::Load {
+                path: m.path.clone(),
+                n_ctx: self.n_ctx(),
+            });
             self.config.last_model = Some(m.path.clone());
             self.config.save();
         }
@@ -1107,7 +1133,8 @@ pub fn run() -> Result<(), String> {
     };
     // Pick up where the desktop app left off — but only if it fits.
     if let Some(path) = autoload {
-        let _ = tui.llm.cmd_tx.send(LlmCmd::Load(path));
+        let n_ctx = tui.n_ctx();
+        let _ = tui.llm.cmd_tx.send(LlmCmd::Load { path, n_ctx });
     }
 
     // llama.cpp writes its loader dump straight to stderr, which would

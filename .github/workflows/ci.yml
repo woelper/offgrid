@@ -42,3 +42,38 @@ jobs:
       # rendered on the dev machine's GPU and differs on CI rasterizers.
       - name: tests
         run: cargo test -- --skip main_screen_snapshot
+
+  # The GPU build compiles a whole second ggml backend and its shaders, none
+  # of which the default build touches. Without this job a broken
+  # `--features vulkan` would first surface when a release tag is already
+  # pushed and the Windows GPU artifact fails to build.
+  #
+  # It builds rather than checks: linking against the Vulkan loader is its own
+  # failure mode, and the compile of llama.cpp dominates either way. The
+  # runners have no GPU, so nothing here exercises the offload at runtime —
+  # that is what the layer-counting unit tests are for.
+  vulkan:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev
+
+      - uses: ./.github/actions/setup-vulkan
+
+      - name: build
+        run: cargo build --features vulkan

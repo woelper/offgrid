@@ -1,8 +1,8 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -42,7 +42,12 @@ pub struct ChatMessage {
 }
 
 pub enum LlmCmd {
-    Load(PathBuf),
+    /// `n_ctx` is needed at load time, not just at generation time: it sizes
+    /// the KV cache, which shares the GPU's memory with the offloaded layers.
+    Load {
+        path: PathBuf,
+        n_ctx: u32,
+    },
     Unload,
     /// Generation events (Token/GenDone/Error) are sent to `reply`, so the
     /// chat UI and API server requests can share one worker. The messages are
@@ -82,6 +87,10 @@ pub struct LlmHandle {
     pub event_tx: Sender<LlmEvent>,
     pub event_rx: Receiver<LlmEvent>,
     pub stop: Arc<AtomicBool>,
+    /// Where the last loaded model ended up — "29/33 layers on NVIDIA …" —
+    /// or empty when nothing is loaded or there is no GPU. Written by the
+    /// worker at load time, read by the UI.
+    pub accel: Arc<Mutex<String>>,
 }
 
 pub fn spawn_worker(n_threads: usize) -> LlmHandle {
@@ -90,16 +99,33 @@ pub fn spawn_worker(n_threads: usize) -> LlmHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
     let event_tx_worker = event_tx.clone();
-    std::thread::spawn(move || worker(cmd_rx, event_tx_worker, stop_worker, n_threads));
+    let accel = Arc::new(Mutex::new(String::new()));
+    let accel_worker = accel.clone();
+    std::thread::spawn(move || {
+        worker(
+            cmd_rx,
+            event_tx_worker,
+            stop_worker,
+            n_threads,
+            accel_worker,
+        )
+    });
     LlmHandle {
         cmd_tx,
         event_tx,
         event_rx,
         stop,
+        accel,
     }
 }
 
-fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>, n_threads: usize) {
+fn worker(
+    cmd_rx: Receiver<LlmCmd>,
+    tx: Sender<LlmEvent>,
+    stop: Arc<AtomicBool>,
+    n_threads: usize,
+    accel: Arc<Mutex<String>>,
+) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
         Err(e) => {
@@ -121,6 +147,9 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
         };
         match cmd {
             LlmCmd::Unload => {
+                if let Ok(mut slot) = accel.lock() {
+                    slot.clear();
+                }
                 let _ = tx.send(LlmEvent::Unloaded);
             }
             // No model: fail the request rather than silently dropping it.
@@ -128,9 +157,12 @@ fn worker(cmd_rx: Receiver<LlmCmd>, tx: Sender<LlmEvent>, stop: Arc<AtomicBool>,
                 let _ = reply.send(LlmEvent::Error("no model loaded".into()));
                 let _ = reply.send(LlmEvent::GenDone);
             }
-            LlmCmd::Load(path) => {
+            LlmCmd::Load { path, n_ctx } => {
                 // Free the old model before loading the new one.
-                let params = LlamaModelParams::default();
+                let (params, note) = load_params(&path, n_ctx);
+                if let Ok(mut slot) = accel.lock() {
+                    *slot = note;
+                }
                 match LlamaModel::load_from_file(&backend, &path, &params) {
                     Ok(model) => {
                         let name = path
@@ -165,7 +197,7 @@ fn run_model(
     let mut session = Session::default();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            LlmCmd::Load(_) | LlmCmd::Unload => return Some(cmd),
+            LlmCmd::Load { .. } | LlmCmd::Unload => return Some(cmd),
             LlmCmd::Generate {
                 messages,
                 reply,
@@ -298,6 +330,50 @@ impl<'m> Session<'m> {
 
 /// Decode the prompt tail past `common` and stream the answer, keeping `cache`
 /// (the tokens evaluated in `ctx`) up to date as generation proceeds.
+/// Decide where a model's layers go, and say so in one line for the UI.
+///
+/// Without a GPU (or in a build with no GPU backend) this is llama.cpp's
+/// default and nothing changes. With a discrete card we count the layers
+/// ourselves instead of leaving `n_gpu_layers` at its default of -1, "all":
+/// a model that does not fit aborts the load with an out-of-memory error
+/// rather than falling back, and "all" is a bet we cannot win on an 8 GB
+/// card with a 16k context. Unified memory (Apple, integrated GPUs) keeps
+/// the default — there is one pool, and llama.cpp splits it better than a
+/// VRAM budget we do not have.
+fn load_params(path: &std::path::Path, n_ctx: u32) -> (LlamaModelParams, String) {
+    // Match the floor `generate` applies, so the KV cache we budget for is
+    // the one that actually gets allocated.
+    let n_ctx = n_ctx.max(2048);
+    let params = LlamaModelParams::default();
+    let Some(gpu) = crate::hardware::gpu() else {
+        return (params, String::new());
+    };
+    if gpu.unified {
+        return (params, format!("{} ({})", gpu.name, gpu.backend));
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // No readable header means no layer count, and guessing with a card's
+    // worth of VRAM at stake is not worth it — keep the weights in RAM.
+    let Some(dims) = crate::models::gguf_dims(path) else {
+        return (
+            params.with_n_gpu_layers(0),
+            format!("CPU only — could not read the layer count for {}", gpu.name),
+        );
+    };
+    let n = crate::models::gpu_layers(size, &dims, n_ctx, gpu.budget());
+    let note = if n == 0 {
+        format!(
+            "CPU only — {} has no room at a {n_ctx} token context",
+            gpu.name
+        )
+    } else if u64::from(n) > dims.layers {
+        format!("all {} layers on {}", dims.layers, gpu.name)
+    } else {
+        format!("{n} of {} layers on {}", dims.layers, gpu.name)
+    };
+    (params.with_n_gpu_layers(n), note)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_and_generate(
     ctx: &mut LlamaContext<'_>,
