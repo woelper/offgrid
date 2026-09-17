@@ -89,7 +89,20 @@ jobs:
           mkdir -p dist
           7z a "dist/offgrid-${VERSION}-${{ matrix.target }}.zip" ./target/release/offgrid.exe
 
+      # gh, not a third-party action: softprops/action-gh-release targets Node
+      # 20, the runners now force Node 24 on it, and its uploads started
+      # failing with "Error creating asset temp dir" — two of four artifacts
+      # in v0.4.2. gh ships on every runner and has no Node of its own.
+      #
+      # The four build jobs race to create the release; whoever loses finds it
+      # already there, which is why create is allowed to fail. --clobber makes
+      # a re-run of one job replace its own asset instead of erroring.
       - name: Upload to GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
