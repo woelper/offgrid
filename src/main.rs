@@ -1,3 +1,8 @@
+// Release builds link as a GUI app so double-clicking offgrid.exe does not
+// open a console window behind the UI. Debug builds keep the console
+// subsystem, so `cargo run` still prints without any of the plumbing below.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod agent;
 mod app;
 mod bridge;
@@ -33,7 +38,64 @@ pub fn hard_exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// Reattach to the terminal that launched us (Windows only).
+///
+/// A GUI-subsystem binary starts with no console at all, so `--tui`,
+/// `--smoke` and friends would print into the void when run from cmd or
+/// PowerShell. `AttachConsole(ATTACH_PARENT_PROCESS)` borrows the parent's
+/// console when there is one and fails harmlessly when there isn't (launched
+/// from Explorer) — which is exactly the case where we want no window.
+///
+/// The attach itself does not necessarily fill in the process' standard
+/// handles, so we point any unset handle at the console device. Handles the
+/// parent already gave us are left alone: that is how `offgrid --smoke > log`
+/// keeps redirecting to the file.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return; // no parent console — stay quiet, as a GUI app should
+    }
+
+    let bind = |which: u32, device: &str, read: bool| {
+        let existing = unsafe { GetStdHandle(which) };
+        if !existing.is_null() && existing != INVALID_HANDLE_VALUE {
+            return; // inherited or redirected by the caller; don't clobber it
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(read)
+            .write(!read)
+            .open(device)
+        {
+            unsafe { SetStdHandle(which, file.as_raw_handle() as *mut c_void) };
+            // The handle now belongs to the process' stdio; closing the File
+            // at the end of this scope would close it out from under us.
+            std::mem::forget(file);
+        }
+    };
+    bind(STD_INPUT_HANDLE, "CONIN$", true);
+    bind(STD_OUTPUT_HANDLE, "CONOUT$", false);
+    bind(STD_ERROR_HANDLE, "CONOUT$", false);
+}
+
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    attach_parent_console();
+
     // Headless check of the core plumbing (download → load → generate → serve).
     if std::env::args().any(|a| a == "--smoke") {
         smoke(false);

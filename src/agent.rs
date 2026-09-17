@@ -2036,8 +2036,13 @@ fn run_command_with_timeout(
     }
     #[cfg(windows)]
     let mut cmd = {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW: offgrid is a GUI app on Windows, so spawning the
+        // console-subsystem `cmd` would flash a black window for every tool
+        // call the agent makes. We only ever read the piped output anyway.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.arg("/C").arg(command).creation_flags(CREATE_NO_WINDOW);
         c
     };
     #[cfg(not(windows))]
