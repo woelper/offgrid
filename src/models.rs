@@ -100,7 +100,8 @@ pub fn gguf_dims(path: &Path) -> Option<GgufDims> {
         let t = read!(u32);
         // Metadata that matters comes first; the tokenizer arrays after it
         // are megabytes we need not walk.
-        if key.starts_with("tokenizer.") && layers.is_some() && kv_heads.or(kv_heads_sum).is_some() {
+        if key.starts_with("tokenizer.") && layers.is_some() && kv_heads.or(kv_heads_sum).is_some()
+        {
             break;
         }
         let want = !arch.is_empty() && key.starts_with(arch.as_str());
@@ -224,7 +225,12 @@ impl Fit {
     /// header when available (see `kv_bytes_per_token`) — the size-based
     /// guess called a 17 GB mixture-of-experts "too big" at 32k on a 32 GB
     /// box when it really needs ~22 GB.
-    pub fn of_model(model_size: u64, kv_per_token: Option<u64>, total_ram: u64, n_ctx: u32) -> Self {
+    pub fn of_model(
+        model_size: u64,
+        kv_per_token: Option<u64>,
+        total_ram: u64,
+        n_ctx: u32,
+    ) -> Self {
         let needed = match kv_per_token {
             Some(kv) => model_size + BASE_OVERHEAD + kv * n_ctx as u64,
             None => model_size + overhead(model_size, n_ctx),
@@ -708,7 +714,10 @@ mod tests {
         assert_eq!(Fit::of(moe, ram32, 32768), Fit::TooBig); // the old guess
         assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 32768), Fit::Fits);
         assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 65_536), Fit::Tight);
-        assert_eq!(Fit::of_model(moe, Some(98_304), ram32, 131_072), Fit::TooBig);
+        assert_eq!(
+            Fit::of_model(moe, Some(98_304), ram32, 131_072),
+            Fit::TooBig
+        );
     }
 
     /// Reads the real header of a local model when one is on disk (the
@@ -721,7 +730,7 @@ mod tests {
         };
         for e in entries.flatten() {
             let p = e.path();
-            if !p.extension().is_some_and(|x| x == "gguf") {
+            if p.extension().is_none_or(|x| x != "gguf") {
                 continue;
             }
             let kv = kv_bytes_per_token(&p).expect("header parses");

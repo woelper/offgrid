@@ -341,9 +341,10 @@ type Face = (&'static str, &'static [u8]);
 /// the bold family (`bind_bold`) or epaint panics when bold text is drawn.
 fn install_fonts(ctx: &egui::Context, regular: Face, mono: Face, bold: Face) {
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert(regular.0.into(), egui::FontData::from_static(regular.1).into());
+    fonts.font_data.insert(
+        regular.0.into(),
+        egui::FontData::from_static(regular.1).into(),
+    );
     fonts
         .font_data
         .insert(mono.0.into(), egui::FontData::from_static(mono.1).into());

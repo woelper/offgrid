@@ -176,9 +176,7 @@ fn web_probe(model_match: &str, question: &str) {
     println!("question: {question}\n");
 
     // Keep KV small so big models don't thrash while we probe.
-    llama_cpp_2::send_logs_to_tracing(
-        llama_cpp_2::LogOptions::default().with_logs_enabled(false),
-    );
+    llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(false));
     let handle = llm::spawn_worker(hardware::HardwareProfile::detect().physical_cores);
     handle
         .cmd_tx

@@ -622,7 +622,11 @@ impl<'a> Run<'a> {
     fn elide_old_writes(&mut self) {
         let mut elided = 0;
         while self.intact_writes.len() > KEEP_FULL_WRITES
-            && self.messages.iter().map(|m| m.content.len() / 3 + 8).sum::<usize>()
+            && self
+                .messages
+                .iter()
+                .map(|m| m.content.len() / 3 + 8)
+                .sum::<usize>()
                 > self.n_ctx as usize * 3 / 4
         {
             let idx = self.intact_writes.remove(0);
@@ -679,7 +683,8 @@ impl<'a> Run<'a> {
         if let Some(e) = gen_error {
             // On context overflow, compact progressively harder and retry
             // instead of aborting the run.
-            let can_compact = self.compact_level < 3 || self.messages.len() > 2 + COMPACT_KEEP_RECENT;
+            let can_compact =
+                self.compact_level < 3 || self.messages.len() > 2 + COMPACT_KEEP_RECENT;
             if e.starts_with("context window full") && can_compact {
                 self.compact_level = (self.compact_level + 1).min(3);
                 self.log
@@ -759,7 +764,8 @@ impl<'a> Run<'a> {
                     "response narrates a write but no tool was called; nudging model",
                 );
                 let _ = self.tx.send(AgentEvent::Info(
-                    "model claimed a write without calling a tool — asking it to really write".into(),
+                    "model claimed a write without calling a tool — asking it to really write"
+                        .into(),
                 ));
                 Arc::make_mut(&mut self.messages).push(ChatMessage {
                     role: Role::User,
@@ -842,7 +848,13 @@ impl<'a> Run<'a> {
         }
         let summary = response.trim_end().trim_end_matches("<tool_call>").trim();
         if !summary.is_empty() {
-            append_history(self.workspace, "Done", &self.task, summary, &self.files_touched);
+            append_history(
+                self.workspace,
+                "Done",
+                &self.task,
+                summary,
+                &self.files_touched,
+            );
         }
         clear_saved_run(self.workspace);
         self.log
@@ -1037,7 +1049,10 @@ impl<'a> Run<'a> {
         // window (see `elide_old_writes`).
         if ok
             && call.name == "write_file"
-            && self.messages.last().is_some_and(|m| m.role == Role::Assistant)
+            && self
+                .messages
+                .last()
+                .is_some_and(|m| m.role == Role::Assistant)
         {
             self.intact_writes.push(self.messages.len() - 1);
         }
@@ -1046,8 +1061,7 @@ impl<'a> Run<'a> {
             // both the transcript and the model.
             output = "(no output — completed successfully)".to_string();
         }
-        self.log
-            .log(&format!("TOOL RESULT (ok={ok})"), &output);
+        self.log.log(&format!("TOOL RESULT (ok={ok})"), &output);
         let _ = self.tx.send(AgentEvent::ToolResult {
             output: output.clone(),
             ok,
@@ -1196,7 +1210,8 @@ fn elide_write(msg: &mut ChatMessage) {
         }
     });
     msg.content.truncate(pos);
-    msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+    msg.content
+        .push_str(&format!("<tool_call>{stub}</tool_call>"));
 }
 
 /// Saved runs checkpointed before elide_write existed carry the old prose
@@ -1224,7 +1239,8 @@ fn upgrade_legacy_stubs(messages: &mut [ChatMessage]) {
             }
         });
         msg.content.truncate(pos);
-        msg.content.push_str(&format!("<tool_call>{stub}</tool_call>"));
+        msg.content
+            .push_str(&format!("<tool_call>{stub}</tool_call>"));
     }
 }
 
@@ -2472,8 +2488,12 @@ mod tests {
              the skeleton components?\n<tool_call>"
         ));
         assert!(asks_the_user("Shall I proceed with the migration?"));
-        assert!(asks_the_user("Let me know if you want me to also add tests."));
-        assert!(!asks_the_user("All done: cargo test passes and the README is updated."));
+        assert!(asks_the_user(
+            "Let me know if you want me to also add tests."
+        ));
+        assert!(!asks_the_user(
+            "All done: cargo test passes and the README is updated."
+        ));
         // A rhetorical question early in a long finished summary is not a prompt.
         let summary = format!(
             "Why did it fail? The lock was stale.{}\nFixed and verified with cargo test.",
@@ -2856,7 +2876,10 @@ mod tests {
                 .into(),
         };
         elide_write(&mut msg);
-        assert!(msg.content.starts_with("Creating the manifest.\n<tool_call>"));
+        assert!(
+            msg.content
+                .starts_with("Creating the manifest.\n<tool_call>")
+        );
         let call = parse_tool_call(&msg.content).unwrap();
         assert_eq!(call.name, "write_file");
         assert_eq!(call.arg("path"), Some("Cargo.toml"));
@@ -2866,7 +2889,10 @@ mod tests {
         // Not a narrated write either: the nudge path must not fire on it.
         assert!(!claims_fake_write(&msg.content));
         // A turn without a call is left alone.
-        let mut plain = ChatMessage { role: Role::Assistant, content: "Done.".into() };
+        let mut plain = ChatMessage {
+            role: Role::Assistant,
+            content: "Done.".into(),
+        };
         elide_write(&mut plain);
         assert_eq!(plain.content, "Done.");
     }
@@ -2899,7 +2925,10 @@ mod tests {
             msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
             w,
             msg(Role::User, "<tool_response>wrote 9 bytes</tool_response>"),
-            msg(Role::Assistant, "Now checking.\n<tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"cargo check\"}}</tool_call>"),
+            msg(
+                Role::Assistant,
+                "Now checking.\n<tool_call>{\"name\": \"run_command\", \"arguments\": {\"command\": \"cargo check\"}}</tool_call>",
+            ),
         ];
         assert_eq!(purge_elided_writes(&mut messages, "a.rs"), 2);
         assert_eq!(messages.len(), 5);
@@ -2913,24 +2942,38 @@ mod tests {
     #[test]
     fn resume_upgrades_legacy_stubs() {
         let mut messages = vec![
-            ChatMessage { role: Role::User, content: "task".into() },
+            ChatMessage {
+                role: Role::User,
+                content: "task".into(),
+            },
             ChatMessage {
                 role: Role::Assistant,
-                content: "Let me fix it:\n[transcript note: the full write_file call (282 bytes to \
+                content:
+                    "Let me fix it:\n[transcript note: the full write_file call (282 bytes to \
                           forge-rules/src/lib.rs) was removed here to save context — the file is \
                           on disk; read_file shows it]"
-                    .into(),
+                        .into(),
             },
-            ChatMessage { role: Role::User, content: "<tool_response>wrote 282 bytes</tool_response>".into() },
+            ChatMessage {
+                role: Role::User,
+                content: "<tool_response>wrote 282 bytes</tool_response>".into(),
+            },
         ];
         upgrade_legacy_stubs(&mut messages);
         let call = parse_tool_call(&messages[1].content).unwrap();
         assert_eq!(call.name, "write_file");
         assert_eq!(call.arg("path"), Some("forge-rules/src/lib.rs"));
         assert!(call.arg("content").unwrap().contains("282 bytes"));
-        assert!(messages[1].content.starts_with("Let me fix it:\n<tool_call>"));
+        assert!(
+            messages[1]
+                .content
+                .starts_with("Let me fix it:\n<tool_call>")
+        );
         assert!(!claims_fake_write(&messages[1].content));
-        assert_eq!(messages[2].content, "<tool_response>wrote 282 bytes</tool_response>");
+        assert_eq!(
+            messages[2].content,
+            "<tool_response>wrote 282 bytes</tool_response>"
+        );
     }
 
     #[test]
@@ -3105,7 +3148,10 @@ mod tests {
         let mut messages = vec![msg(Role::System, "sys"), msg(Role::User, "task")];
         for i in 0..20 {
             messages.push(msg(Role::Assistant, &format!("turn {i}")));
-            messages.push(msg(Role::User, &format!("<tool_response>r{i}</tool_response>")));
+            messages.push(msg(
+                Role::User,
+                &format!("<tool_response>r{i}</tool_response>"),
+            ));
         }
         let no_web = std::collections::HashSet::new();
         let files = vec!["src/main.rs".to_string(), "Cargo.toml".to_string()];
@@ -3113,10 +3159,17 @@ mod tests {
         assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);
         assert_eq!(messages[0].content, "sys");
         assert_eq!(messages[1].content, "task");
-        assert!(messages[2].content.starts_with("[transcript compacted: 34 earlier messages"));
+        assert!(
+            messages[2]
+                .content
+                .starts_with("[transcript compacted: 34 earlier messages")
+        );
         assert!(messages[2].content.contains("src/main.rs, Cargo.toml"));
         assert_eq!(messages[3].content, "turn 17");
-        assert_eq!(messages.last().unwrap().content, "<tool_response>r19</tool_response>");
+        assert_eq!(
+            messages.last().unwrap().content,
+            "<tool_response>r19</tool_response>"
+        );
         // Nothing left to drop: a second pass is a no-op on the shape.
         compact_transcript(&mut messages, 3, &no_web, &files);
         assert_eq!(messages.len(), 2 + 1 + COMPACT_KEEP_RECENT);

@@ -15,9 +15,9 @@ use crossterm::{cursor, execute, style, terminal};
 
 use crate::agent::{self, AgentEvent, AgentRun};
 use crate::config::{Config, models_dir};
+use crate::hardware::HardwareProfile;
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, LlmCmd, LlmEvent, Role};
-use crate::hardware::HardwareProfile;
 use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
 use crate::session::{self, ChatBusy, Command, Conversation, Mode};
@@ -270,7 +270,11 @@ impl Tui {
             let note = match &dl.failed {
                 Some(e) => format!("failed: {e} — download it again to resume"),
                 None => {
-                    let pct = dl.bytes.saturating_mul(100).checked_div(dl.total).unwrap_or(0);
+                    let pct = dl
+                        .bytes
+                        .saturating_mul(100)
+                        .checked_div(dl.total)
+                        .unwrap_or(0);
                     format!(
                         "{pct}% · {} of {}",
                         crate::hardware::fmt_bytes(dl.bytes),
@@ -306,10 +310,18 @@ impl Tui {
                     }
                     lines.push("Recommended for your hardware (/get chat · /get code):".into());
                     if let Some(c) = &p.chat {
-                        lines.push(format!("  chat  {}  ({})", c.name, self.gauge(c.file, c.size)));
+                        lines.push(format!(
+                            "  chat  {}  ({})",
+                            c.name,
+                            self.gauge(c.file, c.size)
+                        ));
                     }
                     if let Some(c) = &p.code {
-                        lines.push(format!("  code  {}  ({})", c.name, self.gauge(c.file, c.size)));
+                        lines.push(format!(
+                            "  code  {}  ({})",
+                            c.name,
+                            self.gauge(c.file, c.size)
+                        ));
                     }
                 }
                 lines.push(String::new());
@@ -426,9 +438,7 @@ impl Tui {
         writeln!(
             out,
             "{}\r",
-            style::Attribute::Reverse.to_string()
-                + &header
-                + &style::Attribute::Reset.to_string()
+            style::Attribute::Reverse.to_string() + &header + &style::Attribute::Reset.to_string()
         )?;
 
         // Tab bar.
@@ -815,7 +825,10 @@ impl Tui {
         };
         self.tab = Tab::Models;
         self.view = ModelsView::Local;
-        if self.models.iter().any(|m| m.name == entry.file.trim_end_matches(".gguf"))
+        if self
+            .models
+            .iter()
+            .any(|m| m.name == entry.file.trim_end_matches(".gguf"))
             || models_dir().join(entry.file).exists()
         {
             self.status = format!("{} is already downloaded", entry.name);
@@ -825,8 +838,12 @@ impl Tui {
             self.status = format!("{} is already downloading", entry.name);
             return;
         }
-        self.downloads
-            .push(hub::start_download(entry.repo, entry.file, entry.size, &models_dir()));
+        self.downloads.push(hub::start_download(
+            entry.repo,
+            entry.file,
+            entry.size,
+            &models_dir(),
+        ));
         self.status = format!("downloading {}", entry.name);
     }
 
@@ -1050,8 +1067,12 @@ impl Tui {
         if let Some(m) = self.models.get(self.selected) {
             // Loading past physical RAM kills the whole process (llama.cpp
             // aborts), so refuse instead of terminating a headless session.
-            if Fit::of_model(m.size, m.kv_per_token, self.hardware.total_ram, self.n_ctx())
-                == Fit::TooBig
+            if Fit::of_model(
+                m.size,
+                m.kv_per_token,
+                self.hardware.total_ram,
+                self.n_ctx(),
+            ) == Fit::TooBig
             {
                 self.status = format!(
                     "{} won't fit: needs more than the {} of RAM here",
@@ -1091,7 +1112,9 @@ pub fn run() -> Result<(), String> {
     let startup_status = match &config.last_model {
         Some(p) if autoload.is_none() && p.exists() => format!(
             "{} won't fit the {} of RAM here — not auto-loaded; pick another in Models.",
-            p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
             crate::hardware::fmt_bytes(hardware.total_ram)
         ),
         _ => "ready".into(),

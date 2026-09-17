@@ -205,14 +205,7 @@ fn run_model(
                 n_ctx,
             } => {
                 if let Err(e) = session.generate(
-                    model,
-                    backend,
-                    &messages,
-                    &reply,
-                    stop,
-                    n_threads,
-                    temp,
-                    n_ctx,
+                    model, backend, &messages, &reply, stop, n_threads, temp, n_ctx,
                 ) {
                     let _ = reply.send(LlmEvent::Error(e));
                 }
@@ -304,11 +297,7 @@ impl<'m> Session<'m> {
         // Longest prefix already in the cache, leaving one token to decode so
         // the sampler always gets fresh logits for the final position.
         let mut common = reusable_prefix(cache, &tokens);
-        if common < cache.len()
-            && ctx
-                .kv_cache_seq_rm(0, Some(common as u32), None)
-                .is_err()
-        {
+        if common < cache.len() && ctx.kv_cache_seq_rm(0, Some(common as u32), None).is_err() {
             // The backend cannot drop a partial sequence (sliding-window or
             // recurrent models): start the cache over.
             ctx.clear_kv_cache();

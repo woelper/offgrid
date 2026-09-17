@@ -219,7 +219,9 @@ impl OffgridApp {
                 // us last time. Leave it selectable; just don't auto-load it.
                 startup_error = Some(format!(
                     "{} needs more than the {} of RAM here — not auto-loaded.",
-                    last.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    last.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
                     hardware::fmt_bytes(hardware.total_ram)
                 ));
             }
@@ -1247,11 +1249,10 @@ impl OffgridApp {
                             self.chat_ctx_used = 0;
                         }
                         theme::context_meter(ui, self.chat_ctx_used, self.n_ctx() as usize);
-                        ui.checkbox(&mut self.chat_web, "🌐 Web")
-                            .on_hover_text(
-                                "Let the model search the web before answering. \
+                        ui.checkbox(&mut self.chat_web, "🌐 Web").on_hover_text(
+                            "Let the model search the web before answering. \
                                  Your query leaves this machine.",
-                            );
+                        );
                     });
                 });
                 let input_h = 60.0;
