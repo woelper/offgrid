@@ -1,8 +1,9 @@
 name: Set up Vulkan
 description: >
-  Install what ggml needs to compile its Vulkan backend: the headers and
-  loader, plus glslc, which compiles the backend's shaders during the build.
-  The runners have no GPU — this is for building, not running.
+  Set a runner up to compile ggml's Vulkan backend: the headers and loader,
+  glslc for the shaders, and on Windows a build generator that can actually
+  get through the shader-generator sub-build. The runners have no GPU — this
+  is for building, not running.
 
 inputs:
   version:
@@ -51,3 +52,17 @@ runs:
         & "$sdk\Bin\glslc.exe" --version
         Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
         Add-Content $env:GITHUB_PATH "$sdk\Bin"
+
+    # ggml-vulkan builds its shader generator as an ExternalProject and sets
+    # CMP0147 (parallel custom build steps). Under MSBuild those steps race:
+    # the install step ran before the configure step and the build died on a
+    # missing cmake_install.cmake. Ninja has no such ordering bug and is
+    # faster besides. cmake-rs handles MSVC+Ninja itself — it passes the
+    # compiler path and environment — so no vcvars dance is needed.
+    - name: Ninja, for the shader sub-build (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        choco install ninja -y --no-progress
+        ninja --version
+        Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
