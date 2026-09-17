@@ -6,8 +6,12 @@ description: >
 
 inputs:
   version:
-    description: LunarG SDK version to install (Windows only).
-    default: "1.4.309.0"
+    description: >
+      LunarG SDK version to install (Windows only), or "latest" to ask LunarG
+      which one that is. Pinning is a trap here: LunarG prunes older SDKs from
+      its download server, so a version pinned today 404s a few months from
+      now.
+    default: latest
 
 runs:
   using: composite
@@ -18,6 +22,7 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y libvulkan-dev glslc
+        glslc --version
 
     - name: Vulkan SDK (Windows)
       if: runner.os == 'Windows'
@@ -25,8 +30,21 @@ runs:
       env:
         VULKAN_VERSION: ${{ inputs.version }}
       run: |
-        curl.exe -o "$env:RUNNER_TEMP/vulkan-sdk.exe" -L `
-          "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
-        & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
-        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
-        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+        $version = $env:VULKAN_VERSION
+        if (-not $version -or $version -eq 'latest') {
+          $version = (Invoke-RestMethod https://vulkan.lunarg.com/sdk/latest.json).windows
+        }
+        Write-Host "Vulkan SDK $version"
+        $installer = "$env:RUNNER_TEMP\vulkan-sdk.exe"
+        # -f: without it curl saves the server's "Not Found" body as the .exe
+        # and the failure only surfaces later as "not a valid application".
+        curl.exe -fsSL -o $installer `
+          "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+        & $installer --accept-licenses --default-answer --confirm-command install | Out-Null
+        $sdk = "C:\VulkanSDK\$version"
+        if (-not (Test-Path "$sdk\Bin\glslc.exe")) {
+          throw "Vulkan SDK installed but $sdk\Bin\glslc.exe is missing"
+        }
+        & "$sdk\Bin\glslc.exe" --version
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+        Add-Content $env:GITHUB_PATH "$sdk\Bin"
