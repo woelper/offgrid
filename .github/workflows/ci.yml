@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -43,16 +44,18 @@ jobs:
       - name: tests
         run: cargo test -- --skip main_screen_snapshot
 
-  # The GPU build compiles a whole second ggml backend and its shaders, none
-  # of which the default build touches. Without this job a broken
-  # `--features vulkan` would first surface when a release tag is already
-  # pushed and the Windows GPU artifact fails to build.
+  # The GPU build compiles a whole second ggml backend and its shaders, which
+  # takes many minutes — too much for every push, where the ordinary build
+  # above is the check that matters. Run it from the Actions tab when the
+  # Vulkan path or the llama.cpp dependency changes; a release tag builds it
+  # for real anyway, and that job does not fail-fast.
   #
   # It builds rather than checks: linking against the Vulkan loader is its own
   # failure mode, and the compile of llama.cpp dominates either way. The
   # runners have no GPU, so nothing here exercises the offload at runtime —
   # that is what the layer-counting unit tests are for.
   vulkan:
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:

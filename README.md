@@ -146,7 +146,7 @@ compiles ggml's shaders); the resulting binary still runs fine on machines
 with no usable GPU, it just stays on the CPU.
 
 ```sh
-sudo apt install libvulkan-dev glslc          # debian/ubuntu
+sudo apt install libvulkan-dev glslc spirv-headers   # debian/ubuntu
 cargo run --release --features vulkan
 ```
 

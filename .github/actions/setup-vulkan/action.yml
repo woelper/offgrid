@@ -21,7 +21,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y libvulkan-dev glslc
+        # spirv-headers is not optional: ggml-vulkan's CMakeLists does
+        # `find_package(SPIRV-Headers CONFIG REQUIRED)`, and the package is
+        # what ships SPIRV-HeadersConfig.cmake. The Windows SDK bundles it.
+        sudo apt-get install -y libvulkan-dev glslc spirv-headers
         glslc --version
 
     - name: Vulkan SDK (Windows)
