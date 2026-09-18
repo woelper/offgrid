@@ -66,7 +66,7 @@ runs:
           -property installationPath
         $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" |
           Sort-Object { [version]($_.Directory.Parent.Parent.Parent.FullName | Split-Path -Leaf) } |
-          Select-Object -Last -ExpandProperty FullName
+          Select-Object -Last 1 -ExpandProperty FullName
         if (-not $cl) { throw "no MSVC cl.exe found under $vs" }
         Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$cl"
         # CUDA 12.9 predates the VS18-era MSVC on these runners, whose version
