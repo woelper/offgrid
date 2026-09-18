@@ -39,17 +39,31 @@ runs:
 
     - name: CUDA toolkit (Windows)
       if: runner.os == 'Windows'
+      # Capped: a wedged installer must fail the job, not sit on it for hours.
+      timeout-minutes: 45
       uses: Jimver/cuda-toolkit@v0.2.36
       with:
         cuda: ${{ inputs.cuda }}
-        # The full local installer stalls for 25+ minutes on these runners;
-        # the network installer with just nvcc, the runtime/math libraries and
-        # the VS integration stays under ~10. cublas_dev carries the cublasLt
-        # headers the Windows link needs; extend this list if a header or import
-        # library ever goes missing, rather than switching back to local.
+        # Full component set over the network installer. A minimal
+        # sub-package list was tried first — cudafe++ access-violated on a
+        # trivial kernel with every host compiler, which smells like a
+        # silently incomplete install, so completeness wins over download
+        # size here. (The full *local* installer is the fallback if this
+        # ever hangs; it is known to stall 25+ minutes on these runners.)
         method: network
-        sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
         log-file-suffix: 'windows-cuda.txt'
+
+    # What exactly got installed? A cudafe++ that reports a different version
+    # than nvcc (or a bin dir missing the usual companions) means a mixed or
+    # partial install — the classic cause of cudafe++ access violations.
+    - name: CUDA install diagnostics (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        nvcc --version
+        & "$env:CUDA_PATH\bin\cudafe++.exe" --version
+        Get-ChildItem "$env:CUDA_PATH\bin" -File |
+          Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  bin: $_" }
 
     # nvcc needs cl.exe plus the MSVC/Windows-SDK INCLUDE/LIB — none of which
     # a stock runner PATH provides. So: enumerate every MSVC toolset on every
