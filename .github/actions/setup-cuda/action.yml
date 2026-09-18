@@ -93,7 +93,14 @@ runs:
         Set-Content -Path "$env:RUNNER_TEMP\probe.cu" -Value '#include <cuda_runtime.h>
         __global__ void k() {}
         int main(){return 0;}'
+        # Full matrix per candidate, cheapest first: a bare kernel separates a
+        # broken cudafe++ from one choking on headers, and strict separates an
+        # allowlist rejection (clean, expected on new toolsets) from a real
+        # crash. The first candidate with a FULL pass wins, preferring strict
+        # so the real build only carries the bypass flag when it proved
+        # necessary.
         $winner = $null
+        $winnerFree = $false
         foreach ($c in ($candidates | Sort-Object { [version]$_.Ver } -Descending)) {
           $toolset = ($c.Ver -split '\.')[0..1] -join '.'
           Write-Host "probing host compiler $($c.Cl) (vcvars_ver=$toolset)"
@@ -107,35 +114,43 @@ runs:
             }
           }
           $include = [Environment]::GetEnvironmentVariable('INCLUDE', 'Process')
-          Write-Host "  INCLUDE head: $($include.Substring(0, [Math]::Min(220, $include.Length)))"
-          # Minimal probe first (no headers): tells a broken cudafe++ apart
-          # from one choking on MSVC/SDK headers.
-          $minOk = $true
-          & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin $c.Cl -allow-unsupported-compiler `
-            -c "$env:RUNNER_TEMP\probe_min.cu" -o "$env:RUNNER_TEMP\probe_min.obj" 2>&1 |
-            ForEach-Object { Write-Host "  [min] $_" }
-          if ($LASTEXITCODE -ne 0) { $minOk = $false }
-          $fullOk = $false
-          if ($minOk) {
-            & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin $c.Cl -allow-unsupported-compiler `
-              -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
-              ForEach-Object { Write-Host "  [full] $_" }
-            if ($LASTEXITCODE -eq 0) { $fullOk = $true }
+          Write-Host "  INCLUDE head: $($include.Substring(0, [Math]::Min(160, $include.Length)))"
+          $nvcc = "$env:CUDA_PATH\bin\nvcc.exe"
+          Write-Host '  [min/strict]'
+          & $nvcc -ccbin $c.Cl -c "$env:RUNNER_TEMP\probe_min.cu" -o "$env:RUNNER_TEMP\probe_min.obj" 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+          $minStrict = $LASTEXITCODE -eq 0
+          $fullStrict = $false
+          if ($minStrict) {
+            Write-Host '  [full/strict]'
+            & $nvcc -ccbin $c.Cl -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
+              ForEach-Object { Write-Host "    $_" }
+            $fullStrict = $LASTEXITCODE -eq 0
           }
-          if ($fullOk) {
-            $winner = $c
-            break
+          if ($fullStrict) { $winner = $c; break }
+          Write-Host '  [min/free]'
+          & $nvcc -ccbin $c.Cl -allow-unsupported-compiler -c "$env:RUNNER_TEMP\probe_min.cu" -o "$env:RUNNER_TEMP\probe_min.obj" 2>&1 |
+            ForEach-Object { Write-Host "    $_" }
+          $fullFree = $false
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host '  [full/free]'
+            & $nvcc -ccbin $c.Cl -allow-unsupported-compiler -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
+              ForEach-Object { Write-Host "    $_" }
+            $fullFree = $LASTEXITCODE -eq 0
           }
+          if ($fullFree) { $winner = $c; $winnerFree = $true; break }
         }
         if (-not $winner) { throw "no working nvcc host compiler found" }
-        Write-Host "using host compiler $($winner.Cl)"
+        Write-Host "using host compiler $($winner.Cl) (bypass flag needed: $winnerFree)"
         Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$($winner.Cl)"
         foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
           Add-Content $env:GITHUB_ENV "$v=$([Environment]::GetEnvironmentVariable($v, 'Process'))"
         }
-        # The allowlist check is bypassed for the hand-picked compiler too —
-        # harmless where supported, required where it is not.
-        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+        if ($winnerFree) {
+          # Only when a strict probe proved necessary: newer MSVC than the
+          # toolkit's host_config.h allowlist knows.
+          Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+        }
 
     - name: nvcc check
       shell: bash
