@@ -154,7 +154,11 @@ runs:
         }
         if (-not $winner) { throw "no working nvcc host compiler found" }
         Write-Host "using host compiler $($winner.Cl) (bypass flag needed: $winnerFree)"
-        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$($winner.Cl)"
+        # Forward slashes: CMake re-emits this value into its generated
+        # CMakeCUDACompiler.cmake, where backslashes die as invalid escapes
+        # (`Invalid character escape '\P'`).
+        $hostCompiler = $winner.Cl -replace '\\', '/'
+        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$hostCompiler"
         foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
           Add-Content $env:GITHUB_ENV "$v=$([Environment]::GetEnvironmentVariable($v, 'Process'))"
         }
