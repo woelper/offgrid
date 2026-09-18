@@ -100,8 +100,10 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # windows-2022 for the same reason as the release matrix below: VS 2026
+      # on windows-latest crashes cudafe++.
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

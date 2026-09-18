@@ -33,7 +33,11 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64-cuda
             features: cuda
-          - os: windows-latest
+          # windows-2022, not -latest: the Server 2025 / VS 2026 image ships
+          # an MSVC whose headers crash cudafe++ (ACCESS_VIOLATION on a
+          # trivial kernel, all toolsets), while VS 2022 17.x is the toolchain
+          # CUDA 12.x was built for. Revisit if GitHub retires the image.
+          - os: windows-2022
             target: windows-x86_64-cuda
             features: cuda
     runs-on: ${{ matrix.os }}
