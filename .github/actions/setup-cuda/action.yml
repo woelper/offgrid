@@ -53,13 +53,14 @@ runs:
 
     # nvcc needs cl.exe plus the MSVC/Windows-SDK INCLUDE/LIB — none of which
     # a stock runner PATH provides. So: enumerate every MSVC toolset on every
-    # VS instance, source that instance's own vcvars env (INCLUDE/LIB/LIBPATH
-    # only — PATH stays untouched, see below), and probe-compile with its cl.
-    # Newest working toolset wins. (CUDA 12.9's cudafe++ access-violates on
-    # the VS18-era MSVC 14.51 headers, so where an image also carries VS17 the
-    # older cl is what actually works.) The probe fails the job fast with
-    # nvcc's raw error instead of after a 30-minute cargo build, where CMake
-    # would only report "No CUDA toolset found".
+    # VS instance, source that toolset's *own* vcvars env (`-vcvars_ver`, not
+    # the instance default — a newer cl against older headers crashes cudafe++
+    # just as surely as the reverse), and probe-compile with it. Newest
+    # working toolset wins. (CUDA 12.9's cudafe++ access-violates on the
+    # VS18-era MSVC 14.51 headers, so where an image also carries older
+    # toolsets one of those is what actually works.) The probe fails the job
+    # fast with nvcc's raw error instead of after a 30-minute cargo build,
+    # where CMake would only report "No CUDA toolset found".
     #
     # Deliberately no vcvars-style PATH rewrite and no msvc-dev-cmd: rustc, cc
     # and CMake all find MSVC on their own (as the plain and Vulkan Windows
@@ -84,16 +85,20 @@ runs:
           }
         }
         if (-not $candidates) { throw "no MSVC cl.exe found in any VS instance" }
+        Write-Host "Windows SDKs on this image:"
+        Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory -ErrorAction SilentlyContinue |
+          Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  SDK $_" }
         Set-Content -Path "$env:RUNNER_TEMP\probe.cu" -Value '#include <cuda_runtime.h>
         __global__ void k() {}
         int main(){return 0;}'
         $winner = $null
         foreach ($c in ($candidates | Sort-Object { [version]$_.Ver } -Descending)) {
-          Write-Host "probing host compiler $($c.Cl)"
+          $toolset = ($c.Ver -split '\.')[0..1] -join '.'
+          Write-Host "probing host compiler $($c.Cl) (vcvars_ver=$toolset)"
           foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
             [Environment]::SetEnvironmentVariable($v, $null, 'Process')
           }
-          cmd /c "`"$($c.Vs)\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+          cmd /c "`"$($c.Vs)\VC\Auxiliary\Build\vcvars64.bat`" -vcvars_ver=$toolset >nul && set" | ForEach-Object {
             if ($_ -match '^(INCLUDE|LIB|LIBPATH)=(.*)$') {
               [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
             }
