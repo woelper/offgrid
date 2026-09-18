@@ -51,48 +51,70 @@ runs:
         sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
         log-file-suffix: 'windows-cuda.txt'
 
-    # nvcc's `-ccbin` plus the MSVC/Windows-SDK INCLUDE/LIB it needs: CMake's
-    # CUDA compiler check dies with "No CUDA toolset found" when nvcc cannot
-    # see a host compiler, and nothing on a stock runner PATH provides cl.exe.
-    # llama-cpp-sys-2's build script forwards every CMAKE_ variable to its
-    # CMake configure, so exports here land as -D flags there.
-    - name: CUDA host compiler and MSVC env (Windows)
+    # nvcc needs cl.exe plus the MSVC/Windows-SDK INCLUDE/LIB — none of which
+    # a stock runner PATH provides. So: enumerate every MSVC toolset on every
+    # VS instance, source that instance's own vcvars env (INCLUDE/LIB/LIBPATH
+    # only — PATH stays untouched, see below), and probe-compile with its cl.
+    # Newest working toolset wins. (CUDA 12.9's cudafe++ access-violates on
+    # the VS18-era MSVC 14.51 headers, so where an image also carries VS17 the
+    # older cl is what actually works.) The probe fails the job fast with
+    # nvcc's raw error instead of after a 30-minute cargo build, where CMake
+    # would only report "No CUDA toolset found".
+    #
+    # Deliberately no vcvars-style PATH rewrite and no msvc-dev-cmd: rustc, cc
+    # and CMake all find MSVC on their own (as the plain and Vulkan Windows
+    # jobs prove), while a wholesale PATH rewrite once made rustc resolve
+    # Git's `link.exe` instead of MSVC's and fail every link.
+    - name: CUDA host compiler (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
-        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
-          -latest -products * `
+        $instances = @(& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+          -products * `
           -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-          -property installationPath
-        $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" |
-          Sort-Object { [version]($_.Directory.Parent.Parent.Parent.FullName | Split-Path -Leaf) } |
-          Select-Object -Last 1 -ExpandProperty FullName
-        if (-not $cl) { throw "no MSVC cl.exe found under $vs" }
-        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$cl"
-        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
-          if ($_ -match '^(INCLUDE|LIB|LIBPATH)=(.*)$') {
-            Add-Content $env:GITHUB_ENV "$($matches[1])=$($matches[2])"
+          -property installationPath)
+        if (-not $instances -or -not $instances[0]) { throw "vswhere found no VS with C++ tools" }
+        $candidates = foreach ($vs in $instances) {
+          foreach ($cl in (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -ErrorAction SilentlyContinue)) {
+            [pscustomobject]@{
+              Vs = $vs
+              Cl = $cl.FullName
+              Ver = ($cl.Directory.Parent.Parent.Parent.FullName | Split-Path -Leaf)
+            }
           }
         }
-        if (-not (Select-String -Path $env:GITHUB_ENV -Pattern '^INCLUDE=' -Quiet)) {
-          throw "vcvars import produced no INCLUDE"
-        }
-        # CUDA 12.9 predates the VS18-era MSVC on these runners, whose version
-        # nvcc's host_config.h allowlist rejects — opt out of that check.
-        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
-
-    # Fail fast with nvcc's raw error instead of after a 30-minute cargo
-    # build: CMake's "No CUDA toolset found" swallows the real message.
-    - name: nvcc probe compile (Windows)
-      if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
+        if (-not $candidates) { throw "no MSVC cl.exe found in any VS instance" }
         Set-Content -Path "$env:RUNNER_TEMP\probe.cu" -Value '#include <cuda_runtime.h>
         __global__ void k() {}
         int main(){return 0;}'
-        & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin "$env:CMAKE_CUDA_HOST_COMPILER" `
-          -allow-unsupported-compiler -c "$env:RUNNER_TEMP\probe.cu" `
-          -o "$env:RUNNER_TEMP\probe.obj"
+        $winner = $null
+        foreach ($c in ($candidates | Sort-Object { [version]$_.Ver } -Descending)) {
+          Write-Host "probing host compiler $($c.Cl)"
+          foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
+            [Environment]::SetEnvironmentVariable($v, $null, 'Process')
+          }
+          cmd /c "`"$($c.Vs)\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^(INCLUDE|LIB|LIBPATH)=(.*)$') {
+              [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+          }
+          & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin $c.Cl -allow-unsupported-compiler `
+            -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
+            ForEach-Object { Write-Host "  $_" }
+          if ($LASTEXITCODE -eq 0) {
+            $winner = $c
+            break
+          }
+        }
+        if (-not $winner) { throw "no working nvcc host compiler found" }
+        Write-Host "using host compiler $($winner.Cl)"
+        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$($winner.Cl)"
+        foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
+          Add-Content $env:GITHUB_ENV "$v=$([Environment]::GetEnvironmentVariable($v, 'Process'))"
+        }
+        # The allowlist check is bypassed for the hand-picked compiler too —
+        # harmless where supported, required where it is not.
+        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
 
     - name: nvcc check
       shell: bash
