@@ -25,6 +25,17 @@ jobs:
           - os: windows-latest
             target: windows-x86_64-vulkan
             features: vulkan
+          # CUDA artifacts: NVIDIA only, and the fastest backend on their
+          # cards. Two of them because the link differs per OS — static on
+          # Linux (the binary is self-contained), dynamic on Windows (the
+          # runtime DLLs travel in the zip). Both need the NVIDIA driver at
+          # runtime; without a usable GPU they stay on the CPU.
+          - os: ubuntu-latest
+            target: linux-x86_64-cuda
+            features: cuda
+          - os: windows-latest
+            target: windows-x86_64-cuda
+            features: cuda
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +62,14 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          cargo bundle --release --format deb
+          if [ "${{ matrix.features }}" = "cuda" ]; then
+            export NUM_JOBS=2
+          fi
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo bundle --release --format deb --features "${{ matrix.features }}"
+          else
+            cargo bundle --release --format deb
+          fi
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist
           cp target/release/bundle/deb/*.deb "dist/offgrid-${VERSION}-${{ matrix.target }}.deb"
@@ -76,10 +94,18 @@ jobs:
       - uses: ./.github/actions/setup-vulkan
         if: matrix.features == 'vulkan'
 
+      # nvcc compiles ggml's CUDA kernels at build time, so the toolkit has
+      # to be there before cargo runs — the driver alone is not enough.
+      - uses: ./.github/actions/setup-cuda
+        if: matrix.features == 'cuda'
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          if [ "${{ matrix.features }}" = "cuda" ]; then
+            export NUM_JOBS=2
+          fi
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release --features "${{ matrix.features }}"
           else
@@ -87,7 +113,17 @@ jobs:
           fi
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist
-          7z a "dist/offgrid-${VERSION}-${{ matrix.target }}.zip" ./target/release/offgrid.exe
+          FILES="./target/release/offgrid.exe"
+          if [ "${{ matrix.features }}" = "cuda" ]; then
+            # The Windows CUDA link is dynamic (NVIDIA ships no static cublas
+            # there), so the runtime DLLs travel in the zip next to the exe.
+            CUDA_BIN="$(cygpath -u "$CUDA_PATH/bin")"
+            cp "$CUDA_BIN"/cudart64_*.dll "$CUDA_BIN"/cublas64_*.dll \
+              "$CUDA_BIN"/cublasLt64_*.dll ./target/release/
+            FILES="$FILES ./target/release/cudart64_*.dll ./target/release/cublas64_*.dll ./target/release/cublasLt64_*.dll"
+          fi
+          # shellcheck disable=SC2086: FILES is a file list, splitting intended
+          7z a "dist/offgrid-${VERSION}-${{ matrix.target }}.zip" $FILES
 
       # gh, not a third-party action: softprops/action-gh-release targets Node
       # 20, the runners now force Node 24 on it, and its uploads started

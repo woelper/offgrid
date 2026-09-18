@@ -153,6 +153,16 @@ cargo run --release --features vulkan
 On Windows, install the [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) so
 `VULKAN_SDK` is set, or take the `-vulkan` zip from the releases page.
 
+On NVIDIA cards the CUDA backend is faster still. Build with
+`--features cuda` (needs the CUDA toolkit: `nvcc` plus the cublas/cudart dev
+libraries); the releases page ships a `-cuda` zip for Windows and a `-cuda`
+tarball for Linux. A CUDA binary needs the NVIDIA driver installed — without
+a usable GPU it stays on the CPU, same as the Vulkan one.
+
+```sh
+cargo run --release --features cuda
+```
+
 What it changes, once a card is found:
 
 - **Settings → System** names the card and its VRAM.
@@ -216,6 +226,6 @@ cp tests/snapshots/offgrid.png assets/screenshot.png
 
 ## Roadmap
 
-- GPU offload: CUDA and ROCm backends (Vulkan is in — see above)
+- GPU offload: ROCm backend (Vulkan and CUDA are in — see above)
 - Persistent conversations
 - Agent: edit/patch tool, diff view, multi-task memory

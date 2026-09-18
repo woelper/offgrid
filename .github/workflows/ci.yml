@@ -80,3 +80,44 @@ jobs:
 
       - name: build
         run: cargo build --features vulkan
+
+  # Same deal as `vulkan`, with an even slower compile: the toolkit install
+  # plus the multi-arch nvcc build are the longest steps in any workflow here.
+  # Manual only, run from the Actions tab when the CUDA path changes; a
+  # release tag builds it for real anyway.
+  #
+  # It builds rather than checks, for the same reason (linking against cudart
+  # and cublas is its own failure mode). The runners have no GPU, so nothing
+  # here exercises the offload at runtime — that is what the layer-counting
+  # unit tests and a physical NVIDIA box are for.
+  cuda:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev
+
+      - uses: ./.github/actions/setup-cuda
+
+      - name: build
+        # The cmake crate reads NUM_JOBS for build parallelism: unbounded
+        # parallel nvcc OOM-kills the 16 GB runners on the fat multi-arch
+        # compile, so two at a time — slow, but it survives.
+        env:
+          NUM_JOBS: 2
+        run: cargo build --features cuda

@@ -20,6 +20,12 @@ short_description = "Fully local LLM prepper tool"
 # A binary built with it still runs where there is no usable GPU — llama.cpp
 # finds no Vulkan device and everything stays on the CPU.
 vulkan = ["llama-cpp-2/vulkan"]
+# GPU offload through CUDA — NVIDIA only, and the fastest backend on their
+# cards. Off by default: building it needs the CUDA toolkit (nvcc plus the
+# cublas/cudart dev libraries), while a plain `cargo build` should keep
+# working with nothing installed. A binary built with it needs the NVIDIA
+# driver installed; where there is no usable GPU it stays on the CPU.
+cuda = ["llama-cpp-2/cuda"]
 
 [dependencies]
 crossterm = "0.29.0"

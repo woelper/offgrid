@@ -13,8 +13,8 @@ use sysinfo::System;
 const DISCRETE_GPU_BANDWIDTH: u64 = 200_000_000_000;
 
 /// A GPU llama.cpp can offload layers to. Only ever `Some` in a build with a
-/// GPU backend compiled in (`--features vulkan`, or Metal on macOS) *and* on
-/// a machine that actually has one.
+/// GPU backend compiled in (`--features vulkan` or `--features cuda`, or
+/// Metal on macOS) *and* on a machine that actually has one.
 #[derive(Clone, Debug)]
 pub struct Gpu {
     /// What the driver calls it, e.g. "NVIDIA GeForce RTX 2070 SUPER".
@@ -41,9 +41,9 @@ impl Gpu {
 
 /// The GPU this machine offers llama.cpp, detected once.
 ///
-/// Enumerating devices spins up the Vulkan loader, so the result is cached —
-/// which also means `vram_free` is a snapshot from startup. That is the
-/// conservative direction: it was taken before we loaded anything ourselves.
+/// Enumerating devices spins up the GPU backend loader, so the result is
+/// cached — which also means `vram_free` is a snapshot from startup. That is
+/// the conservative direction: it was taken before we loaded anything ourselves.
 pub fn gpu() -> Option<&'static Gpu> {
     static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
     GPU.get_or_init(detect_gpu).as_ref()
@@ -155,10 +155,12 @@ impl HardwareProfile {
                 fmt_bytes(g.vram_total),
                 fmt_bytes(g.vram_free)
             ),
-            None if cfg!(feature = "vulkan") => {
-                "none found — running on the CPU (no Vulkan device)".into()
+            None if cfg!(any(feature = "vulkan", feature = "cuda")) => {
+                "none found — running on the CPU (no GPU device)".into()
             }
-            None => "not built in — running on the CPU (build with --features vulkan)".into(),
+            None => {
+                "not built in — running on the CPU (build with --features vulkan or cuda)".into()
+            }
         }
     }
 }

@@ -1,0 +1,56 @@
+name: Set up CUDA
+description: >
+  Set a runner up to compile ggml's CUDA backend: the CUDA toolkit (nvcc plus
+  the cublas/cudart dev libraries) and, on Windows, an MSVC environment so
+  nvcc finds its host compiler. The runners have no GPU — this is for
+  building, not running.
+
+inputs:
+  cuda:
+    description: >
+      CUDA toolkit version to install. Pinned, not floating: a new major drops
+      older architectures and repackages the installer, so bumps are
+      deliberate. The version must exist in Jimver/cuda-toolkit's links for
+      both Linux and Windows.
+    default: '12.9.1'
+
+runs:
+  using: composite
+  steps:
+    # nvcc shells out to cl on Windows; without the VS environment CMake's
+    # CUDA compiler check fails before compiling a single kernel.
+    - name: MSVC environment for nvcc (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: CUDA toolkit (Linux)
+      if: runner.os == 'Linux'
+      # Pinned at patch level, not master: the 0.2.25–0.2.28 range broke
+      # installs on Windows runners, and only the tag tells us what we got.
+      uses: Jimver/cuda-toolkit@v0.2.36
+      with:
+        cuda: ${{ inputs.cuda }}
+        # The full local installer drags in drivers and samples the build
+        # never touches; --toolkit keeps nvcc and the libraries.
+        linux-local-args: '["--toolkit"]'
+        # Required: without it every matrix job uploads its install log under
+        # the same name.
+        log-file-suffix: 'linux-cuda.txt'
+
+    - name: CUDA toolkit (Windows)
+      if: runner.os == 'Windows'
+      uses: Jimver/cuda-toolkit@v0.2.36
+      with:
+        cuda: ${{ inputs.cuda }}
+        # The full local installer stalls for 25+ minutes on these runners;
+        # the network installer with just nvcc, the runtime/math libraries and
+        # the VS integration stays under ~10. cublas_dev carries the cublasLt
+        # headers the Windows link needs; extend this list if a header or import
+        # library ever goes missing, rather than switching back to local.
+        method: network
+        sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+        log-file-suffix: 'windows-cuda.txt'
+
+    - name: nvcc check
+      shell: bash
+      run: nvcc --version
