@@ -39,8 +39,6 @@ runs:
 
     - name: CUDA toolkit (Windows)
       if: runner.os == 'Windows'
-      # Capped: a wedged installer must fail the job, not sit on it for hours.
-      timeout-minutes: 45
       uses: Jimver/cuda-toolkit@v0.2.36
       with:
         cuda: ${{ inputs.cuda }}

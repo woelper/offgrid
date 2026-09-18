@@ -96,6 +96,8 @@ jobs:
   # unit tests and a physical NVIDIA box are for.
   cuda:
     if: github.event_name == 'workflow_dispatch'
+    # Capped: a wedged toolkit installer must fail the job, not sit on it.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
