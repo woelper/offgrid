@@ -1,8 +1,7 @@
 name: Set up CUDA
 description: >
   Set a runner up to compile ggml's CUDA backend: the CUDA toolkit (nvcc plus
-  the cublas/cudart dev libraries) and, on Windows, an MSVC environment so
-  nvcc finds its host compiler. The runners have no GPU — this is for
+  the cublas/cudart dev libraries). The runners have no GPU — this is for
   building, not running.
 
 inputs:
@@ -17,12 +16,12 @@ inputs:
 runs:
   using: composite
   steps:
-    # nvcc shells out to cl on Windows; without the VS environment CMake's
-    # CUDA compiler check fails before compiling a single kernel.
-    - name: MSVC environment for nvcc (Windows)
-      if: runner.os == 'Windows'
-      uses: ilammy/msvc-dev-cmd@v1
-
+    # Deliberately no vcvars/msvc-dev-cmd here: rustc, cc and CMake all find
+    # MSVC on their own (as the plain and Vulkan Windows jobs prove), while a
+    # wholesale PATH rewrite made rustc resolve Git's `link.exe` instead of
+    # MSVC's and fail every link. nvcc locates its host compiler the same
+    # independent way; if it ever cannot, scope that fix to nvcc
+    # (CUDAHOSTCXX) instead of rewriting PATH.
     - name: CUDA toolkit (Linux)
       if: runner.os == 'Linux'
       # Pinned at patch level, not master: the 0.2.25–0.2.28 range broke

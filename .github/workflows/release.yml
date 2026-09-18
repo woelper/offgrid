@@ -58,6 +58,19 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo install cargo-bundle
 
+      # GPU toolkits live up here, before every build step: the Linux CUDA
+      # job needs nvcc just like the Windows one does. The `if` gates keep
+      # the plain builds exactly as they were.
+      # ggml compiles its Vulkan shaders with glslc at build time, so the SDK
+      # has to be there before cargo runs — the runtime loader is not enough.
+      - uses: ./.github/actions/setup-vulkan
+        if: matrix.features == 'vulkan'
+
+      # nvcc compiles ggml's CUDA kernels at build time, so the toolkit has
+      # to be there before cargo runs — the driver alone is not enough.
+      - uses: ./.github/actions/setup-cuda
+        if: matrix.features == 'cuda'
+
       - name: Build (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -88,16 +101,6 @@ jobs:
           # ditto is Apple's archiver; it preserves bundle metadata that zip drops.
           ditto -c -k --keepParent target/release/bundle/osx/offgrid.app \
             "dist/offgrid-${VERSION}-${{ matrix.target }}.app.zip"
-
-      # ggml compiles its Vulkan shaders with glslc at build time, so the SDK
-      # has to be there before cargo runs — the runtime loader is not enough.
-      - uses: ./.github/actions/setup-vulkan
-        if: matrix.features == 'vulkan'
-
-      # nvcc compiles ggml's CUDA kernels at build time, so the toolkit has
-      # to be there before cargo runs — the driver alone is not enough.
-      - uses: ./.github/actions/setup-cuda
-        if: matrix.features == 'cuda'
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
