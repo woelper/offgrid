@@ -19,9 +19,9 @@ runs:
     # Deliberately no vcvars/msvc-dev-cmd here: rustc, cc and CMake all find
     # MSVC on their own (as the plain and Vulkan Windows jobs prove), while a
     # wholesale PATH rewrite made rustc resolve Git's `link.exe` instead of
-    # MSVC's and fail every link. nvcc locates its host compiler the same
-    # independent way; if it ever cannot, scope that fix to nvcc
-    # (CUDAHOSTCXX) instead of rewriting PATH.
+    # MSVC's and fail every link. nvcc is the exception — nothing on PATH
+    # provides cl.exe — so it gets its host compiler handed to it explicitly
+    # below, which is scoped to nvcc and invisible to the linker.
     - name: CUDA toolkit (Linux)
       if: runner.os == 'Linux'
       # Pinned at patch level, not master: the 0.2.25–0.2.28 range broke
@@ -49,6 +49,29 @@ runs:
         method: network
         sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
         log-file-suffix: 'windows-cuda.txt'
+
+    # nvcc's `-ccbin`: CMake's CUDA compiler check dies with "No CUDA toolset
+    # found" when nvcc cannot see a host compiler, and nothing on a stock
+    # runner PATH provides cl.exe. Pointing CMake at cl.exe by absolute path
+    # fixes nvcc without touching PATH (see above). llama-cpp-sys-2's build
+    # script forwards every CMAKE_ variable to its CMake configure, so exports
+    # here land as -D flags there.
+    - name: CUDA host compiler (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+          -latest -products * `
+          -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+          -property installationPath
+        $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" |
+          Sort-Object { [version]($_.Directory.Parent.Parent.Parent.FullName | Split-Path -Leaf) } |
+          Select-Object -Last -ExpandProperty FullName
+        if (-not $cl) { throw "no MSVC cl.exe found under $vs" }
+        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$cl"
+        # CUDA 12.9 predates the VS18-era MSVC on these runners, whose version
+        # nvcc's host_config.h allowlist rejects — opt out of that check.
+        Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
 
     - name: nvcc check
       shell: bash
