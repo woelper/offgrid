@@ -88,6 +88,8 @@ runs:
         Write-Host "Windows SDKs on this image:"
         Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Include' -Directory -ErrorAction SilentlyContinue |
           Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  SDK $_" }
+        Set-Content -Path "$env:RUNNER_TEMP\probe_min.cu" -Value '__global__ void k() {}
+        int main(){return 0;}'
         Set-Content -Path "$env:RUNNER_TEMP\probe.cu" -Value '#include <cuda_runtime.h>
         __global__ void k() {}
         int main(){return 0;}'
@@ -95,6 +97,7 @@ runs:
         foreach ($c in ($candidates | Sort-Object { [version]$_.Ver } -Descending)) {
           $toolset = ($c.Ver -split '\.')[0..1] -join '.'
           Write-Host "probing host compiler $($c.Cl) (vcvars_ver=$toolset)"
+          Write-Host "  compiler banner: $((& $c.Cl 2>&1 | Select-Object -First 1))"
           foreach ($v in 'INCLUDE', 'LIB', 'LIBPATH') {
             [Environment]::SetEnvironmentVariable($v, $null, 'Process')
           }
@@ -103,10 +106,23 @@ runs:
               [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
             }
           }
+          $include = [Environment]::GetEnvironmentVariable('INCLUDE', 'Process')
+          Write-Host "  INCLUDE head: $($include.Substring(0, [Math]::Min(220, $include.Length)))"
+          # Minimal probe first (no headers): tells a broken cudafe++ apart
+          # from one choking on MSVC/SDK headers.
+          $minOk = $true
           & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin $c.Cl -allow-unsupported-compiler `
-            -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
-            ForEach-Object { Write-Host "  $_" }
-          if ($LASTEXITCODE -eq 0) {
+            -c "$env:RUNNER_TEMP\probe_min.cu" -o "$env:RUNNER_TEMP\probe_min.obj" 2>&1 |
+            ForEach-Object { Write-Host "  [min] $_" }
+          if ($LASTEXITCODE -ne 0) { $minOk = $false }
+          $fullOk = $false
+          if ($minOk) {
+            & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin $c.Cl -allow-unsupported-compiler `
+              -c "$env:RUNNER_TEMP\probe.cu" -o "$env:RUNNER_TEMP\probe.obj" 2>&1 |
+              ForEach-Object { Write-Host "  [full] $_" }
+            if ($LASTEXITCODE -eq 0) { $fullOk = $true }
+          }
+          if ($fullOk) {
             $winner = $c
             break
           }
