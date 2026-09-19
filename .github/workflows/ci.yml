@@ -96,8 +96,10 @@ jobs:
   # unit tests and a physical NVIDIA box are for.
   cuda:
     if: github.event_name == 'workflow_dispatch'
-    # Capped: a wedged toolkit installer must fail the job, not sit on it.
-    timeout-minutes: 120
+    # Capped, but generously: the Windows CUDA backend takes well over two
+    # hours with NUM_JOBS=2, and a wedged toolkit installer must still fail
+    # the job instead of sitting on it.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       # windows-2022 for the same reason as the release matrix below: VS 2026
