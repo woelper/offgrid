@@ -16,12 +16,13 @@ inputs:
 runs:
   using: composite
   steps:
-    # Deliberately no vcvars/msvc-dev-cmd here: rustc, cc and CMake all find
-    # MSVC on their own (as the plain and Vulkan Windows jobs prove), while a
-    # wholesale PATH rewrite made rustc resolve Git's `link.exe` instead of
-    # MSVC's and fail every link. nvcc is the exception — nothing on PATH
-    # provides cl.exe — so it gets its host compiler handed to it explicitly
-    # below, which is scoped to nvcc and invisible to the linker.
+    # Deliberately no vcvars-style PATH rewrite here: rustc, cc and CMake all
+    # find MSVC on their own (as the plain and Vulkan Windows jobs prove),
+    # while a wholesale PATH rewrite once made rustc resolve Git's `link.exe`
+    # instead of MSVC's and fail every link. nvcc is the exception — nothing
+    # on PATH provides cl.exe — so the step below imports *only*
+    # INCLUDE/LIB/LIBPATH from vcvars and hands nvcc its host compiler by
+    # absolute path. Both are scoped to nvcc/CMake; PATH stays as it was.
     - name: CUDA toolkit (Linux)
       if: runner.os == 'Linux'
       # Pinned at patch level, not master: the 0.2.25–0.2.28 range broke
@@ -50,13 +51,12 @@ runs:
         sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
         log-file-suffix: 'windows-cuda.txt'
 
-    # nvcc's `-ccbin`: CMake's CUDA compiler check dies with "No CUDA toolset
-    # found" when nvcc cannot see a host compiler, and nothing on a stock
-    # runner PATH provides cl.exe. Pointing CMake at cl.exe by absolute path
-    # fixes nvcc without touching PATH (see above). llama-cpp-sys-2's build
-    # script forwards every CMAKE_ variable to its CMake configure, so exports
-    # here land as -D flags there.
-    - name: CUDA host compiler (Windows)
+    # nvcc's `-ccbin` plus the MSVC/Windows-SDK INCLUDE/LIB it needs: CMake's
+    # CUDA compiler check dies with "No CUDA toolset found" when nvcc cannot
+    # see a host compiler, and nothing on a stock runner PATH provides cl.exe.
+    # llama-cpp-sys-2's build script forwards every CMAKE_ variable to its
+    # CMake configure, so exports here land as -D flags there.
+    - name: CUDA host compiler and MSVC env (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
@@ -69,9 +69,30 @@ runs:
           Select-Object -Last 1 -ExpandProperty FullName
         if (-not $cl) { throw "no MSVC cl.exe found under $vs" }
         Add-Content $env:GITHUB_ENV "CMAKE_CUDA_HOST_COMPILER=$cl"
+        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+          if ($_ -match '^(INCLUDE|LIB|LIBPATH)=(.*)$') {
+            Add-Content $env:GITHUB_ENV "$($matches[1])=$($matches[2])"
+          }
+        }
+        if (-not (Select-String -Path $env:GITHUB_ENV -Pattern '^INCLUDE=' -Quiet)) {
+          throw "vcvars import produced no INCLUDE"
+        }
         # CUDA 12.9 predates the VS18-era MSVC on these runners, whose version
         # nvcc's host_config.h allowlist rejects — opt out of that check.
         Add-Content $env:GITHUB_ENV "CMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+
+    # Fail fast with nvcc's raw error instead of after a 30-minute cargo
+    # build: CMake's "No CUDA toolset found" swallows the real message.
+    - name: nvcc probe compile (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        Set-Content -Path "$env:RUNNER_TEMP\probe.cu" -Value '#include <cuda_runtime.h>
+        __global__ void k() {}
+        int main(){return 0;}'
+        & "$env:CUDA_PATH\bin\nvcc.exe" -ccbin "$env:CMAKE_CUDA_HOST_COMPILER" `
+          -allow-unsupported-compiler -c "$env:RUNNER_TEMP\probe.cu" `
+          -o "$env:RUNNER_TEMP\probe.obj"
 
     - name: nvcc check
       shell: bash
