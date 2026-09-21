@@ -199,6 +199,42 @@ pub fn gpu_layers(model_size: u64, dims: &GgufDims, n_ctx: u32, vram: u64) -> u3
 /// Below this many layers, offloading buys less than the transfers cost.
 const MIN_OFFLOAD_LAYERS: u32 = 4;
 
+/// `MIN_OFFLOAD_LAYERS` expressed as a share of the weights: models run 30 to
+/// 50 layers, so four of them is roughly a tenth. Used where the layer count
+/// is unknown (a catalog entry or a search result is a name and a size, not a
+/// file we can read a header from).
+const MIN_OFFLOAD_SHARE: f32 = 0.1;
+
+/// Share of a model's bytes that ends up on the card, 0.0 to 1.0.
+///
+/// This is the byte-level view of what `gpu_layers` decides layer by layer:
+/// the same VRAM budget, the same overhead, the same all-or-nothing floor.
+/// Both the fit badges and the tok/s estimates read it, so what the UI
+/// promises and what the loader actually does cannot drift apart.
+pub fn gpu_share(model_size: u64, kv_per_token: Option<u64>, n_ctx: u32, vram: u64) -> f32 {
+    let footprint = model_size + kv_size(model_size, kv_per_token, n_ctx);
+    if footprint == 0 {
+        return 0.0;
+    }
+    let budget = vram.saturating_sub(GPU_OVERHEAD);
+    let share = (budget as f64 / footprint as f64).min(1.0) as f32;
+    if share < MIN_OFFLOAD_SHARE {
+        0.0
+    } else {
+        share
+    }
+}
+
+/// The largest model file that still fits `vram` whole at `n_ctx` tokens of
+/// context: `fits_vram` solved for the size, using the same size-derived KV
+/// estimate. This is the number to put in front of someone asking what they
+/// should download, instead of making them binary-search the model list.
+pub fn largest_fitting_vram(vram: u64, n_ctx: u32) -> u64 {
+    // fits_vram is  size + GPU_OVERHEAD + (size/12) * (n_ctx/4096) <= vram.
+    let budget = vram.saturating_sub(GPU_OVERHEAD) as f64;
+    (budget / (1.0 + n_ctx as f64 / (12.0 * 4096.0))) as u64
+}
+
 /// Does the whole model — weights, KV cache and compute buffers — fit in
 /// `vram`? Everything on the GPU is the case worth aiming for: it runs an
 /// order of magnitude faster than the same model split with system RAM.
@@ -251,14 +287,94 @@ impl Fit {
             Fit::TooBig => "too big",
         }
     }
+}
 
-    pub fn badge(self) -> (&'static str, egui::Color32) {
-        let color = match self {
-            Fit::Fits => crate::theme::skin().good,
-            Fit::Tight => crate::theme::skin().warn,
-            Fit::TooBig => crate::theme::skin().bad,
-        };
-        (self.label(), color)
+/// Where a model's bytes end up once loaded.
+///
+/// `Fit` alone answers "will this load at all", which is the whole story on a
+/// CPU box and only half of it on a GPU box: a 19 GB model on a machine with
+/// 64 GB of RAM and a 16 GB card fits comfortably and still runs ten times
+/// slower than a model that fits the card, because the part that did not fit
+/// is read over PCIe for every single token. The lists show this instead of a
+/// bare "fits", which was true and useless.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Placement {
+    /// The system-RAM verdict, unchanged.
+    pub fit: Fit,
+    /// Share of the weights on the card, or `None` without a discrete GPU.
+    pub gpu: Option<f32>,
+}
+
+impl Placement {
+    /// `vram` is the budget of a discrete card, `None` on a machine without
+    /// one (or with unified memory, where there is no split to report).
+    pub fn of(
+        model_size: u64,
+        kv_per_token: Option<u64>,
+        total_ram: u64,
+        vram: Option<u64>,
+        n_ctx: u32,
+    ) -> Self {
+        Placement {
+            fit: Fit::of_model(model_size, kv_per_token, total_ram, n_ctx),
+            gpu: vram.map(|v| gpu_share(model_size, kv_per_token, n_ctx, v)),
+        }
+    }
+
+    /// True when weights and KV cache fit the card whole — the fast case, and
+    /// the one worth steering people towards.
+    pub fn all_on_gpu(self) -> bool {
+        self.gpu.is_some_and(|s| s >= 1.0)
+    }
+
+    /// Badge for the model lists. Everything on the card makes system RAM
+    /// irrelevant; anything else runs from RAM in whole or in part, so the
+    /// RAM verdict governs and the split is reported next to it.
+    pub fn badge(self) -> (String, egui::Color32) {
+        let skin = crate::theme::skin();
+        if self.all_on_gpu() {
+            return ("all on GPU".into(), skin.good);
+        }
+        match (self.fit, self.gpu) {
+            (Fit::TooBig, _) => (self.fit.label().into(), skin.bad),
+            (Fit::Tight, _) => (self.fit.label().into(), skin.warn),
+            (Fit::Fits, Some(s)) if s <= 0.0 => ("CPU only".into(), skin.warn),
+            (Fit::Fits, Some(s)) => (format!("{:.0}% on GPU", s * 100.0), skin.warn),
+            (Fit::Fits, None) => (self.fit.label().into(), skin.good),
+        }
+    }
+
+    /// Hover text for the badge: what the verdict means and what to do about
+    /// it. The split cases are the ones people write bug reports about.
+    pub fn tooltip(self) -> String {
+        if self.all_on_gpu() {
+            return "Weights and KV cache fit in the card's memory. \
+                    Generation runs at VRAM speed, which is the fast case."
+                .into();
+        }
+        match self.fit {
+            Fit::TooBig => "Too large for this machine's RAM at the current context size. \
+                            Loading it will abort or thrash swap — take a smaller \
+                            quantisation or shorten the context."
+                .into(),
+            Fit::Tight => "Fits, but with little room to spare. Expect swapping if \
+                           anything else needs memory."
+                .into(),
+            Fit::Fits => match self.gpu {
+                Some(s) if s <= 0.0 => "Too little of this model would fit on the card to be \
+                                        worth the transfers, so all of it runs on the CPU. \
+                                        A smaller model or a shorter context may change that."
+                    .into(),
+                Some(s) => format!(
+                    "Only about {:.0}% of the weights fit on the card. The rest is read \
+                     from system RAM over PCIe on every token, so the whole model runs \
+                     at close to CPU speed. A smaller model, a lower quantisation or a \
+                     shorter context may get all of it onto the card.",
+                    s * 100.0
+                ),
+                None => "Fits in system RAM with room to spare.".into(),
+            },
+        }
     }
 }
 
@@ -469,39 +585,66 @@ pub fn safe_to_load(path: &Path, total_ram: u64, n_ctx: u32) -> bool {
     size > 0 && Fit::of_model(size, kv_bytes_per_token(path), total_ram, n_ctx) != Fit::TooBig
 }
 
-/// The best chat and coding models this machine can comfortably run. Each is
-/// the largest catalog entry of that kind that still fits — in VRAM when
-/// there is a GPU, otherwise in RAM. Size stands in for quality within the
-/// curated list. Either may be None on a very small box.
+/// The best chat and coding models this machine can run, by where they run.
+///
+/// Two answers rather than one, because on a machine with a card they are
+/// different models and the trade between them belongs to the user: the
+/// `gpu_*` picks fit the card whole and generate several times faster, the
+/// `ram_*` picks are the largest that fit system memory and answer better for
+/// it. Size stands in for quality within the curated list. On a machine
+/// without a discrete GPU the `gpu_*` picks are None and the `ram_*` ones are
+/// simply "the picks".
 pub struct Proposals {
-    pub chat: Option<CatalogEntry>,
-    pub code: Option<CatalogEntry>,
+    pub gpu_chat: Option<CatalogEntry>,
+    pub gpu_code: Option<CatalogEntry>,
+    pub ram_chat: Option<CatalogEntry>,
+    pub ram_code: Option<CatalogEntry>,
+}
+
+impl Proposals {
+    /// The single pick to act on where only one is wanted (`/get chat`):
+    /// the card's, when it has one.
+    pub fn chat(&self) -> Option<&CatalogEntry> {
+        self.gpu_chat.as_ref().or(self.ram_chat.as_ref())
+    }
+
+    pub fn code(&self) -> Option<&CatalogEntry> {
+        self.gpu_code.as_ref().or(self.ram_code.as_ref())
+    }
+
+    /// Is there anything to show at all?
+    pub fn is_empty(&self) -> bool {
+        self.chat().is_none() && self.code().is_none()
+    }
+
+    /// Does the RAM pick offer something the GPU pick does not? When they are
+    /// the same model there is no trade to present, only noise.
+    pub fn ram_adds_anything(&self) -> bool {
+        let differs = |gpu: &Option<CatalogEntry>, ram: &Option<CatalogEntry>| match (gpu, ram) {
+            (Some(g), Some(r)) => r.size > g.size,
+            (None, Some(_)) => false, // no card: the RAM pick *is* the pick
+            _ => false,
+        };
+        differs(&self.gpu_chat, &self.ram_chat) || differs(&self.gpu_code, &self.ram_code)
+    }
 }
 
 /// `vram` is the dedicated VRAM of a discrete GPU, when there is one.
 pub fn propose(total_ram: u64, vram: Option<u64>, n_ctx: u32) -> Proposals {
-    let fits = |e: &CatalogEntry| Fit::of(e.size, total_ram, n_ctx) == Fit::Fits;
-    // With a GPU, the largest model that fits *entirely* in VRAM beats a
-    // bigger one that spills into system RAM: the spilled part is read over
-    // the PCIe bus at DDR speed every single token, and the whole model runs
-    // at that speed. Fall back to the RAM rule when nothing fits the card.
-    let pick = |code_only: bool| {
-        let of_kind = || {
-            catalog()
-                .into_iter()
-                .filter(|e| !code_only || e.use_.codes())
-                .filter(fits)
-        };
-        vram.and_then(|v| {
-            of_kind()
-                .filter(|e| fits_vram(e.size, None, n_ctx, v))
-                .max_by_key(|e| e.size)
-        })
-        .or_else(|| of_kind().max_by_key(|e| e.size))
+    let fits_ram = |e: &CatalogEntry| Fit::of(e.size, total_ram, n_ctx) == Fit::Fits;
+    let largest = |code_only: bool, on_card: bool| {
+        catalog()
+            .into_iter()
+            .filter(|e| !code_only || e.use_.codes())
+            .filter(fits_ram)
+            .filter(|e| !on_card || vram.is_some_and(|v| fits_vram(e.size, None, n_ctx, v)))
+            .max_by_key(|e| e.size)
     };
     Proposals {
-        chat: pick(false),
-        code: pick(true),
+        gpu_chat: vram.and_then(|_| largest(false, true)),
+        gpu_code: vram.and_then(|_| largest(true, true)),
+        ram_chat: largest(false, false),
+        ram_code: largest(true, false),
     }
 }
 
@@ -544,15 +687,37 @@ fn active_fraction(name: &str) -> f32 {
     }
 }
 
-/// Estimated generation speed on this machine: CPU inference is memory-bound,
+/// Share of raw streaming bandwidth llama.cpp actually reaches. Both the
+/// estimate and the measurement that calibrates it use it, so the two are
+/// inverses of each other and a measured run reproduces its own estimate.
+const EFFICIENCY: f32 = 0.8;
+
+/// Bytes read per generated token: the weights, once, minus the experts a
+/// mixture-of-experts model skips.
+fn bytes_per_token(name: &str, size: u64) -> f32 {
+    size as f32 * active_fraction(name)
+}
+
+/// Estimated generation speed on this machine: inference is memory-bound,
 /// so tok/s ≈ effective bandwidth / bytes read per token.
 pub fn est_tokens_per_sec(name: &str, size: u64, mem_bandwidth: u64) -> Option<f32> {
     if size == 0 || mem_bandwidth == 0 {
         return None;
     }
-    let bytes_per_token = size as f32 * active_fraction(name);
-    // llama.cpp reaches roughly 80% of the raw streaming bandwidth.
-    Some(mem_bandwidth as f32 * 0.8 / bytes_per_token)
+    Some(mem_bandwidth as f32 * EFFICIENCY / bytes_per_token(name, size))
+}
+
+/// The inverse: what streaming bandwidth a finished run implies.
+///
+/// Reading a model at `tok_per_sec` means moving its bytes that many times a
+/// second, so the hardware underneath was at least that fast. Only meaningful
+/// for a run whose weights all sat in one place — a split model measures the
+/// slower half and the PCIe bus between them, not the card.
+pub fn bandwidth_from_run(name: &str, size: u64, tok_per_sec: f32) -> Option<u64> {
+    if size == 0 || !tok_per_sec.is_finite() || tok_per_sec <= 0.0 {
+        return None;
+    }
+    Some((bytes_per_token(name, size) * tok_per_sec / EFFICIENCY) as u64)
 }
 
 pub fn fmt_tok_s(est: Option<f32>) -> String {
@@ -629,7 +794,7 @@ mod tests {
         let vram = 8 * 1024 * 1024 * 1024;
 
         let with_gpu = propose(ram, Some(vram), ctx);
-        for pick in [with_gpu.chat.clone().unwrap(), with_gpu.code.unwrap()] {
+        for pick in [with_gpu.chat().unwrap(), with_gpu.code().unwrap()] {
             assert!(
                 fits_vram(pick.size, None, ctx, vram),
                 "{} does not fit an 8 GB card",
@@ -639,8 +804,16 @@ mod tests {
 
         // Same box without the card: the RAM rule, unchanged — and it reaches
         // for the 19 GB model the card could never hold.
-        let cpu_only = propose(ram, None, ctx).chat.unwrap();
-        assert!(cpu_only.size > with_gpu.chat.unwrap().size);
+        let cpu_only = propose(ram, None, ctx).chat().unwrap().clone();
+        assert!(cpu_only.size > with_gpu.chat().unwrap().size);
+
+        // That bigger model is still offered, as the explicit RAM option, so
+        // the choice is presented rather than made for the user.
+        assert!(with_gpu.ram_adds_anything());
+        assert_eq!(with_gpu.ram_chat.as_ref().unwrap().name, cpu_only.name);
+
+        // Without a card there is no second option to present.
+        assert!(!propose(ram, None, ctx).ram_adds_anything());
     }
 
     /// Layer counting is what keeps a load from aborting with an
@@ -671,26 +844,139 @@ mod tests {
         assert_eq!(gpu_layers(4_372_812_000, &small, ctx, gb), 0);
     }
 
+    /// The badge and the tok/s estimate must agree with the loader, or the
+    /// list promises one thing and llama.cpp does another. `gpu_share` is the
+    /// shared answer, so it is pinned against `gpu_layers` at both ends.
+    #[test]
+    fn gpu_share_tracks_the_loader() {
+        let ctx = 16384;
+        let gb = 1024 * 1024 * 1024;
+        let small = GgufDims {
+            layers: 32,
+            kv_bytes_per_token: 131_072,
+        };
+        let big = GgufDims {
+            layers: 48,
+            kv_bytes_per_token: 98_304,
+        };
+
+        // A 7B on an 8 GB card: all layers, and the share agrees.
+        let (size, vram) = (4_372_812_000u64, 8 * gb);
+        assert!(gpu_layers(size, &small, ctx, vram) > small.layers as u32);
+        assert_eq!(gpu_share(size, None, ctx, vram), 1.0);
+
+        // A 19 GB MoE on the same card: part of it, and the share says so
+        // rather than reading as a comfortable "fits".
+        let moe = 18_556_689_568u64;
+        assert!(gpu_layers(moe, &big, ctx, vram) < big.layers as u32);
+        let share = gpu_share(moe, None, ctx, vram);
+        assert!(
+            (0.2..0.6).contains(&share),
+            "expected part of the 30B on an 8 GB card, got {share}"
+        );
+
+        // Below the offload floor the loader keeps everything in RAM, so the
+        // estimate must not hand out partial GPU credit either.
+        assert_eq!(gpu_layers(size, &small, ctx, gb), 0);
+        assert_eq!(gpu_share(size, None, ctx, gb), 0.0);
+    }
+
+    /// The number the System panel puts in front of the user has to be one
+    /// the fit rule actually accepts, at either edge.
+    #[test]
+    fn largest_fitting_vram_round_trips() {
+        let gb = 1024 * 1024 * 1024;
+        for vram in [6 * gb, 8 * gb, 12 * gb, 16 * gb, 24 * gb] {
+            for ctx in [4096u32, 16384, 32768] {
+                let largest = largest_fitting_vram(vram, ctx);
+                assert!(
+                    fits_vram(largest, None, ctx, vram),
+                    "{largest} bytes should fit {vram} at {ctx}"
+                );
+                assert!(
+                    !fits_vram(largest + 256 * 1024 * 1024, None, ctx, vram),
+                    "{largest} should be the largest that fits {vram} at {ctx}"
+                );
+            }
+        }
+        // A card with nothing but overhead to give holds nothing.
+        assert_eq!(largest_fitting_vram(GPU_OVERHEAD / 2, 4096), 0);
+    }
+
+    /// The speed estimate and the measurement that calibrates it are one
+    /// formula read in two directions, so a run at the estimated rate has to
+    /// report back the bandwidth it was estimated from.
+    #[test]
+    fn bandwidth_measurement_inverts_the_estimate() {
+        let bw = 800_000_000_000u64;
+        for name in ["Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", "x-30B-A3B-Q4_K_M"] {
+            let size = 4_372_812_000;
+            let tok_s = est_tokens_per_sec(name, size, bw).unwrap();
+            let back = bandwidth_from_run(name, size, tok_s).unwrap();
+            assert!(
+                (back as f64 - bw as f64).abs() / (bw as f64) < 0.01,
+                "{name}: {back} should round-trip to {bw}"
+            );
+        }
+        assert_eq!(bandwidth_from_run("x", 0, 10.0), None);
+        assert_eq!(bandwidth_from_run("x", 100, 0.0), None);
+    }
+
+    /// The badge is the one line a user reads before downloading 18 GB. A
+    /// model that fits RAM but not the card must not read like a green light.
+    #[test]
+    fn badge_separates_fitting_ram_from_fitting_the_card() {
+        let gb = 1024 * 1024 * 1024;
+        let (ram, vram, ctx) = (64 * gb, 16 * gb, 16384);
+        let on_card = Placement::of(4_372_812_000, None, ram, Some(vram), ctx);
+        assert!(on_card.all_on_gpu());
+        assert_eq!(on_card.badge().0, "all on GPU");
+
+        // The case that started this: comfortable in 64 GB of RAM, a split on
+        // a 16 GB card, and ten times slower for it.
+        let split = Placement::of(18_556_689_568, None, ram, Some(vram), ctx);
+        assert_eq!(split.fit, Fit::Fits);
+        assert!(!split.all_on_gpu());
+        assert!(
+            split.badge().0.ends_with("% on GPU"),
+            "got {}",
+            split.badge().0
+        );
+
+        // Same machine without a card: the RAM verdict, as before.
+        assert_eq!(
+            Placement::of(18_556_689_568, None, ram, None, ctx)
+                .badge()
+                .0,
+            "fits"
+        );
+        // Not loadable at all outranks any placement.
+        assert_eq!(
+            Placement::of(60 * gb, None, ram, Some(vram), ctx).badge().0,
+            "too big"
+        );
+    }
+
     #[test]
     fn proposals_scale_with_ram() {
         let ctx = 16384;
         // A tiny box: chat gets the largest fitting small model, and nothing
         // big enough to code comfortably may be available.
         let small = propose(4 * 1024 * 1024 * 1024, None, ctx);
-        assert!(small.chat.is_some());
+        assert!(small.chat().is_some());
         assert!(
-            small.chat.as_ref().unwrap().size <= 3_000_000_000,
+            small.chat().unwrap().size <= 3_000_000_000,
             "chat pick must actually fit 4 GB"
         );
 
         // A large box: chat and code both resolve, and each is the biggest
         // fitting entry of its kind — here the 30B coder for both.
         let big = propose(64 * 1024 * 1024 * 1024, None, ctx);
-        assert_eq!(big.chat.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
-        assert_eq!(big.code.unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
+        assert_eq!(big.chat().unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
+        assert_eq!(big.code().unwrap().name, "Qwen3 Coder 30B-A3B (Q4_K_M)");
 
         // The coding pick, when present, is always a code-capable entry.
-        if let Some(code) = propose(8 * 1024 * 1024 * 1024, None, ctx).code {
+        if let Some(code) = propose(8 * 1024 * 1024 * 1024, None, ctx).code() {
             assert!(code.use_.codes());
         }
     }

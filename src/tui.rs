@@ -253,15 +253,44 @@ impl Tui {
 
     /// `gauge` with the header-derived KV cost of a local file.
     fn gauge_kv(&self, name: &str, size: u64, kv_per_token: Option<u64>) -> String {
+        let placement = models::Placement::of(
+            size,
+            kv_per_token,
+            self.hardware.total_ram,
+            self.hardware.dedicated_vram(),
+            self.n_ctx(),
+        );
         format!(
             "{} · {}",
-            Fit::of_model(size, kv_per_token, self.hardware.total_ram, self.n_ctx()).label(),
+            placement.badge().0,
             models::fmt_tok_s(models::est_tokens_per_sec(
                 name,
                 size,
                 self.hardware.bandwidth_for(size, self.n_ctx())
             ))
         )
+    }
+
+    /// Learn the card's bandwidth from a finished run — see the GUI's copy of
+    /// this in `app.rs`; the measurement is shared through the config file, so
+    /// whichever front end runs first teaches the other.
+    fn calibrate_gpu_bandwidth(&mut self, gen_tokens: usize, gen_secs: f32) {
+        let all_on_gpu = self.llm.accel.lock().map(|a| a.all_on_gpu).unwrap_or(false);
+        let Some(model) = self
+            .models
+            .iter()
+            .find(|m| Some(m.name.as_str()) == self.loaded.as_deref())
+        else {
+            return;
+        };
+        let (name, size) = (model.name.clone(), model.size);
+        if let Some(measured) = self
+            .hardware
+            .calibrate_gpu(&name, size, gen_tokens, gen_secs, all_on_gpu)
+        {
+            self.config.gpu_bandwidth = Some(measured);
+            self.config.save();
+        }
     }
 
     fn models_body(&self) -> Vec<String> {
@@ -296,7 +325,7 @@ impl Tui {
                     self.hardware.dedicated_vram(),
                     self.n_ctx(),
                 );
-                if p.chat.is_some() || p.code.is_some() {
+                if !p.is_empty() {
                     lines.push(String::new());
                     // Name the accelerator the picks were sized for — on a
                     // headless box this line is the only sign a GPU is in use.
@@ -309,19 +338,19 @@ impl Tui {
                         ));
                     }
                     lines.push("Recommended for your hardware (/get chat · /get code):".into());
-                    if let Some(c) = &p.chat {
-                        lines.push(format!(
-                            "  chat  {}  ({})",
-                            c.name,
-                            self.gauge(c.file, c.size)
-                        ));
-                    }
-                    if let Some(c) = &p.code {
-                        lines.push(format!(
-                            "  code  {}  ({})",
-                            c.name,
-                            self.gauge(c.file, c.size)
-                        ));
+                    let pick = |label: &str, c: Option<&models::CatalogEntry>| {
+                        c.map(|c| {
+                            format!("  {label}  {}  ({})", c.name, self.gauge(c.file, c.size))
+                        })
+                    };
+                    lines.extend(pick("chat", p.chat()));
+                    lines.extend(pick("code", p.code()));
+                    // On a card, name the bigger RAM-only option too rather
+                    // than silently deciding the speed-for-quality trade.
+                    if p.ram_adds_anything() {
+                        lines.push("  bigger, but split with system RAM and much slower:".into());
+                        lines.extend(pick("chat", p.ram_chat.as_ref()));
+                        lines.extend(pick("code", p.ram_code.as_ref()));
                     }
                 }
                 lines.push(String::new());
@@ -516,7 +545,12 @@ impl Tui {
                 LlmEvent::Loaded(name) => {
                     self.loading = false;
                     *self.loaded_shared.lock().unwrap() = Some(name.clone());
-                    let accel = self.llm.accel.lock().map(|a| a.clone()).unwrap_or_default();
+                    let accel = self
+                        .llm
+                        .accel
+                        .lock()
+                        .map(|a| a.note.clone())
+                        .unwrap_or_default();
                     self.status = if accel.is_empty() {
                         format!("loaded {name}")
                     } else {
@@ -548,8 +582,12 @@ impl Tui {
                 LlmEvent::Stats {
                     prompt_tokens,
                     gen_tokens,
+                    gen_secs,
                     ..
-                } => self.chat_ctx_used = prompt_tokens + gen_tokens,
+                } => {
+                    self.chat_ctx_used = prompt_tokens + gen_tokens;
+                    self.calibrate_gpu_bandwidth(gen_tokens, gen_secs);
+                }
             }
         }
         let mut finished = None;
@@ -812,8 +850,8 @@ impl Tui {
             self.n_ctx(),
         );
         let entry = match kind {
-            "chat" => p.chat,
-            "code" | "coding" => p.code,
+            "chat" => p.chat().cloned(),
+            "code" | "coding" => p.code().cloned(),
             _ => {
                 self.status = "usage: /get chat|code".into();
                 return;
@@ -1096,7 +1134,10 @@ impl Tui {
 /// Run the terminal UI until the user quits.
 pub fn run() -> Result<(), String> {
     let config = Config::load();
-    let hardware = crate::hardware::HardwareProfile::detect();
+    let mut hardware = crate::hardware::HardwareProfile::detect();
+    if let Some(stored) = &config.gpu_bandwidth {
+        hardware.adopt_gpu_bandwidth(stored);
+    }
     let llm = llm::spawn_worker(hardware.physical_cores);
     let models = models::scan_local(&models_dir());
     let loaded_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));

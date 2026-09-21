@@ -30,6 +30,11 @@ pub struct Config {
     pub web_tools: bool,
     pub skin: Option<String>,
     pub n_ctx: Option<u32>,
+    /// VRAM bandwidth measured from a run that lived entirely on the card.
+    /// Remembered so the tok/s estimates are right from the next start on
+    /// instead of reverting to the conservative assumption every launch.
+    #[serde(default)]
+    pub gpu_bandwidth: Option<crate::hardware::GpuBandwidth>,
 }
 
 fn config_path() -> Option<PathBuf> {
