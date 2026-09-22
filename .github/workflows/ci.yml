@@ -136,6 +136,12 @@ jobs:
         # this down again if a build dies with signal 9.
         env:
           NUM_JOBS: 4
-        run: |
-          cargo build --features cuda
-          command -v ccache >/dev/null && ccache --show-stats --verbose || true
+        run: cargo build --features cuda
+
+      # Its own step, and Linux only: the build step runs under PowerShell on
+      # Windows, where `>/dev/null` names a file on D: rather than discarding
+      # anything — it failed the job after a 75-minute build that had
+      # succeeded. ccache is Linux-only here anyway.
+      - name: ccache stats
+        if: runner.os == 'Linux'
+        run: ccache --show-stats --verbose
