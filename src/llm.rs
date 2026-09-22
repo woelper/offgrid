@@ -82,15 +82,27 @@ pub enum LlmEvent {
     Error(String),
 }
 
+/// Where the loader actually put the weights.
+///
+/// The UI shows `note`; the bandwidth calibration needs `all_on_gpu`, because
+/// a run split between card and CPU measures the PCIe bus and the slower half
+/// rather than the card. One struct instead of parsing the sentence back.
+#[derive(Clone, Default)]
+pub struct Accel {
+    /// One line for the UI, empty when nothing is loaded or there is no GPU.
+    pub note: String,
+    /// Every layer, the output tensor included, went to the GPU.
+    pub all_on_gpu: bool,
+}
+
 pub struct LlmHandle {
     pub cmd_tx: Sender<LlmCmd>,
     pub event_tx: Sender<LlmEvent>,
     pub event_rx: Receiver<LlmEvent>,
     pub stop: Arc<AtomicBool>,
-    /// Where the last loaded model ended up — "29/33 layers on NVIDIA …" —
-    /// or empty when nothing is loaded or there is no GPU. Written by the
-    /// worker at load time, read by the UI.
-    pub accel: Arc<Mutex<String>>,
+    /// Where the last loaded model ended up. Written by the worker at load
+    /// time, read by the UI and by the bandwidth calibration.
+    pub accel: Arc<Mutex<Accel>>,
 }
 
 pub fn spawn_worker(n_threads: usize) -> LlmHandle {
@@ -99,7 +111,7 @@ pub fn spawn_worker(n_threads: usize) -> LlmHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = stop.clone();
     let event_tx_worker = event_tx.clone();
-    let accel = Arc::new(Mutex::new(String::new()));
+    let accel = Arc::new(Mutex::new(Accel::default()));
     let accel_worker = accel.clone();
     std::thread::spawn(move || {
         worker(
@@ -124,7 +136,7 @@ fn worker(
     tx: Sender<LlmEvent>,
     stop: Arc<AtomicBool>,
     n_threads: usize,
-    accel: Arc<Mutex<String>>,
+    accel: Arc<Mutex<Accel>>,
 ) {
     let backend = match LlamaBackend::init() {
         Ok(b) => b,
@@ -148,7 +160,7 @@ fn worker(
         match cmd {
             LlmCmd::Unload => {
                 if let Ok(mut slot) = accel.lock() {
-                    slot.clear();
+                    *slot = Accel::default();
                 }
                 let _ = tx.send(LlmEvent::Unloaded);
             }
@@ -159,9 +171,9 @@ fn worker(
             }
             LlmCmd::Load { path, n_ctx } => {
                 // Free the old model before loading the new one.
-                let (params, note) = load_params(&path, n_ctx);
+                let (params, placement) = load_params(&path, n_ctx);
                 if let Ok(mut slot) = accel.lock() {
-                    *slot = note;
+                    *slot = placement;
                 }
                 match LlamaModel::load_from_file(&backend, &path, &params) {
                     Ok(model) => {
@@ -329,16 +341,30 @@ impl<'m> Session<'m> {
 /// card with a 16k context. Unified memory (Apple, integrated GPUs) keeps
 /// the default — there is one pool, and llama.cpp splits it better than a
 /// VRAM budget we do not have.
-fn load_params(path: &std::path::Path, n_ctx: u32) -> (LlamaModelParams, String) {
+fn load_params(path: &std::path::Path, n_ctx: u32) -> (LlamaModelParams, Accel) {
+    use crate::hardware::fmt_bytes;
+
     // Match the floor `generate` applies, so the KV cache we budget for is
     // the one that actually gets allocated.
     let n_ctx = n_ctx.max(2048);
     let params = LlamaModelParams::default();
+    let note = |note: String| Accel {
+        note,
+        all_on_gpu: false,
+    };
     let Some(gpu) = crate::hardware::gpu() else {
-        return (params, String::new());
+        return (params, Accel::default());
     };
     if gpu.unified {
-        return (params, format!("{} ({})", gpu.name, gpu.backend));
+        // One pool, no split to report: llama.cpp places the layers and the
+        // memory it uses is the same memory either way.
+        return (
+            params,
+            Accel {
+                note: format!("{} ({})", gpu.name, gpu.backend),
+                all_on_gpu: true,
+            },
+        );
     }
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     // No readable header means no layer count, and guessing with a card's
@@ -346,21 +372,43 @@ fn load_params(path: &std::path::Path, n_ctx: u32) -> (LlamaModelParams, String)
     let Some(dims) = crate::models::gguf_dims(path) else {
         return (
             params.with_n_gpu_layers(0),
-            format!("CPU only — could not read the layer count for {}", gpu.name),
+            note(format!(
+                "CPU only — could not read the layer count for {}",
+                gpu.name
+            )),
         );
     };
     let n = crate::models::gpu_layers(size, &dims, n_ctx, gpu.budget());
-    let note = if n == 0 {
-        format!(
-            "CPU only — {} has no room at a {n_ctx} token context",
-            gpu.name
-        )
-    } else if u64::from(n) > dims.layers {
-        format!("all {} layers on {}", dims.layers, gpu.name)
+    // What the whole model would have taken. A partial offload is the single
+    // most common reason for "my GPU sits at 20%", so the line says what it
+    // would have needed rather than leaving people to guess.
+    let needed = size + dims.kv_bytes_per_token * n_ctx as u64 + crate::models::GPU_OVERHEAD;
+    let short = format!(
+        "needs {} at {n_ctx} tokens of context, {} free on the card",
+        fmt_bytes(needed),
+        fmt_bytes(gpu.budget())
+    );
+    if u64::from(n) > dims.layers {
+        return (
+            params.with_n_gpu_layers(n),
+            Accel {
+                note: format!("all {} layers on {}", dims.layers, gpu.name),
+                all_on_gpu: true,
+            },
+        );
+    }
+    let text = if n == 0 {
+        format!("CPU only — {} has no usable room ({short})", gpu.name)
     } else {
-        format!("{n} of {} layers on {}", dims.layers, gpu.name)
+        format!(
+            "{n} of {} layers on {} — the other {} run on the CPU and hold the \
+             card back ({short})",
+            dims.layers,
+            gpu.name,
+            dims.layers - u64::from(n),
+        )
     };
-    (params.with_n_gpu_layers(n), note)
+    (params.with_n_gpu_layers(n), note(text))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -196,7 +196,10 @@ impl OffgridApp {
         }
         theme::apply(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let hardware = HardwareProfile::detect();
+        let mut hardware = HardwareProfile::detect();
+        if let Some(stored) = &config.gpu_bandwidth {
+            hardware.adopt_gpu_bandwidth(stored);
+        }
         let models_dir = models_dir();
         let _ = std::fs::create_dir_all(&models_dir);
         let (hub_tx, hub_rx) = std::sync::mpsc::channel();
@@ -496,6 +499,7 @@ impl OffgridApp {
                     gen_secs,
                 }) => {
                     self.chat_ctx_used = prompt_tokens + gen_tokens;
+                    self.calibrate_gpu_bandwidth(gen_tokens, gen_secs);
                     self.gen_stats = Some(format!(
                         "{:.1} tok/s · {} tokens · prompt: {} tok in {:.1}s",
                         gen_tokens as f32 / gen_secs.max(0.001),
@@ -683,10 +687,13 @@ impl OffgridApp {
             ));
             ui.label(format!("GPU: {}", self.hardware.gpu_summary()));
             ui.weak(format!(
-                "Measured memory bandwidth: {}/s — this, and how much of a model \
-                 fits in VRAM, drives the tok/s estimates in the model lists.",
-                fmt_bytes(self.hardware.mem_bandwidth)
+                "{} — this, and how much of a model fits in VRAM, drives the tok/s \
+                 estimates in the model lists.",
+                self.hardware.bandwidth_summary()
             ));
+            if let Some(vram) = self.hardware.vram_summary(self.n_ctx()) {
+                ui.weak(vram);
+            }
         });
 
         // Debug builds only: quick access to agent session logs.
@@ -778,9 +785,47 @@ impl OffgridApp {
         }
     }
 
+    /// Turn a finished generation into a bandwidth measurement for the card.
+    ///
+    /// The startup assumption in `hardware.rs` is deliberately low, so on a
+    /// fast card every tok/s figure in the UI reads several times too slow
+    /// until a real run corrects it. A run that had the whole model on the
+    /// card is that measurement, for free, from work already done.
+    fn calibrate_gpu_bandwidth(&mut self, gen_tokens: usize, gen_secs: f32) {
+        let all_on_gpu = self.llm.accel.lock().map(|a| a.all_on_gpu).unwrap_or(false);
+        let Some(model) = self
+            .local_models
+            .iter()
+            .find(|m| Some(m.name.as_str()) == self.loaded_model.as_deref())
+        else {
+            return;
+        };
+        let (name, size) = (model.name.clone(), model.size);
+        if let Some(measured) = self
+            .hardware
+            .calibrate_gpu(&name, size, gen_tokens, gen_secs, all_on_gpu)
+        {
+            self.config.gpu_bandwidth = Some(measured);
+            self.config.save();
+        }
+    }
+
+    /// Where a model of this size would actually run on this machine.
+    fn placement(&self, size: u64, kv_per_token: Option<u64>) -> models::Placement {
+        models::Placement::of(
+            size,
+            kv_per_token,
+            self.hardware.total_ram,
+            self.hardware.dedicated_vram(),
+            self.n_ctx(),
+        )
+    }
+
     fn fit_badge(&self, ui: &mut egui::Ui, size: u64) {
-        let (label, color) = Fit::of(size, self.hardware.total_ram, self.n_ctx()).badge();
-        ui.colored_label(color, label);
+        let placement = self.placement(size, None);
+        let (label, color) = placement.badge();
+        ui.colored_label(color, label)
+            .on_hover_text(placement.tooltip());
     }
 
     fn download_button(ui: &mut egui::Ui) -> bool {
@@ -825,7 +870,7 @@ impl OffgridApp {
                         .llm
                         .accel
                         .lock()
-                        .map(|a| a.clone())
+                        .map(|a| a.note.clone())
                         .unwrap_or_default();
                     if !accel.is_empty() && !self.model_loading && self.loaded_model.is_some() {
                         ui.weak(accel);
@@ -845,13 +890,7 @@ impl OffgridApp {
                 for (i, model) in locals.iter().enumerate() {
                     let loaded = self.loaded_model.as_deref() == Some(model.name.as_str());
                     let can_load = !loaded && !self.model_loading;
-                    let badge = Fit::of_model(
-                        model.size,
-                        model.kv_per_token,
-                        self.hardware.total_ram,
-                        self.n_ctx(),
-                    )
-                    .badge();
+                    let badge = self.placement(model.size, model.kv_per_token);
                     let mut clicked_load = false;
                     let mut clicked_delete = false;
                     list_row(
@@ -1014,25 +1053,44 @@ impl OffgridApp {
                     self.hardware.dedicated_vram(),
                     self.n_ctx(),
                 );
-                if proposals.chat.is_some() || proposals.code.is_some() {
-                    ui.label("Recommended for your hardware:");
-                    if let Some(chat) = &proposals.chat {
-                        ui.horizontal(|ui| {
-                            ui.label("Chat:");
-                            ui.label(theme::bold(chat.name));
-                        });
+                if !proposals.is_empty() {
+                    // Two recommendations on a GPU box, because they are two
+                    // different machines: what the card can hold generates
+                    // several times faster, what RAM can hold answers better.
+                    // Picking one for the user hides the trade they own.
+                    let split = proposals.ram_adds_anything();
+                    ui.label(if split {
+                        "Recommended for your hardware — fastest, entirely on the GPU:"
+                    } else {
+                        "Recommended for your hardware:"
+                    });
+                    let pick = |ui: &mut egui::Ui, label: &str, entry: Option<&models::CatalogEntry>| {
+                        if let Some(entry) = entry {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                ui.label(theme::bold(entry.name));
+                                ui.weak(fmt_bytes(entry.size));
+                            });
+                        }
+                    };
+                    if split {
+                        pick(ui, "Chat:", proposals.gpu_chat.as_ref());
+                        pick(ui, "Coding:", proposals.gpu_code.as_ref());
+                        ui.label("Bigger, but split with system RAM and much slower:");
+                        pick(ui, "Chat:", proposals.ram_chat.as_ref());
+                        pick(ui, "Coding:", proposals.ram_code.as_ref());
+                    } else {
+                        pick(ui, "Chat:", proposals.chat());
+                        pick(ui, "Coding:", proposals.code());
                     }
-                    if let Some(code) = &proposals.code {
-                        ui.horizontal(|ui| {
-                            ui.label("Coding:");
-                            ui.label(theme::bold(code.name));
-                        });
+                    if let Some(vram) = self.hardware.vram_summary(self.n_ctx()) {
+                        ui.weak(vram);
                     }
                     ui.separator();
                 }
                 let catalog = models::catalog();
                 for (i, entry) in catalog.iter().enumerate() {
-                    let badge = Fit::of(entry.size, self.hardware.total_ram, self.n_ctx()).badge();
+                    let badge = self.placement(entry.size, None);
                     let downloaded = self.is_downloaded(entry.file);
                     let downloading = self.is_downloading(entry.file);
                     let tooltip = models::quant_tooltip(entry.file);
@@ -1098,11 +1156,17 @@ impl OffgridApp {
                         theme::spinner(ui);
                     }
                 });
-                ui.weak(
+                ui.weak(if self.hardware.dedicated_vram().is_some() {
                     "Q4_K_M is the sweet spot for most machines — higher Q means better but \
-                 bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
-                 the highest-quality quant that fits your RAM.",
-                );
+                     bigger and slower, Q2 and below degrade noticeably. \"best on GPU\" marks \
+                     the best quant that fits your card whole, \"best in RAM\" the best that \
+                     fits memory at all — bigger and better, but split with the CPU and \
+                     several times slower."
+                } else {
+                    "Q4_K_M is the sweet spot for most machines — higher Q means better but \
+                     bigger and slower, Q2 and below degrade noticeably. \"best pick\" marks \
+                     the highest-quality quant that fits your RAM."
+                });
                 if !self.search_pending
                     && self.search_results.is_empty()
                     && let Some(q) = &self.last_search
@@ -1131,13 +1195,33 @@ impl OffgridApp {
                                         ui.weak("No usable GGUF model files in this repo.");
                                     }
                                 }
-                                let best = files
-                                    .iter()
-                                    .filter(|f| {
-                                        Fit::of(f.size, self.hardware.total_ram, self.n_ctx()) == Fit::Fits
-                                    })
-                                    .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
-                                    .map(|f| f.name.clone());
+                                // Two picks, not one: the best quant that runs
+                                // entirely on the card, and the best that fits
+                                // RAM at all. On a GPU box those are usually
+                                // different files, and a single "best pick"
+                                // sized against RAM steers people straight into
+                                // a split model.
+                                let vram = self.hardware.dedicated_vram();
+                                let best_of = |on_card: bool| {
+                                    files
+                                        .iter()
+                                        .filter(|f| {
+                                            Fit::of(f.size, self.hardware.total_ram, self.n_ctx())
+                                                == Fit::Fits
+                                        })
+                                        .filter(|f| {
+                                            !on_card
+                                                || vram.is_some_and(|v| {
+                                                    models::fits_vram(f.size, None, self.n_ctx(), v)
+                                                })
+                                        })
+                                        .min_by_key(|f| (models::quant_tag(&f.name).pref, f.size))
+                                        .map(|f| f.name.clone())
+                                };
+                                let best_ram = best_of(false);
+                                let best_gpu = vram.and_then(|_| best_of(true));
+                                // Only worth two markers when they differ.
+                                let best = if best_gpu == best_ram { None } else { best_ram };
                                 egui::Grid::new(("repo_files", &repo.id))
                                     .num_columns(6)
                                     .spacing([16.0, 6.0])
@@ -1168,10 +1252,24 @@ impl OffgridApp {
                                                     ui.colored_label(tag.color, tag.label)
                                                         .on_hover_text(&tip);
                                                 }
-                                                if best.as_deref() == Some(f.name.as_str()) {
-                                                    ui.label(theme::bold("• best pick")).on_hover_text(
+                                                if best_gpu.as_deref() == Some(f.name.as_str()) {
+                                                    ui.label(theme::bold("• best on GPU"))
+                                                        .on_hover_text(
+                                                            "The highest-quality quant of this \
+                                                             repo that fits your card whole. \
+                                                             This is the fast one.",
+                                                        );
+                                                } else if best.as_deref() == Some(f.name.as_str()) {
+                                                    ui.label(theme::bold(if best_gpu.is_some() {
+                                                        "• best in RAM"
+                                                    } else {
+                                                        "• best pick"
+                                                    }))
+                                                    .on_hover_text(
                                                         "The highest-quality quant of this repo \
-                                                     that fits your RAM.",
+                                                         that fits your RAM. Better answers than \
+                                                         the GPU pick, at a fraction of the speed \
+                                                         when it does not fit the card.",
                                                     );
                                                 }
                                             });
@@ -1990,7 +2088,7 @@ fn list_row(
     name: impl FnOnce(&mut egui::Ui),
     size: u64,
     est: String,
-    badge: (&'static str, egui::Color32),
+    placement: models::Placement,
     actions: impl FnOnce(&mut egui::Ui),
 ) {
     let fill = if stripe {
@@ -2016,14 +2114,16 @@ fn list_row(
                 ui.allocate_ui_with_layout(egui::vec2(COL_TOKS, ROW_H), cell, |ui| {
                     ui.set_width(COL_TOKS);
                     ui.weak(est).on_hover_text(
-                        "Estimated generation speed on this machine \
-                         (from measured memory bandwidth)",
+                        "Estimated generation speed on this machine: how fast its \
+                         memory can stream the model's weights, split between VRAM \
+                         and system RAM the way this model would be.",
                     );
                 });
-                let (label, color) = badge;
+                let (label, color) = placement.badge();
                 ui.allocate_ui_with_layout(egui::vec2(COL_BADGE, ROW_H), cell, |ui| {
                     ui.set_width(COL_BADGE);
-                    ui.colored_label(color, label);
+                    ui.colored_label(color, label)
+                        .on_hover_text(placement.tooltip());
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
             });
@@ -2484,7 +2584,7 @@ mod tests {
                             },
                             size,
                             models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
-                            Fit::of(size, DEMO_RAM, llm::DEFAULT_N_CTX).badge(),
+                            models::Placement::of(size, None, DEMO_RAM, None, llm::DEFAULT_N_CTX),
                             |ui| {
                                 let _ = theme::button(
                                     ui,
@@ -2530,7 +2630,7 @@ mod tests {
                         },
                         size,
                         models::fmt_tok_s(models::est_tokens_per_sec(name, size, DEMO_BW)),
-                        Fit::of(size, DEMO_RAM, llm::DEFAULT_N_CTX).badge(),
+                        models::Placement::of(size, None, DEMO_RAM, None, llm::DEFAULT_N_CTX),
                         |ui| {
                             let _ = theme::button(
                                 ui,

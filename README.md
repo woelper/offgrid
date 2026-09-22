@@ -17,8 +17,9 @@ internet was there in the first place.
 
 - **Models**: a curated catalog of known-good models plus full Hugging Face
   search. Every model shows its size, an estimated tok/s for your actual
-  hardware (measured, not guessed from vibes), and a fit badge so you know
-  whether it fits in RAM before you commit to an 18 GB download. Downloads
+  hardware (measured, not guessed from vibes), and a fit badge saying where it
+  would run — in RAM, or entirely on your graphics card — before you commit to
+  an 18 GB download. Downloads
   survive network drops and app restarts, and resume where they stopped.
 - **Chat**: streaming markdown chat with whatever model you loaded. Reasoning
   models get their thinking rendered as a quiet little quote block instead of
@@ -165,16 +166,43 @@ cargo run --release --features cuda
 
 What it changes, once a card is found:
 
-- **Settings → System** names the card and its VRAM.
+- **Settings → System** names the card, its VRAM, both memory bandwidths, and
+  the largest model that still runs entirely on the card at your context size.
 - **Loading a model** reads the layer count and KV-cache size out of the GGUF
   header and hands the GPU as many layers as fit in free VRAM, keeping some
   back for compute buffers. Current model reports the split — "all 32 layers
-  on NVIDIA GeForce RTX 2070 SUPER", "23 of 48 layers on …". llama.cpp's own
-  default is *all layers*, which aborts the load when they do not fit.
-- **Recommendations and tok/s estimates** size against the card: the suggested
-  model is the largest that fits *entirely* in VRAM, because a model split
-  with system RAM is read over the PCIe bus every token and runs at roughly
-  system-RAM speed anyway.
+  on NVIDIA GeForce RTX 2070 SUPER", or "23 of 48 layers on … — the other 25
+  run on the CPU and hold the card back (needs 19.8 GB at 16384 tokens of
+  context, 14.2 GB free on the card)". llama.cpp's own default is *all
+  layers*, which aborts the load when they do not fit.
+- **Fit badges** say where a model runs, not just whether it loads: "all on
+  GPU", "62% on GPU", "CPU only". A 19 GB model on a box with 64 GB of RAM and
+  a 16 GB card fits memory comfortably and still generates ten times slower
+  than one that fits the card, so "fits" on its own was true and useless.
+- **Recommendations come in pairs** on a machine with a card — the best model
+  that fits it whole, and the bigger one that only fits RAM. Hugging Face
+  search marks both ("best on GPU", "best in RAM"). Which way that trade goes
+  is the user's call, so both are shown rather than one picked for them.
+- **tok/s estimates** split the weights between VRAM and system RAM exactly
+  the way the loader will, using the same calculation the badge reports.
+
+### Where the bandwidth numbers come from
+
+Generation is memory-bound: every token reads the weights once, so tok/s is
+bandwidth divided by bytes per token. System RAM is benchmarked at startup.
+VRAM cannot be — neither Vulkan nor ggml reports it and llama.cpp offers no
+way to measure it — so offgrid starts from a deliberately low assumption
+(200 GB/s, at or below nearly every discrete card of the last several years)
+and **measures the real figure from your own runs**: any generation that had
+the whole model on the card reports back what the card actually streamed.
+The result is stored per GPU name in the config and reused on the next start,
+Settings → System says whether the figure is measured or still assumed, and
+only a faster measurement replaces an earlier one, since background load can
+drag an observed rate below the hardware but never above it.
+
+This matters more than it sounds. On a fast card the assumption is off by a
+factor of four or more, which made every estimate in the lists read far too
+slow until the machine had run something.
 
 Apple Silicon and integrated GPUs share one memory pool, so there is no
 separate budget to compute — those keep llama.cpp's own split. Metal is built
