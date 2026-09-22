@@ -12,10 +12,52 @@ inputs:
       deliberate. The version must exist in Jimver/cuda-toolkit's links for
       both Linux and Windows.
     default: '12.9.1'
+  architectures:
+    description: >
+      CUDA architectures to generate code for, as CMAKE_CUDA_ARCHITECTURES.
+      ggml's own default is ten targets (50/61/70/75/80-virtual, 86/89-real,
+      90-virtual, 120a/121a-real) and every kernel is compiled once per
+      target, which is most of why this build takes hours. These four cover
+      Turing through Blackwell — RTX 20 to 50, the cards offgrid is actually
+      run on. Older NVIDIA hardware keeps working through the Vulkan build.
+    default: '75-real;86-real;89-real;120a-real'
 
 runs:
   using: composite
   steps:
+    - name: Architectures to compile for
+      shell: bash
+      run: echo "CMAKE_CUDA_ARCHITECTURES=${{ inputs.architectures }}" >> "$GITHUB_ENV"
+
+    # ccache wraps nvcc as well as cc: ggml sets RULE_LAUNCH_COMPILE, which
+    # covers every compile rule under Makefile and Ninja generators. Linux
+    # only, because the Visual Studio generator ignores that property.
+    #
+    # llama.cpp's sources do not change between our releases, so after the
+    # first build this is the difference between an hour of nvcc and minutes
+    # of cache hits.
+    - name: ccache (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get install -y ccache
+        {
+          echo "CCACHE_DIR=$HOME/.ccache"
+          echo "CCACHE_MAXSIZE=2G"
+          echo "CCACHE_COMPRESS=1"
+        } >> "$GITHUB_ENV"
+
+    # A cache entry is immutable, so every run writes a new one keyed by run
+    # id and falls back to the newest entry for this toolkit version.
+    - name: ccache store (Linux)
+      if: runner.os == 'Linux'
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-cuda-${{ inputs.cuda }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-cuda-${{ inputs.cuda }}-
+
     # Deliberately no vcvars-style PATH rewrite here: rustc, cc and CMake all
     # find MSVC on their own (as the plain and Vulkan Windows jobs prove),
     # while a wholesale PATH rewrite once made rustc resolve Git's `link.exe`

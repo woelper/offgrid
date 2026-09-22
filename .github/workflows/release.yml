@@ -80,7 +80,10 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.features }}" = "cuda" ]; then
-            export NUM_JOBS=2
+            # Was 2, when ten architectures were compiled and parallel nvcc
+            # OOM-killed the runner; four architectures leave room for the
+            # runner's own core count. See .github/actions/setup-cuda.
+            export NUM_JOBS=4
           fi
           if [ -n "${{ matrix.features }}" ]; then
             cargo bundle --release --format deb --features "${{ matrix.features }}"
@@ -111,7 +114,10 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.features }}" = "cuda" ]; then
-            export NUM_JOBS=2
+            # Was 2, when ten architectures were compiled and parallel nvcc
+            # OOM-killed the runner; four architectures leave room for the
+            # runner's own core count. See .github/actions/setup-cuda.
+            export NUM_JOBS=4
           fi
           if [ -n "${{ matrix.features }}" ]; then
             cargo build --release --features "${{ matrix.features }}"

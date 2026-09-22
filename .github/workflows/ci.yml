@@ -96,9 +96,9 @@ jobs:
   # unit tests and a physical NVIDIA box are for.
   cuda:
     if: github.event_name == 'workflow_dispatch'
-    # Capped, but generously: the Windows CUDA backend takes well over two
-    # hours with NUM_JOBS=2, and a wedged toolkit installer must still fail
-    # the job instead of sitting on it.
+    # Capped, but generously: a cold Windows CUDA build ran well over two
+    # hours before the architecture list was trimmed, and a wedged toolkit
+    # installer must still fail the job instead of sitting on it.
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -129,9 +129,13 @@ jobs:
           cuda: ${{ inputs.cuda }}
 
       - name: build
-        # The cmake crate reads NUM_JOBS for build parallelism: unbounded
-        # parallel nvcc OOM-kills the 16 GB runners on the fat multi-arch
-        # compile, so two at a time — slow, but it survives.
+        # The cmake crate reads NUM_JOBS for build parallelism. This was two,
+        # because unbounded parallel nvcc OOM-killed the 16 GB runners on the
+        # fat ten-architecture compile; four targets need far less memory per
+        # process, so the runner's own core count is back on the table. Dial
+        # this down again if a build dies with signal 9.
         env:
-          NUM_JOBS: 2
-        run: cargo build --features cuda
+          NUM_JOBS: 4
+        run: |
+          cargo build --features cuda
+          command -v ccache >/dev/null && ccache --show-stats --verbose || true

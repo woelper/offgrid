@@ -164,6 +164,15 @@ a usable GPU it stays on the CPU, same as the Vulkan one.
 cargo run --release --features cuda
 ```
 
+The prebuilt `-cuda` artifacts are compiled for Turing through Blackwell —
+RTX 20, 30, 40 and 50. Older NVIDIA cards (GTX 10xx and down) are served by
+the `-vulkan` build instead: ggml's default is to generate code for ten
+architectures, and each one is another full pass over every kernel, which is
+what made these builds take hours. Building it yourself gets whatever you
+ask for — `CMAKE_CUDA_ARCHITECTURES=native cargo build --release --features
+cuda` compiles for the card in the machine and nothing else, which is both
+faster and smaller.
+
 What it changes, once a card is found:
 
 - **Settings → System** names the card, its VRAM, both memory bandwidths, and
