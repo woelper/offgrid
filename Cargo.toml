@@ -26,6 +26,21 @@ vulkan = ["llama-cpp-2/vulkan"]
 # working with nothing installed. A binary built with it needs the NVIDIA
 # driver installed; where there is no usable GPU it stays on the CPU.
 cuda = ["llama-cpp-2/cuda"]
+# Local image generation through stable-diffusion.cpp. It shares one ggml with
+# llama.cpp rather than linking a second copy (see `shared-ggml`), which is why
+# this needs scripts/images-build.sh rather than a bare `cargo build`: the ggml
+# and the sd.cpp static library are produced outside cargo, and the script
+# passes their location in OFFGRID_SD_PREFIX.
+#
+# The earlier candle implementation is in this branch's history. It was five
+# times slower on a CPU (47s a step, 31s with MKL, against 9.2s here), has no
+# Vulkan backend for non-NVIDIA cards, and could not use quantized weights.
+images = ["shared-ggml", "dep:cc"]
+# Experiment, and the foundation of `images`: link llama.cpp against a ggml
+# built outside the crate, so a second consumer of ggml can link the same copy
+# instead of bringing its own and colliding on every symbol. GGML_MAX_NAME must
+# match across all of them — it is part of ggml_tensor's layout.
+shared-ggml = ["llama-cpp-2/system-ggml", "llama-cpp-2/system-ggml-static"]
 
 [dependencies]
 crossterm = "0.29.0"
@@ -44,6 +59,10 @@ sysinfo = "0.38.4"
 tiny_http = "0.12.0"
 ureq = "3.4.0"
 wait-timeout = "0.2.1"
+
+[build-dependencies]
+# Compiles src/sd/offgrid_sd.c, the C surface over stable-diffusion.h.
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
@@ -73,7 +92,7 @@ opt-level = 3
 # libtest harness).
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# lto = true
+# codegen-units = 1
 strip = true
 panic = "abort"

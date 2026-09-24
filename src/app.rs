@@ -12,6 +12,8 @@ use crate::bridge;
 use crate::config::{Config, models_dir};
 use crate::hardware::{self, HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
+#[cfg(feature = "images")]
+use crate::imagegen;
 use crate::llm::{self, LlmCmd, LlmEvent, LlmHandle, Role};
 use crate::models::{self, Fit, LocalModel};
 use crate::server::{self, ApiServer};
@@ -25,7 +27,20 @@ enum Tab {
     Chat,
     Code,
     Serve,
+    #[cfg(feature = "images")]
+    Images,
     Settings,
+}
+
+/// "2m 30s" / "45s" — a rough wait, not a stopwatch.
+#[cfg(feature = "images")]
+fn fmt_secs(secs: f32) -> String {
+    let secs = secs.max(0.0).round() as u64;
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn tool_icon(name: &str) -> egui::ImageSource<'static> {
@@ -107,6 +122,69 @@ enum AgentItem {
     Info(String),
 }
 
+/// Everything the images tab needs between frames. The worker is spawned on
+/// first use, not at startup: most sessions never open this tab, and the model
+/// is a 2 GB download nobody should pay for by accident.
+#[cfg(feature = "images")]
+struct ImagesState {
+    worker: Option<imagegen::ImageHandle>,
+    /// Index into `imagegen::MODELS`.
+    model: usize,
+    /// Keep weights in RAM rather than filling VRAM. Pointless on a CPU-only
+    /// build, and the difference between running and not on a small card.
+    offload: bool,
+    prompt: String,
+    steps: usize,
+    seed: u64,
+    /// Output size. Cost follows the pixel count, and past 512 SD 1.5 starts
+    /// repeating subjects, so this is a short list rather than free numbers.
+    size: (usize, usize),
+    busy: bool,
+    /// What the worker last said it was doing (downloading, loading, decoding).
+    note: String,
+    progress: Option<(usize, usize)>,
+    started: Option<std::time::Instant>,
+    /// Wall-clock seconds the last finished image took, the number this whole
+    /// prototype exists to produce.
+    took: Option<f32>,
+    image: Option<(usize, usize, Vec<u8>)>,
+    texture: Option<egui::TextureHandle>,
+    /// Latent preview: tiny, blurry, and updated every step.
+    preview: Option<(usize, usize, Vec<u8>)>,
+    preview_texture: Option<egui::TextureHandle>,
+    /// When the first step landed. Loading the model dominates the first
+    /// minute, so steps have to be timed from their own start for an estimate
+    /// to mean anything.
+    first_step: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "images")]
+impl Default for ImagesState {
+    fn default() -> Self {
+        Self {
+            worker: None,
+            // The quick one first: a five-minute wait is a poor introduction,
+            // and the picker says what the slower one buys.
+            model: 0,
+            offload: true,
+            prompt: String::new(),
+            steps: imagegen::MODELS[0].steps,
+            seed: 42,
+            size: imagegen::DEFAULT_SIZE,
+            busy: false,
+            note: String::new(),
+            progress: None,
+            started: None,
+            took: None,
+            image: None,
+            texture: None,
+            preview: None,
+            preview_texture: None,
+            first_step: None,
+        }
+    }
+}
+
 pub struct OffgridApp {
     hardware: HardwareProfile,
     /// Free space where models live. Cached: querying the mount table every
@@ -186,6 +264,8 @@ pub struct OffgridApp {
     /// changes, so unchanged frames do not deep-clone every message.
     chat_snapshot: Vec<llm::ChatMessage>,
     chat_fp: u64,
+    #[cfg(feature = "images")]
+    images: ImagesState,
 }
 
 impl OffgridApp {
@@ -282,6 +362,8 @@ impl OffgridApp {
             agent_auto_approve: false,
             agent_approval: None,
             confirm_delete: None,
+            #[cfg(feature = "images")]
+            images: ImagesState::default(),
             last_error: startup_error,
             chat_culler: RowCuller::default(),
             agent_culler: RowCuller::default(),
@@ -473,6 +555,9 @@ impl OffgridApp {
             }
         }
 
+        #[cfg(feature = "images")]
+        self.drain_image_events();
+
         loop {
             match self.llm.event_rx.try_recv() {
                 Ok(LlmEvent::Loaded(name)) => {
@@ -598,17 +683,312 @@ impl OffgridApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         // Plain grey strip above the tabs, like Haiku's window layouts.
         ui.add_space(14.0);
-        theme::tab_bar(
-            ui,
-            &mut self.tab,
-            &[
-                (Tab::Models, theme::icons().models.clone(), "Models"),
-                (Tab::Chat, theme::icons().chat.clone(), "Chat"),
-                (Tab::Code, theme::icons().code.clone(), "Code"),
-                (Tab::Serve, theme::icons().serve.clone(), "Serve"),
-                (Tab::Settings, theme::icons().settings.clone(), "Settings"),
-            ],
-        );
+        let mut tabs = vec![
+            (Tab::Models, theme::icons().models.clone(), "Models"),
+            (Tab::Chat, theme::icons().chat.clone(), "Chat"),
+            (Tab::Code, theme::icons().code.clone(), "Code"),
+            (Tab::Serve, theme::icons().serve.clone(), "Serve"),
+        ];
+        #[cfg(feature = "images")]
+        tabs.push((Tab::Images, theme::icons().appearance.clone(), "Images"));
+        tabs.push((Tab::Settings, theme::icons().settings.clone(), "Settings"));
+        theme::tab_bar(ui, &mut self.tab, &tabs);
+    }
+
+    #[cfg(feature = "images")]
+    fn drain_image_events(&mut self) {
+        let Some(worker) = &self.images.worker else {
+            return;
+        };
+        loop {
+            match worker.event_rx.try_recv() {
+                Ok(imagegen::ImageEvent::Note(note)) => self.images.note = note,
+                Ok(imagegen::ImageEvent::Step { done, total }) => {
+                    if done == 1 {
+                        self.images.first_step = Some(std::time::Instant::now());
+                    }
+                    self.images.progress = Some((done, total));
+                    self.images.note.clear();
+                }
+                Ok(imagegen::ImageEvent::Preview { width, height, rgb }) => {
+                    self.images.preview = Some((width, height, rgb));
+                    self.images.preview_texture = None;
+                }
+                Ok(imagegen::ImageEvent::Image { width, height, rgb }) => {
+                    // Keep the pixels; the texture is uploaded in the tab,
+                    // which is the only place with a Context to hand.
+                    self.images.image = Some((width, height, rgb));
+                    self.images.texture = None;
+                    self.images.preview = None;
+                    self.images.preview_texture = None;
+                }
+                Ok(imagegen::ImageEvent::Done) => {
+                    self.images.busy = false;
+                    self.images.progress = None;
+                    self.images.first_step = None;
+                    self.images.note.clear();
+                    self.images.took = self
+                        .images
+                        .started
+                        .take()
+                        .map(|t| t.elapsed().as_secs_f32());
+                }
+                Ok(imagegen::ImageEvent::Error(e)) => {
+                    self.last_error = Some(format!("image: {e}"));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[cfg(feature = "images")]
+    fn images_ui(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            theme::group(
+                ui,
+                "Image models",
+                Some(theme::icons().depot.clone()),
+                |ui| {
+                    let mut fetch = None;
+                    for (i, model) in imagegen::MODELS.iter().enumerate() {
+                        let missing = model.missing_bytes();
+                        ui.horizontal(|ui| {
+                            let selected = i == self.images.model;
+                            if ui.selectable_label(selected, model.name).clicked() && !selected {
+                                self.images.model = i;
+                                // Each model is distilled for its own step
+                                // count, and the last one's is wrong here.
+                                self.images.steps = model.steps;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if missing == 0 {
+                                        ui.weak("on disk");
+                                    } else if self.images.busy {
+                                        ui.weak(format!("{} to fetch", fmt_bytes(missing)));
+                                    } else if Self::download_button(ui) {
+                                        fetch = Some(i);
+                                    }
+                                    ui.weak(fmt_bytes(model.total_bytes()));
+                                },
+                            );
+                        });
+                    }
+                    ui.weak(imagegen::MODELS[self.images.model].note);
+                    if let Some(model) = fetch {
+                        self.fetch_image_model(model);
+                    }
+                },
+            );
+
+            theme::group(
+                ui,
+                "Prompt",
+                Some(theme::icons().appearance.clone()),
+                |ui| {
+                    ui.checkbox(&mut self.images.offload, "Offload weights to RAM")
+                        .on_hover_text(
+                            "Keeps the weights in RAM and streams them to the GPU as needed, \
+                             so a model larger than VRAM still runs. No effect on a build \
+                             without a GPU backend.",
+                        );
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.images.prompt)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("a rusty robot walking on a sandy beach"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Steps:");
+                        ui.add(egui::Slider::new(&mut self.images.steps, 1..=50));
+                        ui.label("Seed:");
+                        ui.add(egui::DragValue::new(&mut self.images.seed));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Size:");
+                        let (w, h) = self.images.size;
+                        let current = imagegen::SIZES
+                            .iter()
+                            .find(|(_, sw, sh)| (*sw, *sh) == (w, h))
+                            .map(|(label, _, _)| *label)
+                            .unwrap_or("custom");
+                        egui::ComboBox::from_id_salt("image_size")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for (label, sw, sh) in imagegen::SIZES {
+                                    ui.selectable_value(&mut self.images.size, (*sw, *sh), *label);
+                                }
+                            });
+                        // Not just the pixel ratio: attention costs the square
+                        // of the latent area, so the wait climbs faster than
+                        // the size does — by a lot, measured.
+                        let (dw, dh) = imagegen::DEFAULT_SIZE;
+                        let ratio = (w * h) as f32 / (dw * dh) as f32;
+                        if ratio > 1.01 {
+                            ui.weak(format!(
+                                "{ratio:.1}× the pixels of 512 × 512, and rather more than that in time"
+                            ));
+                        } else if ratio < 0.99 {
+                            ui.weak(format!("{ratio:.1}× the pixels of 512 × 512, and quicker"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let ready = !self.images.busy && !self.images.prompt.trim().is_empty();
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Generate"))
+                            .on_disabled_hover_text(if self.images.busy {
+                                "an image is already generating"
+                            } else {
+                                // The grey line in the box is a placeholder,
+                                // not text: nothing is sent until you type.
+                                "type a prompt first"
+                            })
+                            .clicked()
+                        {
+                            self.start_image();
+                        }
+                        if self.images.busy
+                            && theme::button(ui, None, "Stop").clicked()
+                            && let Some(worker) = &self.images.worker
+                        {
+                            worker.stop.store(true, Ordering::Relaxed);
+                        }
+                        if let Some(took) = self.images.took {
+                            ui.weak(format!("last image: {took:.1}s"));
+                        }
+                    });
+                    let missing = imagegen::MODELS[self.images.model].missing_bytes();
+                    if missing > 0 && !self.images.busy {
+                        ui.weak(format!(
+                        "Stable Diffusion 1.5 is not on disk yet — the first image downloads {} \
+                         of weights. candle runs them in f16, not a GGUF quant.",
+                        fmt_bytes(missing)
+                    ));
+                    }
+                },
+            );
+
+            if self.images.busy {
+                theme::group(ui, "Working", Some(theme::icons().model.clone()), |ui| {
+                    match self.images.progress {
+                        Some((done, total)) => {
+                            // A step is slow enough on a CPU that the wait is
+                            // worth quantifying rather than animating.
+                            let label = match self.images.first_step {
+                                Some(t0) if done > 0 => {
+                                    let per_step = t0.elapsed().as_secs_f32() / done as f32;
+                                    format!(
+                                        "step {done}/{total} — {per_step:.0}s/step, {} left",
+                                        fmt_secs(per_step * (total - done) as f32)
+                                    )
+                                }
+                                _ => format!("step {done}/{total}"),
+                            };
+                            ui.add(egui::ProgressBar::new(done as f32 / total as f32).text(label));
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(if self.images.note.is_empty() {
+                                    "starting…"
+                                } else {
+                                    &self.images.note
+                                });
+                            });
+                        }
+                    }
+                    // The latents on their way to being an image: an eighth of
+                    // the resolution and blurry, but it moves every step.
+                    if let Some((width, height, rgb)) = self.images.preview.clone() {
+                        let texture = self.images.preview_texture.get_or_insert_with(|| {
+                            let image = egui::ColorImage::from_rgb([width, height], &rgb);
+                            ui.ctx()
+                                .load_texture("preview", image, egui::TextureOptions::LINEAR)
+                        });
+                        // Drawn at the size the finished image will be, so the
+                        // tab does not jump when the real one arrives.
+                        let (w, h) = self.images.size;
+                        ui.add(
+                            egui::Image::new((texture.id(), texture.size_vec2()))
+                                .fit_to_exact_size(egui::vec2(w as f32, h as f32)),
+                        );
+                    }
+                });
+            }
+
+            if let Some((width, height, rgb)) = self.images.image.clone() {
+                theme::group(ui, "Result", Some(theme::icons().file.clone()), |ui| {
+                    let texture = self.images.texture.get_or_insert_with(|| {
+                        let image = egui::ColorImage::from_rgb([width, height], &rgb);
+                        ui.ctx()
+                            .load_texture("generated", image, egui::TextureOptions::LINEAR)
+                    });
+                    ui.image((texture.id(), texture.size_vec2()));
+                    if theme::button(ui, Some((theme::icons().disk.clone(), 18.0)), "Save as…")
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .set_file_name("offgrid.png")
+                            .save_file()
+                    {
+                        let saved = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+                            .ok_or_else(|| "image data does not match its size".to_string())
+                            .and_then(|img| img.save(&path).map_err(|e| e.to_string()));
+                        if let Err(e) = saved {
+                            self.last_error = Some(format!("saving the image: {e}"));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Download a model's weights without generating, so the list behaves like
+    /// the model tab's: pick it now, wait once, generate later.
+    #[cfg(feature = "images")]
+    fn fetch_image_model(&mut self, model: usize) {
+        let worker = self
+            .images
+            .worker
+            .get_or_insert_with(imagegen::spawn_worker);
+        if worker
+            .cmd_tx
+            .send(imagegen::ImageCmd::Fetch { model })
+            .is_ok()
+        {
+            self.images.busy = true;
+            self.images.started = Some(std::time::Instant::now());
+            self.images.progress = None;
+            self.images.note = "starting…".into();
+        }
+    }
+
+    #[cfg(feature = "images")]
+    fn start_image(&mut self) {
+        let worker = self
+            .images
+            .worker
+            .get_or_insert_with(imagegen::spawn_worker);
+        let (width, height) = self.images.size;
+        let cmd = imagegen::ImageCmd::Generate {
+            model: self.images.model,
+            offload: self.images.offload,
+            prompt: self.images.prompt.clone(),
+            steps: self.images.steps,
+            seed: self.images.seed,
+            width,
+            height,
+        };
+        if worker.cmd_tx.send(cmd).is_ok() {
+            self.images.busy = true;
+            self.images.started = Some(std::time::Instant::now());
+            self.images.took = None;
+            self.images.progress = None;
+            self.images.first_step = None;
+            self.images.preview = None;
+            self.images.preview_texture = None;
+            self.images.note = "starting…".into();
+        }
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
@@ -2059,10 +2439,17 @@ impl eframe::App for OffgridApp {
             Tab::Chat => self.chat_ui(ui),
             Tab::Code => self.code_ui(ui),
             Tab::Serve => self.serve_ui(ui),
+            #[cfg(feature = "images")]
+            Tab::Images => self.images_ui(ui),
             Tab::Settings => self.settings_ui(ui),
         });
 
-        let busy = self.generating
+        #[cfg(feature = "images")]
+        let images_busy = self.images.busy;
+        #[cfg(not(feature = "images"))]
+        let images_busy = false;
+        let busy = images_busy
+            || self.generating
             || self.model_loading
             || self.search_pending
             || self.agent_run.is_some()

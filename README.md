@@ -217,6 +217,45 @@ Apple Silicon and integrated GPUs share one memory pool, so there is no
 separate budget to compute — those keep llama.cpp's own split. Metal is built
 in on macOS with or without this feature.
 
+## Image generation
+
+Optional, and off by default: it needs the Vulkan-style build machinery all
+over again — cmake, a C++ toolchain — and most people want a chat client.
+Build it with the script rather than cargo directly:
+
+```sh
+./scripts/images-build.sh run --release --features images
+```
+
+The script exists because llama.cpp and stable-diffusion.cpp both embed ggml,
+and two static copies in one binary collide on every symbol. Both can consume
+an external one instead, so it builds ggml once, builds sd.cpp against it, and
+hands cargo the result. (`GGML_MAX_NAME` has to match across all three — it
+sits inside `ggml_tensor`, and sd.cpp needs a larger one than upstream's
+default.) `OFFGRID_SD_REF` picks the stable-diffusion.cpp revision; it is
+pinned, because sd.cpp adds models weekly and the model list here is tuned to
+what one revision does.
+
+The Images tab lists models the way the Models tab lists LLMs — pick one, see
+its size, download it when you choose:
+
+| model | what it is |
+|---|---|
+| Stable Diffusion 1.5 | 2022, and it shows, but much the quickest and smallest |
+| Z-Image-Turbo | 2025, far better pictures, several times slower |
+| Qwen-Image 2.1 | 2026, the newest, and an order of magnitude slower on a CPU |
+
+Each is listed at a couple of quantisations. Quants of one model share their
+VAE and text encoder, so moving between them only fetches the part that
+differs. Z-Image's text encoder is a Qwen3 4B — the same model the chat
+catalog offers.
+
+On a CPU this is minutes an image, not seconds; the tab shows measured seconds
+per step and what is left. A GPU build is where these models belong, and
+"Offload weights to RAM" is what lets one larger than VRAM run on a small
+card. `--image-probe "a prompt"` runs the whole thing without a display, with
+`IMAGE_MODEL`, `IMAGE_STEPS`, `IMAGE_SIZE` and `IMAGE_THREADS` to vary it.
+
 ## macOS releases
 
 The `.app` is ad-hoc signed but not notarized, because Apple charges rent for
@@ -264,5 +303,6 @@ cp tests/snapshots/offgrid.png assets/screenshot.png
 ## Roadmap
 
 - GPU offload: ROCm backend (Vulkan and CUDA are in — see above)
+- Image generation on the GPU, and in the agent's tool set
 - Persistent conversations
 - Agent: edit/patch tool, diff view, multi-task memory

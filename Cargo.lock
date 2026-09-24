@@ -2756,6 +2756,7 @@ dependencies = [
 name = "offgrid"
 version = "0.6.0"
 dependencies = [
+ "cc",
  "crossterm",
  "directories",
  "eframe",

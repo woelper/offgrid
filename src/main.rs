@@ -9,6 +9,8 @@ mod bridge;
 mod config;
 mod hardware;
 mod hub;
+#[cfg(feature = "images")]
+mod imagegen;
 mod llm;
 mod models;
 mod server;
@@ -109,6 +111,15 @@ fn main() -> eframe::Result {
         let model_match = args.get(i + 1).cloned().unwrap_or_default();
         let question = args[i + 2..].join(" ");
         web_probe(&model_match, &question);
+        hard_exit(0);
+    }
+    // Image generation without the GUI: fetches the weights if needed, runs the
+    // pipeline, writes a PNG next to the working directory and prints what each
+    // stage cost. Usage: offgrid --image-probe <prompt…>   (steps: IMAGE_STEPS)
+    #[cfg(feature = "images")]
+    if let Some(i) = std::env::args().position(|a| a == "--image-probe") {
+        let args: Vec<String> = std::env::args().collect();
+        image_probe(&args[i + 1..].join(" "));
         hard_exit(0);
     }
     // Same, but exercises the coding-agent loop instead of serving.
@@ -239,6 +250,103 @@ fn web_probe(model_match: &str, question: &str) {
             "did NOT search — answered from memory"
         }
     );
+}
+
+/// Headless image generation, for measuring what the candle prototype costs on
+/// a given machine without a display in the way.
+#[cfg(feature = "images")]
+fn image_probe(prompt: &str) {
+    let prompt = if prompt.is_empty() {
+        "a rusty robot walking on a sandy beach"
+    } else {
+        prompt
+    };
+    // IMAGE_MODEL indexes imagegen::MODELS; steps default to what that model
+    // was distilled for.
+    let model: usize = std::env::var("IMAGE_MODEL")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .filter(|m: &usize| *m < imagegen::MODELS.len())
+        .unwrap_or(0);
+    let steps: usize = std::env::var("IMAGE_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(imagegen::MODELS[model].steps);
+    // IMAGE_SIZE=768 or IMAGE_SIZE=512x768.
+    let (width, height) = std::env::var("IMAGE_SIZE")
+        .ok()
+        .and_then(|spec| {
+            let (w, h) = spec
+                .split_once('x')
+                .unwrap_or((spec.as_str(), spec.as_str()));
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        })
+        .unwrap_or(imagegen::DEFAULT_SIZE);
+    println!(
+        "model: {}\nprompt: {prompt}\nsteps: {steps}\nsize: {width}x{height}",
+        imagegen::MODELS[model].name
+    );
+
+    let handle = imagegen::spawn_worker();
+    handle
+        .cmd_tx
+        .send(imagegen::ImageCmd::Generate {
+            model,
+            // IMAGE_OFFLOAD=0 turns it off; it is on by default, which is what
+            // a GPU build with a big model needs and a CPU build ignores.
+            offload: std::env::var("IMAGE_OFFLOAD")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            prompt: prompt.to_string(),
+            steps,
+            seed: 42,
+            width,
+            height,
+        })
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let mut first_step: Option<std::time::Instant> = None;
+    for event in handle.event_rx {
+        match event {
+            imagegen::ImageEvent::Note(note) => {
+                println!("[{:.1}s] {note}", start.elapsed().as_secs_f32())
+            }
+            imagegen::ImageEvent::Step { done, total } => {
+                let now = std::time::Instant::now();
+                let per_step = match first_step {
+                    Some(t0) if done > 1 => (now - t0).as_secs_f32() / (done - 1) as f32,
+                    _ => {
+                        first_step = Some(now);
+                        0.0
+                    }
+                };
+                println!(
+                    "[{:.1}s] step {done}/{total}{}",
+                    start.elapsed().as_secs_f32(),
+                    if per_step > 0.0 {
+                        format!(" — {per_step:.1}s/step")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            imagegen::ImageEvent::Image { width, height, rgb } => {
+                match image::RgbImage::from_raw(width as u32, height as u32, rgb) {
+                    Some(img) => match img.save("offgrid-image-probe.png") {
+                        Ok(()) => println!("wrote offgrid-image-probe.png ({width}x{height})"),
+                        Err(e) => eprintln!("could not write the png: {e}"),
+                    },
+                    None => eprintln!("image data does not match its size"),
+                }
+            }
+            // Previews are for the UI; headless, the step line is enough.
+            imagegen::ImageEvent::Preview { .. } => {}
+            imagegen::ImageEvent::Error(e) => eprintln!("error: {e}"),
+            imagegen::ImageEvent::Done => break,
+        }
+    }
+    println!("total: {:.1}s", start.elapsed().as_secs_f32());
 }
 
 fn smoke(agent_mode: bool) {
