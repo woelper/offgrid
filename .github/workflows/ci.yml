@@ -48,6 +48,47 @@ jobs:
       - name: tests
         run: cargo test -- --skip main_screen_snapshot
 
+  # Image generation is optional for anyone building offgrid — it wants cmake, a
+  # C++ toolchain and a ggml built outside cargo — but CI builds it on every
+  # push, because a feature nobody compiles is a feature that quietly rots.
+  # Linux only for now: the build script is bash and has only ever been run
+  # there.
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libssl-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev
+
+      # ggml and stable-diffusion.cpp are a ten-minute compile that changes
+      # only when the pinned revision or the lockfile does.
+      - name: Cache the ggml and stable-diffusion.cpp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/sd-prefix
+            target/ggml-build
+            target/sd-build
+            target/stable-diffusion.cpp
+          key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
+
+      - name: build
+        run: ./scripts/images-build.sh build --features images
+
+      - name: clippy
+        run: ./scripts/images-build.sh clippy --features images --all-targets -- -D warnings
+
   # The GPU build compiles a whole second ggml backend and its shaders, which
   # takes many minutes — too much for every push, where the ordinary build
   # above is the check that matters. Run it from the Actions tab when the
@@ -136,12 +177,6 @@ jobs:
         # this down again if a build dies with signal 9.
         env:
           NUM_JOBS: 4
-        run: cargo build --features cuda
-
-      # Its own step, and Linux only: the build step runs under PowerShell on
-      # Windows, where `>/dev/null` names a file on D: rather than discarding
-      # anything — it failed the job after a 75-minute build that had
-      # succeeded. ccache is Linux-only here anyway.
-      - name: ccache stats
-        if: runner.os == 'Linux'
-        run: ccache --show-stats --verbose
+        run: |
+          cargo build --features cuda
+          command -v ccache >/dev/null && ccache --show-stats --verbose || true
