@@ -248,17 +248,47 @@ fn range_get(url: &str, offset: u64) -> Result<ureq::http::Response<ureq::Body>,
         let res = req.call().map_err(|e| e.to_string())?;
         match res.status().as_u16() {
             301 | 302 | 303 | 307 | 308 => {
-                url = res
+                let location = res
                     .headers()
                     .get("location")
                     .and_then(|l| l.to_str().ok())
-                    .ok_or("redirect without location")?
-                    .to_string();
+                    .ok_or("redirect without location")?;
+                url = resolve_redirect(&url, location)?;
             }
             _ => return Ok(res),
         }
     }
     Err("too many redirects".into())
+}
+
+/// Turn a `Location` header into a URL we can request.
+///
+/// Hugging Face answers with relative locations for anything not on the LFS
+/// CDN — a small file redirects to `/api/resolve-cache/…`, and a renamed repo
+/// to `/<new-owner>/<new-name>/resolve/…`. Handing those to the HTTP client
+/// verbatim fails with "missing scheme", which is what a plain
+/// `location.to_string()` used to do. Large GGUF weights always land on an
+/// absolute CDN URL, which is why this never showed up in the model tab.
+fn resolve_redirect(base: &str, location: &str) -> Result<String, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_string());
+    }
+    let base: ureq::http::Uri = base.parse().map_err(|e| format!("bad url: {e}"))?;
+    let scheme = base.scheme_str().unwrap_or("https");
+    // Protocol-relative: //host/path keeps the scheme, replaces the host.
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{scheme}://{rest}"));
+    }
+    let authority = base
+        .authority()
+        .ok_or("redirect from a url with no host")?
+        .as_str();
+    if location.starts_with('/') {
+        return Ok(format!("{scheme}://{authority}{location}"));
+    }
+    // Relative to the directory the current path sits in.
+    let dir = base.path().rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    Ok(format!("{scheme}://{authority}{dir}/{location}"))
 }
 
 fn download(
@@ -390,6 +420,44 @@ mod tests {
 
     fn content() -> Vec<u8> {
         (0..100_000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The shapes Hugging Face actually sends. Both of these used to end the
+    /// download with "bad uri … is missing scheme": a small file redirects
+    /// into the resolve cache, and `runwayml/stable-diffusion-v1-5` redirects
+    /// to the repo's new name — neither location carries a host.
+    #[test]
+    fn redirects_resolve_against_the_current_url() {
+        let base =
+            "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/tokenizer.json";
+        assert_eq!(
+            resolve_redirect(
+                base,
+                "/api/resolve-cache/models/openai/x/tokenizer.json?etag=%22a%22"
+            )
+            .unwrap(),
+            "https://huggingface.co/api/resolve-cache/models/openai/x/tokenizer.json?etag=%22a%22"
+        );
+        assert_eq!(
+            resolve_redirect(
+                base,
+                "/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/x"
+            )
+            .unwrap(),
+            "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/x"
+        );
+        // An absolute CDN location — the LFS case — is passed through.
+        let cdn = "https://cdn-lfs.huggingface.co/repos/ab/model.safetensors?x=1";
+        assert_eq!(resolve_redirect(base, cdn).unwrap(), cdn);
+        // Protocol-relative and path-relative, for completeness.
+        assert_eq!(
+            resolve_redirect(base, "//cdn.example.com/f.bin").unwrap(),
+            "https://cdn.example.com/f.bin"
+        );
+        assert_eq!(
+            resolve_redirect(base, "other.json").unwrap(),
+            "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/other.json"
+        );
     }
 
     /// Loopback server; optionally honors Range with 206 + Content-Range.
