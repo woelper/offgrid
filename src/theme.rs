@@ -12,14 +12,16 @@ pub enum SkinKind {
     Haiku,
     Modern,
     Phosphor,
+    Delta,
     EguiDefault,
 }
 
 impl SkinKind {
-    pub const ALL: [SkinKind; 4] = [
+    pub const ALL: [SkinKind; 5] = [
         SkinKind::Haiku,
         SkinKind::Modern,
         SkinKind::Phosphor,
+        SkinKind::Delta,
         SkinKind::EguiDefault,
     ];
 
@@ -28,6 +30,7 @@ impl SkinKind {
             SkinKind::Haiku => "Haiku",
             SkinKind::Modern => "Modern",
             SkinKind::Phosphor => "Phosphor",
+            SkinKind::Delta => "Delta",
             SkinKind::EguiDefault => "egui default",
         }
     }
@@ -37,6 +40,7 @@ impl SkinKind {
             SkinKind::Haiku => "haiku",
             SkinKind::Modern => "modern",
             SkinKind::Phosphor => "phosphor",
+            SkinKind::Delta => "delta",
             SkinKind::EguiDefault => "egui",
         }
     }
@@ -48,6 +52,7 @@ impl SkinKind {
             // written before the rename should still open on the same theme.
             "modern" | "material" => SkinKind::Modern,
             "phosphor" => SkinKind::Phosphor,
+            "delta" => SkinKind::Delta,
             _ => SkinKind::Haiku,
         }
     }
@@ -60,6 +65,7 @@ pub fn kind() -> SkinKind {
         1 => SkinKind::EguiDefault,
         2 => SkinKind::Modern,
         3 => SkinKind::Phosphor,
+        4 => SkinKind::Delta,
         _ => SkinKind::Haiku,
     }
 }
@@ -70,6 +76,7 @@ pub fn set_kind(kind: SkinKind) {
         SkinKind::EguiDefault => 1,
         SkinKind::Modern => 2,
         SkinKind::Phosphor => 3,
+        SkinKind::Delta => 4,
     };
     ACTIVE_SKIN.store(v, Ordering::Relaxed);
 }
@@ -277,11 +284,52 @@ pub const PHOSPHOR: Skin = Skin {
     icon_tint: Some(Color32::from_rgb(0x7f, 0xe0, 0xbd)),
 };
 
+/// Aerospace livery: ice-blue ground, near-black ink, and electric yellow used
+/// the way the reference uses it — as a solid block behind dark text, never as
+/// text itself, because yellow type on pale blue is unreadable. Deep blue does
+/// the interactive work. Hairline rules, square corners, nothing glossy: the
+/// look of an access pass for a race nobody has run yet.
+pub const DELTA: Skin = Skin {
+    panel: Color32::from_rgb(0xdc, 0xed, 0xf2),
+    faint: Color32::from_rgb(0xd0, 0xe4, 0xeb),
+    control: Color32::from_rgb(0xe9, 0xf4, 0xf7),
+    control_border: Color32::from_rgb(0x8f, 0xa9, 0xb4),
+    control_border_hover: Color32::from_rgb(0x14, 0x51, 0xd2),
+    border: Color32::from_rgb(0x9f, 0xb9, 0xc4),
+    border_width: 1.0,
+    border_radius: 0,
+    border_emboss: None,
+    window_border: Color32::from_rgb(0x1c, 0x2b, 0x33),
+    title: Color32::from_rgb(0xf2, 0xe5, 0x34),
+    title_border: Color32::from_rgb(0x1c, 0x2b, 0x33),
+    tab_strip_top: Color32::from_rgb(0xd0, 0xe4, 0xeb),
+    tab_strip_bottom: Color32::from_rgb(0xd0, 0xe4, 0xeb),
+    tab_active_top: Color32::from_rgb(0xf2, 0xe5, 0x34),
+    tab_divider: Color32::from_rgb(0xb4, 0xcb, 0xd4),
+    tab_border: Color32::from_rgb(0x1c, 0x2b, 0x33),
+    accent: Color32::from_rgb(0x14, 0x51, 0xd2),
+    // The yellow block: selection is the one place it belongs, with the ink
+    // reading straight through it.
+    selection: Color32::from_rgb(0xf2, 0xe5, 0x34),
+    progress_top: Color32::from_rgb(0x14, 0x51, 0xd2),
+    progress_bottom: Color32::from_rgb(0x14, 0x51, 0xd2),
+    good: Color32::from_rgb(0x4d, 0x94, 0x1f),
+    warn: Color32::from_rgb(0xa8, 0x76, 0x00),
+    bad: Color32::from_rgb(0xd0, 0x2f, 0x3a),
+    button_radius: 0,
+    button_padding: egui::Vec2::new(14.0, 6.0),
+    tab_radius: 0,
+    control_height: 30.0,
+    gloss: false,
+    icon_tint: Some(Color32::from_rgb(0x1c, 0x2b, 0x33)),
+};
+
 pub fn skin() -> &'static Skin {
     match kind() {
         SkinKind::Haiku => &HAIKU,
         SkinKind::Modern => &MODERN,
         SkinKind::Phosphor => &PHOSPHOR,
+        SkinKind::Delta => &DELTA,
         SkinKind::EguiDefault => &EGUI_DEFAULT,
     }
 }
@@ -652,7 +700,109 @@ fn apply_phosphor(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Light, style);
 }
 
+fn apply_delta(ctx: &egui::Context) {
+    let s = skin();
+    install_fonts(
+        ctx,
+        (
+            "PlexSans",
+            include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+        ),
+        (
+            "PlexMono",
+            include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+        ),
+        (
+            "PlexSansBold",
+            include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf"),
+        ),
+    );
+    ctx.set_theme(egui::Theme::Light);
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
+    let ink = Color32::from_rgb(0x1c, 0x2b, 0x33);
+    base_style(&mut style, s, ink, 0);
+
+    // Big bold headings over small plain body text, the way the reference sets
+    // a seat number against its labels.
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(19.0, bold_family()),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(12.0, egui::FontFamily::Monospace),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+
+    let v = &mut style.visuals;
+    v.window_fill = s.control;
+    v.window_stroke = Stroke::new(s.border_width, s.border);
+    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
+    // Fields are the palest thing on screen, so entered data reads as ink on
+    // paper rather than as another panel.
+    v.extreme_bg_color = Color32::WHITE;
+    v.faint_bg_color = s.faint;
+    v.selection.bg_fill = s.selection;
+    v.selection.stroke = Stroke::new(1.0, ink);
+    v.hyperlink_color = s.accent;
+    v.warn_fg_color = s.warn;
+    v.error_fg_color = s.bad;
+
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = egui::CornerRadius::ZERO;
+        w.expansion = 0.0;
+        w.fg_stroke = Stroke::new(1.0, ink);
+    }
+    v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
+    v.widgets.inactive.bg_fill = s.control;
+    v.widgets.inactive.weak_bg_fill = s.control;
+    v.widgets.inactive.bg_stroke = Stroke::new(s.border_width, s.control_border);
+    // Hover draws the blue rule; the fill barely moves. The reference marks
+    // things with a line, not with a wash.
+    v.widgets.hovered.bg_fill = Color32::WHITE;
+    v.widgets.hovered.weak_bg_fill = Color32::WHITE;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, s.accent);
+    // Pressed is the yellow block, ink straight through it.
+    v.widgets.active.bg_fill = s.selection;
+    v.widgets.active.weak_bg_fill = s.selection;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, ink);
+    v.widgets.open.bg_fill = Color32::WHITE;
+    v.widgets.open.weak_bg_fill = Color32::WHITE;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, s.accent);
+
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = s.button_padding;
+    style.spacing.interact_size = egui::vec2(38.0, s.control_height);
+    ctx.set_style_of(egui::Theme::Light, style.clone());
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    if kind() == SkinKind::Delta {
+        apply_delta(ctx);
+        return;
+    }
     if kind() == SkinKind::Phosphor {
         apply_phosphor(ctx);
         return;
