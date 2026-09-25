@@ -2,3 +2,6 @@
 
 # Written by `--image-probe`.
 offgrid-image-probe.png
+
+# Reference images dropped in for a look; not part of the app.
+refs/
