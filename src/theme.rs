@@ -11,16 +11,23 @@ pub enum SkinKind {
     #[default]
     Haiku,
     Modern,
+    Phosphor,
     EguiDefault,
 }
 
 impl SkinKind {
-    pub const ALL: [SkinKind; 3] = [SkinKind::Haiku, SkinKind::Modern, SkinKind::EguiDefault];
+    pub const ALL: [SkinKind; 4] = [
+        SkinKind::Haiku,
+        SkinKind::Modern,
+        SkinKind::Phosphor,
+        SkinKind::EguiDefault,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             SkinKind::Haiku => "Haiku",
             SkinKind::Modern => "Modern",
+            SkinKind::Phosphor => "Phosphor",
             SkinKind::EguiDefault => "egui default",
         }
     }
@@ -29,6 +36,7 @@ impl SkinKind {
         match self {
             SkinKind::Haiku => "haiku",
             SkinKind::Modern => "modern",
+            SkinKind::Phosphor => "phosphor",
             SkinKind::EguiDefault => "egui",
         }
     }
@@ -39,6 +47,7 @@ impl SkinKind {
             // "material" is what this skin used to be called; a settings file
             // written before the rename should still open on the same theme.
             "modern" | "material" => SkinKind::Modern,
+            "phosphor" => SkinKind::Phosphor,
             _ => SkinKind::Haiku,
         }
     }
@@ -50,6 +59,7 @@ pub fn kind() -> SkinKind {
     match ACTIVE_SKIN.load(Ordering::Relaxed) {
         1 => SkinKind::EguiDefault,
         2 => SkinKind::Modern,
+        3 => SkinKind::Phosphor,
         _ => SkinKind::Haiku,
     }
 }
@@ -59,6 +69,7 @@ pub fn set_kind(kind: SkinKind) {
         SkinKind::Haiku => 0,
         SkinKind::EguiDefault => 1,
         SkinKind::Modern => 2,
+        SkinKind::Phosphor => 3,
     };
     ACTIVE_SKIN.store(v, Ordering::Relaxed);
 }
@@ -112,6 +123,10 @@ pub struct Skin {
     pub control_height: f32,
     /// Gradient sheen on buttons and tabs (Haiku's 3D look).
     pub gloss: bool,
+    /// Recolour the icon set. The artwork is mid-grey line work drawn for light
+    /// panels; on a dark skin it reads as grey smudges unless it is tinted to
+    /// the skin's own light.
+    pub icon_tint: Option<Color32>,
 }
 
 pub const HAIKU: Skin = Skin {
@@ -146,6 +161,7 @@ pub const HAIKU: Skin = Skin {
     tab_radius: 3,
     control_height: 30.0,
     gloss: true,
+    icon_tint: None,
 };
 
 /// Skin values matching egui's stock light theme, so the custom widgets
@@ -180,6 +196,7 @@ pub const EGUI_DEFAULT: Skin = Skin {
     tab_radius: 4,
     control_height: 26.0,
     gloss: false,
+    icon_tint: None,
 };
 
 /// The light theme from the `transcribe` app: an indigo accent on a cool grey
@@ -216,12 +233,55 @@ pub const MODERN: Skin = Skin {
     tab_radius: 12,
     control_height: 32.0,
     gloss: false,
+    icon_tint: None,
+};
+
+/// A green-screen terminal: phosphor text on near-black, hard-edged boxes drawn
+/// in a single hairline, everything monospaced and nothing rounded. The cue is
+/// the silo computers in the television series of that name — amber for the
+/// field you are working in, cyan-green for everything else — though the look
+/// is really that of any VT-era terminal photographed through a CRT.
+pub const PHOSPHOR: Skin = Skin {
+    panel: Color32::from_rgb(0x03, 0x0c, 0x09),
+    faint: Color32::from_rgb(0x06, 0x14, 0x10),
+    control: Color32::from_rgb(0x08, 0x1c, 0x16),
+    control_border: Color32::from_rgb(0x1d, 0x6b, 0x57),
+    control_border_hover: Color32::from_rgb(0x5a, 0xe0, 0xb4),
+    border: Color32::from_rgb(0x17, 0x53, 0x44),
+    border_width: 1.0,
+    // Nothing on a terminal has a rounded corner.
+    border_radius: 0,
+    border_emboss: None,
+    window_border: Color32::from_rgb(0x1d, 0x6b, 0x57),
+    title: Color32::from_rgb(0x08, 0x1c, 0x16),
+    title_border: Color32::from_rgb(0x1d, 0x6b, 0x57),
+    tab_strip_top: Color32::from_rgb(0x05, 0x12, 0x0e),
+    tab_strip_bottom: Color32::from_rgb(0x05, 0x12, 0x0e),
+    // The selected tab reads like the inverted header bars on those screens.
+    tab_active_top: Color32::from_rgb(0x0e, 0x33, 0x29),
+    tab_divider: Color32::from_rgb(0x12, 0x3d, 0x32),
+    tab_border: Color32::from_rgb(0x1d, 0x6b, 0x57),
+    // Amber: the field with focus, the row being edited, the warning.
+    accent: Color32::from_rgb(0xc8, 0xcf, 0x6a),
+    selection: Color32::from_rgb(0x1e, 0x5c, 0x4c),
+    progress_top: Color32::from_rgb(0x5a, 0xe0, 0xb4),
+    progress_bottom: Color32::from_rgb(0x5a, 0xe0, 0xb4),
+    good: Color32::from_rgb(0x5a, 0xe0, 0xb4),
+    warn: Color32::from_rgb(0xc8, 0xcf, 0x6a),
+    bad: Color32::from_rgb(0xe8, 0x6a, 0x5c),
+    button_radius: 0,
+    button_padding: egui::Vec2::new(12.0, 6.0),
+    tab_radius: 0,
+    control_height: 28.0,
+    gloss: false,
+    icon_tint: Some(Color32::from_rgb(0x7f, 0xe0, 0xbd)),
 };
 
 pub fn skin() -> &'static Skin {
     match kind() {
         SkinKind::Haiku => &HAIKU,
         SkinKind::Modern => &MODERN,
+        SkinKind::Phosphor => &PHOSPHOR,
         SkinKind::EguiDefault => &EGUI_DEFAULT,
     }
 }
@@ -511,7 +571,92 @@ fn apply_modern(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
+fn apply_phosphor(ctx: &egui::Context) {
+    let s = skin();
+    // Monospace for everything, not only code: on these screens the prose is
+    // the same face as the data, which is half of why they read as terminals.
+    install_fonts(
+        ctx,
+        (
+            "PlexMono",
+            include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+        ),
+        (
+            "PlexMonoBody",
+            include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf"),
+        ),
+        (
+            "PlexSansBold",
+            include_bytes!("../assets/fonts/IBMPlexSans-Bold.ttf"),
+        ),
+    );
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    let text = Color32::from_rgb(0x7f, 0xe0, 0xbd);
+    base_style(&mut style, s, text, 0);
+
+    let v = &mut style.visuals;
+    // base_style starts from the light visuals; this skin is the dark one.
+    v.dark_mode = true;
+    v.window_fill = s.panel;
+    v.window_stroke = Stroke::new(s.border_width, s.border);
+    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
+    // Input fields are darker than the panel, not lighter: the glass is black
+    // and the phosphor is the only thing emitting.
+    v.extreme_bg_color = Color32::from_rgb(0x02, 0x08, 0x06);
+    v.faint_bg_color = s.faint;
+    v.selection.bg_fill = s.selection;
+    v.selection.stroke = Stroke::new(1.0, s.accent);
+    v.hyperlink_color = s.accent;
+    v.warn_fg_color = s.warn;
+    v.error_fg_color = s.bad;
+
+    // Every control is a hairline rectangle. Hover brightens the line rather
+    // than filling it, which is what a vector display can do and a painted
+    // button cannot.
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = egui::CornerRadius::ZERO;
+        w.expansion = 0.0;
+        w.fg_stroke = Stroke::new(1.0, text);
+    }
+    v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
+    v.widgets.inactive.bg_fill = s.control;
+    v.widgets.inactive.weak_bg_fill = s.control;
+    v.widgets.inactive.bg_stroke = Stroke::new(s.border_width, s.control_border);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x0e, 0x33, 0x29);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x0e, 0x33, 0x29);
+    v.widgets.hovered.bg_stroke = Stroke::new(s.border_width, s.control_border_hover);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xa8, 0xff, 0xe0));
+    // The control being used goes amber, like the active field on those
+    // screens, and its text goes dark against it.
+    v.widgets.active.bg_fill = s.accent;
+    v.widgets.active.weak_bg_fill = s.accent;
+    v.widgets.active.bg_stroke = Stroke::new(s.border_width, s.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, s.panel);
+    v.widgets.open.bg_fill = Color32::from_rgb(0x0e, 0x33, 0x29);
+    v.widgets.open.weak_bg_fill = Color32::from_rgb(0x0e, 0x33, 0x29);
+    v.widgets.open.bg_stroke = Stroke::new(s.border_width, s.control_border_hover);
+
+    // Tight, even spacing: a terminal fills its screen.
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = s.button_padding;
+    style.spacing.interact_size = egui::vec2(36.0, s.control_height);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    if kind() == SkinKind::Phosphor {
+        apply_phosphor(ctx);
+        return;
+    }
     if kind() == SkinKind::Modern {
         apply_modern(ctx);
         return;
@@ -673,10 +818,7 @@ pub fn tab_bar<T: Copy + PartialEq>(
             egui::pos2(r.min.x + pad + icon_s / 2.0, r.center().y),
             egui::vec2(icon_s, icon_s),
         );
-        ui.put(
-            icon_rect,
-            egui::Image::new(items[i].1.clone()).fit_to_exact_size(egui::vec2(icon_s, icon_s)),
-        );
+        ui.put(icon_rect, icon_image(items[i].1.clone(), icon_s));
         ui.painter().galley(
             egui::pos2(
                 r.min.x + pad + icon_s + gap,
@@ -750,7 +892,7 @@ pub fn group<R>(
 ) -> R {
     ui.horizontal(|ui| {
         if let Some(icon) = icon {
-            ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 18.0)));
+            ui.add(icon_image(icon, 18.0));
         }
         ui.label(bold(title));
     });
@@ -784,7 +926,16 @@ pub fn group<R>(
 }
 
 pub fn icon(ui: &mut egui::Ui, source: egui::ImageSource<'static>, size: f32) {
-    ui.add(egui::Image::new(source).fit_to_exact_size(egui::vec2(size, size)));
+    ui.add(icon_image(source, size));
+}
+
+/// An icon at `size`, tinted if the skin asks for it.
+fn icon_image(source: egui::ImageSource<'static>, size: f32) -> egui::Image<'static> {
+    let image = egui::Image::new(source).fit_to_exact_size(egui::vec2(size, size));
+    match skin().icon_tint {
+        Some(tint) => image.tint(tint),
+        None => image,
+    }
 }
 
 /// Like `egui::Spinner`, but asks for the next repaint on a fixed cadence
@@ -938,10 +1089,7 @@ pub fn button(
     label: &str,
 ) -> egui::Response {
     let resp = match icon {
-        Some((src, size)) => ui.add(egui::Button::image_and_text(
-            egui::Image::new(src).fit_to_exact_size(egui::vec2(size, size)),
-            label,
-        )),
+        Some((src, size)) => ui.add(egui::Button::image_and_text(icon_image(src, size), label)),
         None => ui.add(egui::Button::new(label)),
     };
     gloss(ui, resp.rect);
