@@ -315,6 +315,21 @@ fn image_probe(prompt: &str) {
         })
         .unwrap();
 
+    // IMAGE_STOP_AFTER=<seconds> sets the same flag the Stop button sets, which
+    // is the only way to exercise cancellation without a UI: `generate_image`
+    // blocks for the whole run, so the flag has to arrive from elsewhere.
+    if let Some(after) = std::env::var("IMAGE_STOP_AFTER")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        let stop = handle.stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(after));
+            println!("--- asking it to stop ---");
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     let start = std::time::Instant::now();
     let mut first_step: Option<std::time::Instant> = None;
     let mut previews = 0usize;

@@ -42,6 +42,7 @@ mod ffi {
             offload_to_cpu: c_int,
         ) -> *mut c_void;
         pub fn offgrid_sd_free(ctx: *mut c_void);
+        pub fn offgrid_sd_cancel(ctx: *mut c_void, reset: c_int);
         pub fn offgrid_sd_generate(
             ctx: *mut c_void,
             prompt: *const c_char,
@@ -534,6 +535,11 @@ struct Callbacks {
     /// decoding through the same progress callback as sampling, so the only
     /// way to tell them apart is that their totals are not ours.
     steps: usize,
+    /// The running context and the flag the UI sets: `generate_image` blocks
+    /// for the whole run, so a stop can only be noticed from inside a
+    /// callback, which is where it is turned into sd.cpp's own cancellation.
+    ctx: *mut c_void,
+    stop: *const AtomicBool,
 }
 
 extern "C" fn on_progress(step: c_int, steps: c_int, data: *mut c_void) {
@@ -543,6 +549,13 @@ extern "C" fn on_progress(step: c_int, steps: c_int, data: *mut c_void) {
     // Safety: `data` is the &Callbacks handed to sd.cpp for this generation,
     // and sd.cpp calls back synchronously from inside `generate`.
     let cb = unsafe { &*(data as *const Callbacks) };
+    // Safety: `stop` outlives the generation this callback belongs to.
+    if unsafe { &*cb.stop }.load(Ordering::Relaxed) {
+        // Checked once a step, so a stop lands within a step rather than at
+        // once — which on these models is the difference between ten seconds
+        // and a minute of waiting, but far better than the whole run.
+        unsafe { ffi::offgrid_sd_cancel(cb.ctx, 0) };
+    }
     let total = steps.max(0) as usize;
     if total != cb.steps {
         return; // loading tensors or decoding, not sampling
@@ -672,7 +685,7 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                     .and_then(|spec| {
                         fetch_weights(spec, &tx, &stop)?;
                         let ctx = load(&mut loaded, model, spec, offload, &tx)?;
-                        generate(ctx, spec, &prompt, steps, seed, width, height, &tx)
+                        generate(ctx, spec, &prompt, steps, seed, width, height, &stop, &tx)
                     });
                 if let Err(e) = result {
                     let _ = tx.send(ImageEvent::Error(e));
@@ -788,6 +801,7 @@ fn generate(
     seed: u64,
     width: usize,
     height: usize,
+    stop: &AtomicBool,
     tx: &Sender<ImageEvent>,
 ) -> Result<(), String> {
     // A size the UNet cannot halve three times over produces garbage rather
@@ -798,9 +812,14 @@ fn generate(
         CString::new(prompt).map_err(|_| "the prompt contains a nul byte".to_string())?;
     let negative = CString::new("").unwrap();
 
+    // A cancellation from a previous run would otherwise stop this one before
+    // it starts.
+    unsafe { ffi::offgrid_sd_cancel(model.0, 1) };
     let callbacks = Callbacks {
         tx: tx.clone(),
         steps,
+        ctx: model.0,
+        stop,
     };
     let data = &callbacks as *const Callbacks as *mut c_void;
     let (preview_mode, preview_interval) = spec.preview;
@@ -837,6 +856,10 @@ fn generate(
         ffi::offgrid_sd_set_preview(None, 0, 0, std::ptr::null_mut());
     }
 
+    // A stop is not a failure: sd.cpp returns the same false for both.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     if ok == 0 || pixels.is_null() {
         return Err(match take_complaint() {
             Some(why) => format!("generation failed: {why}"),

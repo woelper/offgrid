@@ -112,6 +112,13 @@ void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
     return (void *)new_sd_ctx(&params);
 }
 
+void offgrid_sd_cancel(void *ctx, int reset) {
+    if (ctx) {
+        sd_cancel_generation((sd_ctx_t *)ctx,
+                             reset ? SD_CANCEL_RESET : SD_CANCEL_ALL);
+    }
+}
+
 void offgrid_sd_free(void *ctx) {
     if (ctx) {
         free_sd_ctx((sd_ctx_t *)ctx);

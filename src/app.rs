@@ -984,11 +984,19 @@ impl OffgridApp {
                         {
                             self.start_image();
                         }
-                        if self.images.busy
-                            && theme::button(ui, None, "Stop").clicked()
-                            && let Some(worker) = &self.images.worker
-                        {
-                            worker.stop.store(true, Ordering::Relaxed);
+                        if self.images.busy {
+                            let stopping = self
+                                .images
+                                .worker
+                                .as_ref()
+                                .is_some_and(|w| w.stop.load(Ordering::Relaxed));
+                            if stopping {
+                                ui.weak("stopping after this step…");
+                            } else if theme::button(ui, None, "Stop").clicked()
+                                && let Some(worker) = &self.images.worker
+                            {
+                                worker.stop.store(true, Ordering::Relaxed);
+                            }
                         }
                         if let Some(took) = self.images.took {
                             ui.weak(format!("last image: {took:.1}s"));

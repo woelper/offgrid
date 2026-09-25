@@ -35,6 +35,12 @@ void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
                      int flash_attn, int offload_to_cpu);
 void offgrid_sd_free(void *ctx);
 
+/* Ask a running generation to stop, or clear a stale request before starting
+ * one (reset != 0). sd.cpp only sets a flag, which it checks between steps, so
+ * this is safe to call from a callback or another thread — and a stop takes
+ * effect at the end of the step it lands in, not immediately. */
+void offgrid_sd_cancel(void *ctx, int reset);
+
 /* Generate one image. On success returns 1 and fills *out_pixels with a buffer
  * owned by the caller (release it with offgrid_sd_free_buf), plus its size and
  * channel count — 3 for RGB, 4 where the model produces alpha. */
