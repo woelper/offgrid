@@ -112,6 +112,16 @@ pub struct ImageModel {
     /// sd.cpp's sample_method_t, or -1 for the library's default. Qwen-Image
     /// is trained for euler and gives noise under the default sampler.
     pub sampler: i32,
+    /// The smallest edge this model still behaves at. Diffusion models are
+    /// trained at a resolution and drift off-distribution below it: SD 1.5 was
+    /// trained at 512 and copes at 384, while the newer ones are trained
+    /// around 1024 and answer a small canvas with a lattice of unresolved
+    /// patches rather than a picture.
+    pub min_size: usize,
+    /// Whether the model can be asked for a transparent background. Only
+    /// Qwen-Image 2.1 can, and it is asked in the prompt rather than through a
+    /// switch — see `transparent_prompt`.
+    pub transparency: bool,
     /// Whether the cheap latent preview works for this model. sd.cpp's
     /// projection preview only knows certain latent spaces, and asking for one
     /// it cannot do ("No latent to RGB projection known for this model") fails
@@ -161,8 +171,10 @@ pub const MODELS: &[ImageModel] = &[
         }],
         steps: 10,
         cfg: 7.5,
+        min_size: 384,
         flash_attn: false,
         sampler: SAMPLER_DEFAULT,
+        transparency: false,
         preview: true,
     },
     ImageModel {
@@ -193,8 +205,10 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
+        transparency: false,
         preview: true,
     },
     ImageModel {
@@ -223,8 +237,10 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
+        transparency: false,
         preview: true,
     },
     ImageModel {
@@ -260,8 +276,10 @@ pub const MODELS: &[ImageModel] = &[
         // have not been judged here, only the plumbing.
         steps: 20,
         cfg: 6.0,
+        min_size: 768,
         flash_attn: true,
         sampler: SAMPLER_EULER,
+        transparency: true,
         // No projection for a 64-dimensional latent, so the tab shows the
         // step count and nothing else until the image lands.
         preview: false,
@@ -292,13 +310,30 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 20,
         cfg: 6.0,
+        min_size: 768,
         flash_attn: true,
         sampler: SAMPLER_EULER,
+        transparency: true,
         // No projection for a 64-dimensional latent, so the tab shows the
         // step count and nothing else until the image lands.
         preview: false,
     },
 ];
+
+/// Ask for a transparent background, in the form Qwen-Image 2.1 expects.
+///
+/// There is no switch for this: the model decides between an opaque image and
+/// an RGBA one from the prompt itself, and this is the wording its authors
+/// recommend. The alpha then arrives as a fourth channel, which is carried
+/// through to the PNG — cutouts for a button or a badge, without keying a
+/// background out by hand.
+pub fn transparent_prompt(prompt: &str) -> String {
+    format!(
+        "This is an RGBA image with transparency. {}. \
+         The image has alpha channel and the background is transparent.",
+        prompt.trim().trim_end_matches('.')
+    )
+}
 
 /// Leave the sampler to sd.cpp.
 const SAMPLER_DEFAULT: i32 = -1;

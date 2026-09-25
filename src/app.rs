@@ -163,6 +163,8 @@ struct ImagesState {
     worker: Option<imagegen::ImageHandle>,
     /// Index into `imagegen::MODELS`.
     model: usize,
+    /// Ask for a transparent background, where the model can do it.
+    transparent: bool,
     /// Keep weights in RAM rather than filling VRAM. Pointless on a CPU-only
     /// build, and the difference between running and not on a small card.
     offload: bool,
@@ -203,6 +205,7 @@ impl Default for ImagesState {
             // The quick one first: a five-minute wait is a poor introduction,
             // and the picker says what the slower one buys.
             model: 0,
+            transparent: false,
             offload: true,
             prompt: String::new(),
             steps: imagegen::MODELS[0].steps,
@@ -768,7 +771,9 @@ impl OffgridApp {
                         pixels,
                         recipe: imagegen::Recipe {
                             model: spec.name,
-                            prompt: self.images.prompt.clone(),
+                            // What the model was actually given, so the file's
+                            // own metadata reproduces the image.
+                            prompt: self.image_prompt(),
                             steps: self.images.steps,
                             cfg: spec.cfg,
                             seed: self.images.seed,
@@ -853,6 +858,15 @@ impl OffgridApp {
                 "Prompt",
                 Some(theme::icons().appearance.clone()),
                 |ui| {
+                    if imagegen::MODELS[self.images.model].transparency {
+                        ui.checkbox(&mut self.images.transparent, "Transparent background")
+                            .on_hover_text(
+                                "Asks the model for an RGBA image with the background cut \
+                                 out — for a button or a badge. Qwen-Image decides this from \
+                                 the prompt, so this rewords yours; the other models cannot \
+                                 do it at all.",
+                            );
+                    }
                     ui.checkbox(&mut self.images.offload, "Offload weights to RAM")
                         .on_hover_text(
                             "Keeps the weights in RAM and streams them to the GPU as needed, \
@@ -871,6 +885,21 @@ impl OffgridApp {
                         ui.label("Seed:");
                         ui.add(egui::DragValue::new(&mut self.images.seed));
                     });
+                    // Turning steps down is the obvious way to wait less, and
+                    // on a model that is not distilled for it the result is not
+                    // a rougher picture but a broken one — a lattice of
+                    // half-resolved patches. Say so before the wait, not after.
+                    let spec = &imagegen::MODELS[self.images.model];
+                    if self.images.steps < spec.steps {
+                        ui.colored_label(
+                            theme::skin().bad,
+                            format!(
+                                "{} needs {} steps — fewer leaves the image unfinished, \
+                                 not merely rougher",
+                                spec.name, spec.steps
+                            ),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Size:");
                         let (w, h) = self.images.size;
@@ -891,6 +920,13 @@ impl OffgridApp {
                         // the size does — by a lot, measured.
                         let (dw, dh) = imagegen::DEFAULT_SIZE;
                         let ratio = (w * h) as f32 / (dw * dh) as f32;
+                        let min = imagegen::MODELS[self.images.model].min_size;
+                        if w.min(h) < min {
+                            ui.colored_label(
+                                theme::skin().bad,
+                                format!("below {min}px this model loses coherence"),
+                            );
+                        }
                         if ratio > 1.01 {
                             ui.weak(format!(
                                 "{ratio:.1}× the pixels of 512 × 512, and rather more than that in time"
@@ -1097,8 +1133,22 @@ impl OffgridApp {
         }
     }
 
+    /// The prompt as the model will see it: asking for transparency means
+    /// rewording, since Qwen-Image takes that from the prompt and not a flag.
+    #[cfg(feature = "images")]
+    fn image_prompt(&self) -> String {
+        let prompt = self.images.prompt.clone();
+        if self.images.transparent && imagegen::MODELS[self.images.model].transparency {
+            imagegen::transparent_prompt(&prompt)
+        } else {
+            prompt
+        }
+    }
+
     #[cfg(feature = "images")]
     fn start_image(&mut self) {
+        // Built before the worker is borrowed: it reads the rest of self.
+        let prompt = self.image_prompt();
         let worker = self
             .images
             .worker
@@ -1107,7 +1157,7 @@ impl OffgridApp {
         let cmd = imagegen::ImageCmd::Generate {
             model: self.images.model,
             offload: self.images.offload,
-            prompt: self.images.prompt.clone(),
+            prompt,
             steps: self.images.steps,
             seed: self.images.seed,
             width,

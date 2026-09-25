@@ -282,6 +282,16 @@ fn image_probe(prompt: &str) {
             Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
         })
         .unwrap_or(imagegen::DEFAULT_SIZE);
+    // IMAGE_TRANSPARENT=1 asks for a cutout, where the model can do it.
+    let prompt = if std::env::var("IMAGE_TRANSPARENT")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+        && imagegen::MODELS[model].transparency
+    {
+        imagegen::transparent_prompt(prompt)
+    } else {
+        prompt.to_string()
+    };
     println!(
         "model: {}\nprompt: {prompt}\nsteps: {steps}\nsize: {width}x{height}",
         imagegen::MODELS[model].name
@@ -297,7 +307,7 @@ fn image_probe(prompt: &str) {
             offload: std::env::var("IMAGE_OFFLOAD")
                 .map(|v| v != "0")
                 .unwrap_or(true),
-            prompt: prompt.to_string(),
+            prompt: prompt.clone(),
             steps,
             seed: 42,
             width,
@@ -339,7 +349,7 @@ fn image_probe(prompt: &str) {
             } => {
                 let recipe = imagegen::Recipe {
                     model: imagegen::MODELS[model].name,
-                    prompt: prompt.to_string(),
+                    prompt: prompt.clone(),
                     steps,
                     cfg: imagegen::MODELS[model].cfg,
                     seed: 42,
