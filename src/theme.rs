@@ -10,17 +10,17 @@ use eframe::egui::{self, Color32, CornerRadius, Stroke, StrokeKind};
 pub enum SkinKind {
     #[default]
     Haiku,
-    Material,
+    Modern,
     EguiDefault,
 }
 
 impl SkinKind {
-    pub const ALL: [SkinKind; 3] = [SkinKind::Haiku, SkinKind::Material, SkinKind::EguiDefault];
+    pub const ALL: [SkinKind; 3] = [SkinKind::Haiku, SkinKind::Modern, SkinKind::EguiDefault];
 
     pub fn label(self) -> &'static str {
         match self {
             SkinKind::Haiku => "Haiku",
-            SkinKind::Material => "Material",
+            SkinKind::Modern => "Modern",
             SkinKind::EguiDefault => "egui default",
         }
     }
@@ -28,7 +28,7 @@ impl SkinKind {
     pub fn id(self) -> &'static str {
         match self {
             SkinKind::Haiku => "haiku",
-            SkinKind::Material => "material",
+            SkinKind::Modern => "modern",
             SkinKind::EguiDefault => "egui",
         }
     }
@@ -36,7 +36,9 @@ impl SkinKind {
     pub fn from_id(id: &str) -> Self {
         match id {
             "egui" => SkinKind::EguiDefault,
-            "material" => SkinKind::Material,
+            // "material" is what this skin used to be called; a settings file
+            // written before the rename should still open on the same theme.
+            "modern" | "material" => SkinKind::Modern,
             _ => SkinKind::Haiku,
         }
     }
@@ -47,7 +49,7 @@ static ACTIVE_SKIN: AtomicU8 = AtomicU8::new(0);
 pub fn kind() -> SkinKind {
     match ACTIVE_SKIN.load(Ordering::Relaxed) {
         1 => SkinKind::EguiDefault,
-        2 => SkinKind::Material,
+        2 => SkinKind::Modern,
         _ => SkinKind::Haiku,
     }
 }
@@ -56,7 +58,7 @@ pub fn set_kind(kind: SkinKind) {
     let v = match kind {
         SkinKind::Haiku => 0,
         SkinKind::EguiDefault => 1,
-        SkinKind::Material => 2,
+        SkinKind::Modern => 2,
     };
     ACTIVE_SKIN.store(v, Ordering::Relaxed);
 }
@@ -180,36 +182,38 @@ pub const EGUI_DEFAULT: Skin = Skin {
     gloss: false,
 };
 
-/// Clean, flat light theme in the spirit of Material design
-/// (palette borrowed from the `transcribe` app).
-pub const MATERIAL: Skin = Skin {
-    panel: Color32::from_rgb(0xf7, 0xf8, 0xfb),
-    faint: Color32::from_rgb(0xee, 0xf1, 0xf6),
-    control: Color32::from_rgb(0xe9, 0xed, 0xf3),
-    control_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
-    control_border_hover: Color32::from_rgb(0xb0, 0xb8, 0xc4),
-    border: Color32::from_rgb(0xdf, 0xe3, 0xea),
+/// The light theme from the `transcribe` app: an indigo accent on a cool grey
+/// ground, white cards, generously rounded, no borders doing work that space
+/// can do instead.
+pub const MODERN: Skin = Skin {
+    panel: Color32::from_rgb(0xf1, 0xf2, 0xf9),
+    faint: Color32::from_rgb(0xf3, 0xf4, 0xfa),
+    control: Color32::from_rgb(0xec, 0xee, 0xf6),
+    control_border: Color32::from_rgb(0xdd, 0xe0, 0xec),
+    control_border_hover: Color32::from_rgb(0x6c, 0x5c, 0xe7),
+    border: Color32::from_rgb(0xdd, 0xe0, 0xec),
     border_width: 1.0,
-    border_radius: 10,
+    border_radius: 16,
     border_emboss: None,
-    window_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
-    title: Color32::from_rgb(0xe9, 0xed, 0xf3),
-    title_border: Color32::from_rgb(0xdf, 0xe3, 0xea),
-    tab_strip_top: Color32::from_rgb(0xe4, 0xe8, 0xef),
-    tab_strip_bottom: Color32::from_rgb(0xee, 0xf1, 0xf6),
+    window_border: Color32::from_rgb(0xdd, 0xe0, 0xec),
+    title: Color32::WHITE,
+    title_border: Color32::from_rgb(0xdd, 0xe0, 0xec),
+    tab_strip_top: Color32::from_rgb(0xf1, 0xf2, 0xf9),
+    tab_strip_bottom: Color32::from_rgb(0xf1, 0xf2, 0xf9),
     tab_active_top: Color32::WHITE,
-    tab_divider: Color32::from_rgb(0xd5, 0xda, 0xe2),
-    tab_border: Color32::from_rgb(0xd0, 0xd6, 0xde),
-    accent: Color32::from_rgb(0x11, 0x72, 0xdc),
-    selection: Color32::from_rgb(0xc4, 0xe1, 0xfb),
-    progress_top: Color32::from_rgb(0x5a, 0xa2, 0xee),
-    progress_bottom: Color32::from_rgb(0x11, 0x72, 0xdc),
-    good: Color32::from_rgb(0x1e, 0x8e, 0x3e),
-    warn: Color32::from_rgb(0xb2, 0x6a, 0x00),
-    bad: Color32::from_rgb(0xd9, 0x30, 0x25),
-    button_radius: 10,
+    tab_divider: Color32::from_rgb(0xe1, 0xe4, 0xf1),
+    tab_border: Color32::from_rgb(0xdd, 0xe0, 0xec),
+    accent: Color32::from_rgb(0x6c, 0x5c, 0xe7),
+    selection: Color32::from_rgb(0xe9, 0xe6, 0xfb),
+    // Flat, not a gradient: the two ends are the same colour.
+    progress_top: Color32::from_rgb(0x6c, 0x5c, 0xe7),
+    progress_bottom: Color32::from_rgb(0x6c, 0x5c, 0xe7),
+    good: Color32::from_rgb(0x2b, 0xd8, 0x8f),
+    warn: Color32::from_rgb(0xf5, 0xa6, 0x23),
+    bad: Color32::from_rgb(0xef, 0x50, 0x6e),
+    button_radius: 12,
     button_padding: egui::Vec2::new(14.0, 7.0),
-    tab_radius: 8,
+    tab_radius: 12,
     control_height: 32.0,
     gloss: false,
 };
@@ -217,7 +221,7 @@ pub const MATERIAL: Skin = Skin {
 pub fn skin() -> &'static Skin {
     match kind() {
         SkinKind::Haiku => &HAIKU,
-        SkinKind::Material => &MATERIAL,
+        SkinKind::Modern => &MODERN,
         SkinKind::EguiDefault => &EGUI_DEFAULT,
     }
 }
@@ -403,7 +407,7 @@ fn base_style(style: &mut egui::Style, s: &Skin, text: Color32, window_radius: u
     style.spacing.button_padding = s.button_padding;
 }
 
-fn apply_material(ctx: &egui::Context) {
+fn apply_modern(ctx: &egui::Context) {
     let s = skin();
     install_fonts(
         ctx,
@@ -422,36 +426,94 @@ fn apply_material(ctx: &egui::Context) {
     );
     ctx.set_theme(egui::Theme::Light);
     let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
-    let text = Color32::from_rgb(0x30, 0x34, 0x3c);
-    base_style(&mut style, s, text, 12);
+    let text = Color32::from_rgb(0x26, 0x28, 0x3d);
+    base_style(&mut style, s, text, 16);
+
+    // A larger, airier type scale than the other skins: this one leans on
+    // space and weight where Haiku leans on lines and bevels.
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(18.0, bold_family()),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(14.5, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(14.5, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(13.0, egui::FontFamily::Monospace),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(11.5, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+
     let v = &mut style.visuals;
-    // Flat, borderless controls.
+    // Cards: white, well rounded, and lifted off the ground by a shadow
+    // rather than outlined.
+    v.window_fill = Color32::WHITE;
+    v.window_stroke = Stroke::NONE;
+    v.window_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_rgba_premultiplied(5, 5, 8, 16),
+    };
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 28,
+        spread: 0,
+        color: Color32::from_rgba_premultiplied(8, 8, 14, 64),
+    };
+    // Text fields and progress troughs sit a shade off the card.
+    v.extreme_bg_color = s.faint;
+    v.faint_bg_color = s.faint;
+    v.selection.bg_fill = s.selection;
+    v.selection.stroke = Stroke::new(1.0, s.accent);
+    v.hyperlink_color = s.accent;
+
+    // Every button gets the same generous radius and a faint outline; nothing
+    // grows on hover, it only changes shade.
     for w in [
         &mut v.widgets.inactive,
         &mut v.widgets.hovered,
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.bg_stroke = Stroke::NONE;
+        w.corner_radius = egui::CornerRadius::same(s.button_radius);
+        w.bg_stroke = Stroke::new(s.border_width, s.border);
         w.expansion = 0.0;
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(s.border_width, s.border);
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(s.button_radius);
+    // No separators or outlines on things that are not controls: the layout
+    // does that work here.
+    v.widgets.noninteractive.bg_stroke = Stroke::NONE;
     v.widgets.inactive.bg_fill = s.control;
     v.widgets.inactive.weak_bg_fill = s.control;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0xe1, 0xe4, 0xf1);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xe1, 0xe4, 0xf1);
     v.widgets.active.bg_fill = s.selection;
     v.widgets.active.weak_bg_fill = s.selection;
-    v.widgets.open.bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
-    v.widgets.open.weak_bg_fill = Color32::from_rgb(0xdd, 0xe4, 0xee);
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    v.widgets.open.bg_fill = Color32::from_rgb(0xe1, 0xe4, 0xf1);
+    v.widgets.open.weak_bg_fill = Color32::from_rgb(0xe1, 0xe4, 0xf1);
+
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.button_padding = s.button_padding;
+    style.spacing.interact_size = egui::vec2(40.0, s.control_height);
     ctx.set_style_of(egui::Theme::Light, style.clone());
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
 pub fn apply(ctx: &egui::Context) {
-    if kind() == SkinKind::Material {
-        apply_material(ctx);
+    if kind() == SkinKind::Modern {
+        apply_modern(ctx);
         return;
     }
     if kind() == SkinKind::EguiDefault {
