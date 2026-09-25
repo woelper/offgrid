@@ -157,17 +157,30 @@ fn color_image(width: usize, height: usize, channels: usize, pixels: &[u8]) -> e
     }
 }
 
-/// A generated image is a picture, not a widget: it sits centred with a little
-/// shadow under it, so it reads as something produced rather than as part of
-/// the panel it happens to be in.
+/// Centre something `width` wide, optionally in a frame with a shadow under it.
+///
+/// The centring is a measured gap rather than `vertical_centered`, because a
+/// frame in a vertical layout stretches to the whole width it is offered, and
+/// its shadow then reads as a band across the tab rather than a shadow beneath
+/// the picture. A horizontal layout sizes to its content, so the frame comes
+/// out the size of the image.
 #[cfg(feature = "images")]
-fn image_frame() -> egui::Frame {
-    egui::Frame::NONE.shadow(egui::epaint::Shadow {
-        offset: [0, 4],
-        blur: 12,
-        spread: 0,
-        color: egui::Color32::from_black_alpha(60),
-    })
+fn centered(ui: &mut egui::Ui, width: f32, shadow: bool, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - width) * 0.5).max(0.0));
+        if shadow {
+            egui::Frame::NONE
+                .shadow(egui::epaint::Shadow {
+                    offset: [0, 4],
+                    blur: 12,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(60),
+                })
+                .show(ui, add);
+        } else {
+            add(ui);
+        }
+    });
 }
 
 /// How many generations a session keeps before the oldest falls off.
@@ -1053,13 +1066,12 @@ impl OffgridApp {
                         // Drawn at the size the finished image will be, so the
                         // tab does not jump when the real one arrives.
                         let (w, h) = self.images.size;
-                        ui.vertical_centered(|ui| {
-                            image_frame().show(ui, |ui| {
-                                ui.add(
-                                    egui::Image::new((texture.id(), texture.size_vec2()))
-                                        .fit_to_exact_size(egui::vec2(w as f32, h as f32)),
-                                );
-                            });
+                        let (id, size) = (texture.id(), texture.size_vec2());
+                        centered(ui, w as f32, true, |ui| {
+                            ui.add(
+                                egui::Image::new((id, size))
+                                    .fit_to_exact_size(egui::vec2(w as f32, h as f32)),
+                            );
                         });
                     }
                 });
@@ -1083,11 +1095,12 @@ impl OffgridApp {
                     }
                     if let Some(texture) = &entry.texture {
                         let (id, size) = (texture.id(), texture.size_vec2());
-                        ui.vertical_centered(|ui| {
-                            image_frame().show(ui, |ui| ui.image((id, size)));
+                        centered(ui, size.x, true, |ui| {
+                            ui.image((id, size));
                         });
                     }
-                    ui.vertical_centered(|ui| {
+                    let width = self.images.history[shown].width as f32;
+                    centered(ui, width, false, |ui| {
                         ui.horizontal(|ui| {
                             if theme::button(
                                 ui,
