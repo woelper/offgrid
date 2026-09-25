@@ -57,12 +57,13 @@ static void preview_trampoline(int step, int frame_count, sd_image_t *frames,
         return;
     }
     sd_image_t *frame = &frames[0];
-    /* Previews arrive as RGB; anything else we let pass rather than guess. */
-    if (frame->channel != 3 || frame->data == NULL) {
+    /* A VAE-decoded preview of a model that makes alpha has four channels,
+     * like its finished image; the projection kind has three. */
+    if (frame->data == NULL || (frame->channel != 3 && frame->channel != 4)) {
         return;
     }
-    g_preview_cb((int)frame->width, (int)frame->height, frame->data,
-                 g_preview_data);
+    g_preview_cb((int)frame->width, (int)frame->height, (int)frame->channel,
+                 frame->data, g_preview_data);
 }
 
 void offgrid_sd_set_progress(offgrid_sd_progress_cb cb, void *data) {
@@ -71,15 +72,17 @@ void offgrid_sd_set_progress(offgrid_sd_progress_cb cb, void *data) {
     sd_set_progress_callback(cb ? progress_trampoline : NULL, NULL);
 }
 
-void offgrid_sd_set_preview(offgrid_sd_preview_cb cb, int interval,
+void offgrid_sd_set_preview(offgrid_sd_preview_cb cb, int mode, int interval,
                             void *data) {
     g_preview_cb = cb;
     g_preview_data = data;
-    /* PREVIEW_PROJ is the linear approximation of the latents: no VAE, so it
-     * costs almost nothing next to a denoiser step. denoised=true, noisy=false
-     * keeps the picture from flickering with the sampler's noise. */
-    sd_set_preview_callback(cb ? preview_trampoline : NULL, PREVIEW_PROJ,
-                            interval, true, false, NULL);
+    if (mode < 0 || mode >= PREVIEW_COUNT) {
+        mode = PREVIEW_NONE;
+    }
+    /* denoised=true, noisy=false keeps the picture from flickering with the
+     * sampler's noise. */
+    sd_set_preview_callback(cb ? preview_trampoline : NULL,
+                            (enum preview_t)mode, interval, true, false, NULL);
 }
 
 /* Treat an empty string as absent: it is easier to pass "" from Rust than to

@@ -237,18 +237,23 @@ pinned, because sd.cpp adds models weekly and the model list here is tuned to
 what one revision does.
 
 The Images tab lists models the way the Models tab lists LLMs — pick one, see
-its size, download it when you choose:
+its size, download it when you choose. The same prompt, "a dog jumping over a
+fence", through each of them:
 
-| model | what it is |
-|---|---|
-| Stable Diffusion 1.5 | 2022, and it shows, but much the quickest and smallest |
-| Z-Image-Turbo | 2025, far better pictures, several times slower |
-| Qwen-Image 2.1 | 2026, the newest, and an order of magnitude slower on a CPU |
+| Stable Diffusion 1.5 | Z-Image-Turbo | Qwen-Image 2.1 |
+|---|---|---|
+| ![SD 1.5](assets/dog-stable-diffusion.png) | ![Z-Image-Turbo](assets/dog-z-image.png) | ![Qwen-Image 2.1](assets/dog-qwen2.1.png) |
+| 2022, and it shows, but much the quickest and smallest | 2025, far better pictures, several times slower | 2026, the newest, and an order of magnitude slower on a CPU |
 
-Each is listed at a couple of quantisations. Quants of one model share their
-VAE and text encoder, so moving between them only fetches the part that
-differs. Z-Image's text encoder is a Qwen3 4B — the same model the chat
-catalog offers.
+Three years of models, in the order you would guess. Each is listed at a couple
+of quantisations; quants of one model share their VAE and text encoder, so
+moving between them only fetches the part that differs. Z-Image's text encoder
+is a Qwen3 4B — the same model the chat catalog offers.
+
+Saved images carry their own recipe: the prompt, steps, CFG, seed, size and
+model go into the PNG as text chunks, in the form the diffusion tools have
+settled on, so a picture filed away still says what made it. (The three above
+do.)
 
 On a CPU this is minutes an image, not seconds; the tab shows measured seconds
 per step and what is left. A GPU build is where these models belong, and

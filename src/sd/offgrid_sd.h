@@ -17,9 +17,10 @@ extern "C" {
 
 /* step is 1-based; steps is the total for this sampling pass. */
 typedef void (*offgrid_sd_progress_cb)(int step, int steps, void *data);
-/* RGB rows, tightly packed. Borrowed for the duration of the call. */
-typedef void (*offgrid_sd_preview_cb)(int width, int height,
-                                      const unsigned char *rgb, void *data);
+/* Tightly packed rows, 3 or 4 channels. Borrowed for the duration of the
+ * call. */
+typedef void (*offgrid_sd_preview_cb)(int width, int height, int channels,
+                                      const unsigned char *pixels, void *data);
 
 /* Load a model. Either model_path names a single checkpoint (SD 1.5), or the
  * three split paths do (Z-Image and the other recent models ship the diffusion
@@ -54,9 +55,12 @@ void offgrid_sd_set_log(offgrid_sd_log_cb cb, void *data);
 /* Callbacks are global in sd.cpp, and so are these. `data` is passed back
  * untouched. Pass NULL to clear. */
 void offgrid_sd_set_progress(offgrid_sd_progress_cb cb, void *data);
-/* interval is in denoiser steps; previews are decoded with the cheap
- * projection, not the VAE. */
-void offgrid_sd_set_preview(offgrid_sd_preview_cb cb, int interval, void *data);
+/* mode is sd.cpp's preview_t: 1 is the cheap linear projection of the latents,
+ * 3 decodes them through the model's own VAE — far better and far more
+ * expensive, and the only option for models whose latent space has no known
+ * projection. interval is in denoiser steps. */
+void offgrid_sd_set_preview(offgrid_sd_preview_cb cb, int mode, int interval,
+                            void *data);
 
 #ifdef __cplusplus
 }

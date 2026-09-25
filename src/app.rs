@@ -140,14 +140,20 @@ struct Generated {
 
 #[cfg(feature = "images")]
 impl Generated {
-    /// egui wants its own image type, and the channel count decides which.
     fn color_image(&self) -> egui::ColorImage {
-        let size = [self.width, self.height];
-        if self.channels == 4 {
-            egui::ColorImage::from_rgba_unmultiplied(size, &self.pixels)
-        } else {
-            egui::ColorImage::from_rgb(size, &self.pixels)
-        }
+        color_image(self.width, self.height, self.channels, &self.pixels)
+    }
+}
+
+/// egui wants its own image type, and the channel count decides which — models
+/// that make alpha return four channels for previews as well as results.
+#[cfg(feature = "images")]
+fn color_image(width: usize, height: usize, channels: usize, pixels: &[u8]) -> egui::ColorImage {
+    let size = [width, height];
+    if channels == 4 {
+        egui::ColorImage::from_rgba_unmultiplied(size, pixels)
+    } else {
+        egui::ColorImage::from_rgb(size, pixels)
     }
 }
 
@@ -188,8 +194,8 @@ struct ImagesState {
     history: Vec<Generated>,
     /// Which of them the result panel is showing; the newest by default.
     shown: Option<usize>,
-    /// Latent preview: tiny, blurry, and updated every step.
-    preview: Option<(usize, usize, Vec<u8>)>,
+    /// The image as it forms: width, height, channels, pixels.
+    preview: Option<(usize, usize, usize, Vec<u8>)>,
     preview_texture: Option<egui::TextureHandle>,
     /// When the first step landed. Loading the model dominates the first
     /// minute, so steps have to be timed from their own start for an estimate
@@ -750,8 +756,13 @@ impl OffgridApp {
                     self.images.progress = Some((done, total));
                     self.images.note.clear();
                 }
-                Ok(imagegen::ImageEvent::Preview { width, height, rgb }) => {
-                    self.images.preview = Some((width, height, rgb));
+                Ok(imagegen::ImageEvent::Preview {
+                    width,
+                    height,
+                    channels,
+                    pixels,
+                }) => {
+                    self.images.preview = Some((width, height, channels, pixels));
                     self.images.preview_texture = None;
                 }
                 Ok(imagegen::ImageEvent::Image {
@@ -1012,9 +1023,9 @@ impl OffgridApp {
                     }
                     // The latents on their way to being an image: an eighth of
                     // the resolution and blurry, but it moves every step.
-                    if let Some((width, height, rgb)) = self.images.preview.clone() {
+                    if let Some((width, height, channels, pixels)) = self.images.preview.clone() {
                         let texture = self.images.preview_texture.get_or_insert_with(|| {
-                            let image = egui::ColorImage::from_rgb([width, height], &rgb);
+                            let image = color_image(width, height, channels, &pixels);
                             ui.ctx()
                                 .load_texture("preview", image, egui::TextureOptions::LINEAR)
                         });

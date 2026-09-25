@@ -317,6 +317,7 @@ fn image_probe(prompt: &str) {
 
     let start = std::time::Instant::now();
     let mut first_step: Option<std::time::Instant> = None;
+    let mut previews = 0usize;
     for event in handle.event_rx {
         match event {
             imagegen::ImageEvent::Note(note) => {
@@ -365,13 +366,29 @@ fn image_probe(prompt: &str) {
                     Err(e) => eprintln!("{e}"),
                 }
             }
-            // Previews are for the UI; headless, the step line is enough.
-            imagegen::ImageEvent::Preview { .. } => {}
+            // Nothing to show headless, but worth reporting: whether previews
+            // arrive at all is a per-model question, and a silent probe cannot
+            // answer it.
+            imagegen::ImageEvent::Preview {
+                width,
+                height,
+                channels,
+                ..
+            } => {
+                previews += 1;
+                println!(
+                    "[{:.1}s] preview {width}x{height}, {channels} channels",
+                    start.elapsed().as_secs_f32()
+                );
+            }
             imagegen::ImageEvent::Error(e) => eprintln!("error: {e}"),
             imagegen::ImageEvent::Done => break,
         }
     }
-    println!("total: {:.1}s", start.elapsed().as_secs_f32());
+    println!(
+        "total: {:.1}s, {previews} preview(s)",
+        start.elapsed().as_secs_f32()
+    );
 }
 
 fn smoke(agent_mode: bool) {

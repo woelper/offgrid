@@ -23,8 +23,13 @@ mod ffi {
 
     pub type LogCb = extern "C" fn(level: c_int, text: *const c_char, data: *mut c_void);
     pub type ProgressCb = extern "C" fn(step: c_int, steps: c_int, data: *mut c_void);
-    pub type PreviewCb =
-        extern "C" fn(width: c_int, height: c_int, rgb: *const c_uchar, data: *mut c_void);
+    pub type PreviewCb = extern "C" fn(
+        width: c_int,
+        height: c_int,
+        channels: c_int,
+        pixels: *const c_uchar,
+        data: *mut c_void,
+    );
 
     unsafe extern "C" {
         pub fn offgrid_sd_new(
@@ -55,7 +60,12 @@ mod ffi {
         pub fn offgrid_sd_free_buf(buf: *mut c_uchar);
         pub fn offgrid_sd_set_log(cb: Option<LogCb>, data: *mut c_void);
         pub fn offgrid_sd_set_progress(cb: Option<ProgressCb>, data: *mut c_void);
-        pub fn offgrid_sd_set_preview(cb: Option<PreviewCb>, interval: c_int, data: *mut c_void);
+        pub fn offgrid_sd_set_preview(
+            cb: Option<PreviewCb>,
+            mode: c_int,
+            interval: c_int,
+            data: *mut c_void,
+        );
     }
 }
 
@@ -81,9 +91,9 @@ pub fn size_label(spec: &ImageModel, width: usize, height: usize) -> String {
 /// The size the estimates compare against.
 pub const DEFAULT_SIZE: (usize, usize) = (512, 512);
 
-/// Preview after every denoiser step: sd.cpp's projection preview skips the
-/// VAE, so it costs almost nothing next to a step.
-const PREVIEW_INTERVAL: i32 = 1;
+/// `PREVIEW_NONE`, `PREVIEW_PROJ` and `PREVIEW_VAE` from sd.cpp's preview_t.
+const PREVIEW_PROJECTION: i32 = 1;
+const PREVIEW_VAE: i32 = 3;
 
 /// One weight file of an image model, and where it comes from.
 pub struct WeightFile {
@@ -134,12 +144,15 @@ pub struct ImageModel {
     /// Qwen-Image 2.1 can, and it is asked in the prompt rather than through a
     /// switch — see `transparent_prompt`.
     pub transparency: bool,
-    /// Whether the cheap latent preview works for this model. sd.cpp's
-    /// projection preview only knows certain latent spaces, and asking for one
-    /// it cannot do ("No latent to RGB projection known for this model") fails
-    /// the whole generation rather than skipping the preview. Qwen-Image 2.1's
-    /// latents are 64-dimensional and have no projection.
-    pub preview: bool,
+    /// How to show the image forming, and how often. sd.cpp's cheap preview
+    /// projects the latents through a small matrix, but it only knows certain
+    /// latent spaces — asking for one it cannot do ("No latent to RGB
+    /// projection known for this model") fails the whole generation rather
+    /// than skipping the preview, which is what Qwen-Image 2.1's
+    /// 64-dimensional latents do. Those decode through the model's own VAE
+    /// instead: a real picture rather than an impression, at the price of a
+    /// decode, so it runs every few steps rather than every one.
+    pub preview: (i32, i32),
 }
 
 impl ImageModel {
@@ -188,7 +201,7 @@ pub const MODELS: &[ImageModel] = &[
         flash_attn: false,
         sampler: SAMPLER_DEFAULT,
         transparency: false,
-        preview: true,
+        preview: (PREVIEW_PROJECTION, 1),
     },
     ImageModel {
         name: "Z-Image-Turbo",
@@ -223,7 +236,7 @@ pub const MODELS: &[ImageModel] = &[
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
         transparency: false,
-        preview: true,
+        preview: (PREVIEW_PROJECTION, 1),
     },
     ImageModel {
         name: "Z-Image-Turbo (Q3_K)",
@@ -256,7 +269,7 @@ pub const MODELS: &[ImageModel] = &[
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
         transparency: false,
-        preview: true,
+        preview: (PREVIEW_PROJECTION, 1),
     },
     ImageModel {
         name: "Qwen-Image 2.1",
@@ -292,13 +305,17 @@ pub const MODELS: &[ImageModel] = &[
         steps: 20,
         cfg: 6.0,
         native: 1024,
-        min_size: 768,
+        // 512 was the first size anyone produced a good picture at, once the
+        // step count was right: the lattice that looked like a resolution
+        // problem was eight steps on a twenty-step model. Below 512 it does
+        // degrade, so the floor stays — one step lower than it was.
+        min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_EULER,
         transparency: true,
-        // No projection for a 64-dimensional latent, so the tab shows the
-        // step count and nothing else until the image lands.
-        preview: false,
+        // Every fourth step: a VAE decode is not free, and at this model's
+        // pace four steps is minutes of waiting to fill.
+        preview: (PREVIEW_VAE, 4),
     },
     ImageModel {
         name: "Qwen-Image 2.1 (Q2_K)",
@@ -327,13 +344,17 @@ pub const MODELS: &[ImageModel] = &[
         steps: 20,
         cfg: 6.0,
         native: 1024,
-        min_size: 768,
+        // 512 was the first size anyone produced a good picture at, once the
+        // step count was right: the lattice that looked like a resolution
+        // problem was eight steps on a twenty-step model. Below 512 it does
+        // degrade, so the floor stays — one step lower than it was.
+        min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_EULER,
         transparency: true,
-        // No projection for a 64-dimensional latent, so the tab shows the
-        // step count and nothing else until the image lands.
-        preview: false,
+        // Every fourth step: a VAE decode is not free, and at this model's
+        // pace four steps is minutes of waiting to fill.
+        preview: (PREVIEW_VAE, 4),
     },
 ];
 
@@ -461,11 +482,13 @@ pub enum ImageCmd {
 pub enum ImageEvent {
     /// Human-readable progress that is not a step count: downloads, loading.
     Note(String),
-    /// The latents part-way through, decoded cheaply by sd.cpp.
+    /// The image part-way through: projected from the latents, or decoded
+    /// through the VAE for models that have no projection.
     Preview {
         width: usize,
         height: usize,
-        rgb: Vec<u8>,
+        channels: usize,
+        pixels: Vec<u8>,
     },
     Step {
         done: usize,
@@ -530,19 +553,27 @@ extern "C" fn on_progress(step: c_int, steps: c_int, data: *mut c_void) {
     });
 }
 
-extern "C" fn on_preview(width: c_int, height: c_int, rgb: *const c_uchar, data: *mut c_void) {
-    if data.is_null() || rgb.is_null() || width <= 0 || height <= 0 {
+extern "C" fn on_preview(
+    width: c_int,
+    height: c_int,
+    channels: c_int,
+    pixels: *const c_uchar,
+    data: *mut c_void,
+) {
+    if data.is_null() || pixels.is_null() || width <= 0 || height <= 0 {
         return;
     }
     let (width, height) = (width as usize, height as usize);
-    // Safety: as above, and the shim only forwards 3-channel frames, whose
-    // buffer is width*height*3 bytes borrowed for the call.
+    let channels = (channels as usize).clamp(3, 4);
+    // Safety: as above, and the shim only forwards 3- or 4-channel frames,
+    // whose buffer is width*height*channels bytes borrowed for the call.
     let cb = unsafe { &*(data as *const Callbacks) };
-    let pixels = unsafe { std::slice::from_raw_parts(rgb, width * height * 3) };
+    let borrowed = unsafe { std::slice::from_raw_parts(pixels, width * height * channels) };
     let _ = cb.tx.send(ImageEvent::Preview {
         width,
         height,
-        rgb: pixels.to_vec(),
+        channels,
+        pixels: borrowed.to_vec(),
     });
 }
 
@@ -772,13 +803,10 @@ fn generate(
         steps,
     };
     let data = &callbacks as *const Callbacks as *mut c_void;
+    let (preview_mode, preview_interval) = spec.preview;
     unsafe {
         ffi::offgrid_sd_set_progress(Some(on_progress), data);
-        if spec.preview {
-            ffi::offgrid_sd_set_preview(Some(on_preview), PREVIEW_INTERVAL, data);
-        } else {
-            ffi::offgrid_sd_set_preview(None, 0, std::ptr::null_mut());
-        }
+        ffi::offgrid_sd_set_preview(Some(on_preview), preview_mode, preview_interval, data);
     }
 
     let mut pixels: *mut c_uchar = std::ptr::null_mut();
@@ -806,7 +834,7 @@ fn generate(
     // them first, or a later generation would write through a dangling pointer.
     unsafe {
         ffi::offgrid_sd_set_progress(None, std::ptr::null_mut());
-        ffi::offgrid_sd_set_preview(None, 0, std::ptr::null_mut());
+        ffi::offgrid_sd_set_preview(None, 0, 0, std::ptr::null_mut());
     }
 
     if ok == 0 || pixels.is_null() {
