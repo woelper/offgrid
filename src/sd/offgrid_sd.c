@@ -117,12 +117,12 @@ void offgrid_sd_free(void *ctx) {
 
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, unsigned char **out_rgb,
-                        int *out_width, int *out_height) {
-    if (!ctx || !out_rgb) {
+                        int64_t seed, int sampler, unsigned char **out_pixels,
+                        int *out_width, int *out_height, int *out_channels) {
+    if (!ctx || !out_pixels) {
         return 0;
     }
-    *out_rgb = NULL;
+    *out_pixels = NULL;
 
     sd_img_gen_params_t params;
     sd_img_gen_params_init(&params);
@@ -152,15 +152,16 @@ int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
         return 0;
     }
 
-    /* Copy out as packed RGB and hand that back, so ownership on the Rust side
-     * is one plain malloc'd block with no sd_image_t attached. Models differ on
-     * channels — Qwen-Image 2.1 returns RGBA where SD 1.5 and Z-Image return
-     * RGB — and everything downstream, the texture upload and the PNG writer,
-     * wants three, so any alpha is dropped here rather than everywhere. */
+    /* Copy the pixels out as they came and hand that back, so ownership on the
+     * Rust side is one plain malloc'd block with no sd_image_t attached. Models
+     * differ on channels — Qwen-Image 2.1 returns RGBA where SD 1.5 and
+     * Z-Image return RGB — and the count travels with the buffer rather than
+     * the alpha being thrown away here. */
     sd_image_t *image = &images[0];
-    size_t pixels = (size_t)image->width * image->height;
+    size_t pixel_count = (size_t)image->width * image->height;
+    size_t bytes = pixel_count * image->channel;
     int ok = 0;
-    if (!image->data || pixels == 0) {
+    if (!image->data || bytes == 0) {
         complain("the generated image is empty");
     } else if (image->channel != 3 && image->channel != 4) {
         static char note[96];
@@ -168,19 +169,20 @@ int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                  image->channel);
         complain(note);
     } else {
-        unsigned char *copy = (unsigned char *)malloc(pixels * 3);
+        unsigned char *copy = (unsigned char *)malloc(bytes);
         if (!copy) {
             complain("out of memory copying the image");
         } else {
-            for (size_t i = 0; i < pixels; i++) {
-                memcpy(copy + i * 3, image->data + i * image->channel, 3);
-            }
-            *out_rgb = copy;
+            memcpy(copy, image->data, bytes);
+            *out_pixels = copy;
             if (out_width) {
                 *out_width = (int)image->width;
             }
             if (out_height) {
                 *out_height = (int)image->height;
+            }
+            if (out_channels) {
+                *out_channels = (int)image->channel;
             }
             ok = 1;
         }

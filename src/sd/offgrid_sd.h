@@ -34,15 +34,16 @@ void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
                      int flash_attn, int offload_to_cpu);
 void offgrid_sd_free(void *ctx);
 
-/* Generate one image. On success returns 1 and fills *out_rgb with a buffer
- * owned by the caller (release it with offgrid_sd_free_buf), plus its size. */
+/* Generate one image. On success returns 1 and fills *out_pixels with a buffer
+ * owned by the caller (release it with offgrid_sd_free_buf), plus its size and
+ * channel count — 3 for RGB, 4 where the model produces alpha. */
 /* sampler is sd.cpp's sample_method_t; -1 keeps the library's default. Models
  * are distilled for particular samplers — Qwen-Image wants euler — and the
  * wrong one produces noise rather than an error. */
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, unsigned char **out_rgb,
-                        int *out_width, int *out_height);
+                        int64_t seed, int sampler, unsigned char **out_pixels,
+                        int *out_width, int *out_height, int *out_channels);
 void offgrid_sd_free_buf(unsigned char *buf);
 
 /* Warnings and errors from sd.cpp, so a failure can say what went wrong

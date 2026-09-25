@@ -331,13 +331,28 @@ fn image_probe(prompt: &str) {
                     }
                 );
             }
-            imagegen::ImageEvent::Image { width, height, rgb } => {
-                match image::RgbImage::from_raw(width as u32, height as u32, rgb) {
-                    Some(img) => match img.save("offgrid-image-probe.png") {
-                        Ok(()) => println!("wrote offgrid-image-probe.png ({width}x{height})"),
-                        Err(e) => eprintln!("could not write the png: {e}"),
-                    },
-                    None => eprintln!("image data does not match its size"),
+            imagegen::ImageEvent::Image {
+                width,
+                height,
+                channels,
+                pixels,
+            } => {
+                let recipe = imagegen::Recipe {
+                    model: imagegen::MODELS[model].name,
+                    prompt: prompt.to_string(),
+                    steps,
+                    cfg: imagegen::MODELS[model].cfg,
+                    seed: 42,
+                    width,
+                    height,
+                };
+                let path = std::path::Path::new("offgrid-image-probe.png");
+                match imagegen::save_png(path, width, height, channels, &pixels, &recipe) {
+                    Ok(()) => println!(
+                        "wrote {} ({width}x{height}, {channels} channels)",
+                        path.display()
+                    ),
+                    Err(e) => eprintln!("{e}"),
                 }
             }
             // Previews are for the UI; headless, the step line is enough.

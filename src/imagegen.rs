@@ -47,9 +47,10 @@ mod ffi {
             cfg: f32,
             seed: i64,
             sampler: c_int,
-            out_rgb: *mut *mut c_uchar,
+            out_pixels: *mut *mut c_uchar,
             out_width: *mut c_int,
             out_height: *mut c_int,
+            out_channels: *mut c_int,
         ) -> c_int;
         pub fn offgrid_sd_free_buf(buf: *mut c_uchar);
         pub fn offgrid_sd_set_log(cb: Option<LogCb>, data: *mut c_void);
@@ -313,6 +314,78 @@ fn local_path(file: &WeightFile) -> PathBuf {
     crate::config::models_dir().join("images").join(base)
 }
 
+/// What produced an image, kept with it and written into the file.
+#[derive(Clone)]
+pub struct Recipe {
+    pub model: &'static str,
+    pub prompt: String,
+    pub steps: usize,
+    pub cfg: f32,
+    pub seed: u64,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Recipe {
+    /// The one-string form the diffusion tools agreed on: prompt first, then
+    /// comma-separated settings. Automatic1111 and ComfyUI both write and read
+    /// it under the `parameters` key, so an image saved here can be dropped
+    /// into one of those and still say where it came from.
+    pub fn parameters(&self) -> String {
+        format!(
+            "{}\nSteps: {}, CFG scale: {}, Seed: {}, Size: {}x{}, Model: {}",
+            self.prompt.trim(),
+            self.steps,
+            self.cfg,
+            self.seed,
+            self.width,
+            self.height,
+            self.model,
+        )
+    }
+}
+
+/// Write a PNG with the recipe in its text chunks. The `image` crate cannot
+/// express those, and an image whose prompt is only in the UI that made it
+/// loses the prompt the moment it is filed somewhere.
+pub fn save_png(
+    path: &Path,
+    width: usize,
+    height: usize,
+    channels: usize,
+    pixels: &[u8],
+    recipe: &Recipe,
+) -> Result<(), String> {
+    let expected = width * height * channels;
+    if pixels.len() != expected {
+        return Err(format!(
+            "image is {} bytes, expected {expected}",
+            pixels.len()
+        ));
+    }
+    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    encoder.set_color(if channels == 4 {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
+    encoder.set_depth(png::BitDepth::Eight);
+    let text = |encoder: &mut png::Encoder<_>, key: &str, value: String| {
+        // A rejected chunk is not worth failing a save over: the pixels are
+        // the point, the provenance is a bonus.
+        let _ = encoder.add_text_chunk(key.to_string(), value);
+    };
+    text(&mut encoder, "parameters", recipe.parameters());
+    text(&mut encoder, "prompt", recipe.prompt.trim().to_string());
+    text(&mut encoder, "Software", "offgrid".to_string());
+    encoder
+        .write_header()
+        .map_err(|e| format!("writing {}: {e}", path.display()))?
+        .write_image_data(pixels)
+        .map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
 pub enum ImageCmd {
     /// Download a model's weights without generating anything, so the list can
     /// offer it the way the model tab offers an LLM.
@@ -349,7 +422,11 @@ pub enum ImageEvent {
     Image {
         width: usize,
         height: usize,
-        rgb: Vec<u8>,
+        /// 3 for RGB, 4 where the model produces alpha — Qwen-Image does, the
+        /// others do not, and none of them are trained to make it mean
+        /// transparency, so it is carried rather than interpreted.
+        channels: usize,
+        pixels: Vec<u8>,
     },
     Done,
     Error(String),
@@ -652,10 +729,10 @@ fn generate(
         }
     }
 
-    let mut rgb: *mut c_uchar = std::ptr::null_mut();
+    let mut pixels: *mut c_uchar = std::ptr::null_mut();
     // Filled by the shim — kept distinct from the requested size, which they
     // would otherwise shadow.
-    let (mut out_width, mut out_height) = (0 as c_int, 0 as c_int);
+    let (mut out_width, mut out_height, mut out_channels) = (0 as c_int, 0 as c_int, 0 as c_int);
     let ok = unsafe {
         ffi::offgrid_sd_generate(
             model.0,
@@ -667,9 +744,10 @@ fn generate(
             spec.cfg,
             seed as i64,
             spec.sampler as c_int,
-            &mut rgb,
+            &mut pixels,
             &mut out_width,
             &mut out_height,
+            &mut out_channels,
         )
     };
     // The callbacks borrow `callbacks`, which dies with this function: clear
@@ -679,22 +757,24 @@ fn generate(
         ffi::offgrid_sd_set_preview(None, 0, std::ptr::null_mut());
     }
 
-    if ok == 0 || rgb.is_null() {
+    if ok == 0 || pixels.is_null() {
         return Err(match take_complaint() {
             Some(why) => format!("generation failed: {why}"),
             None => "generation failed, and sd.cpp said nothing about why".into(),
         });
     }
     let (width, height) = (out_width as usize, out_height as usize);
+    let channels = (out_channels as usize).clamp(3, 4);
     // Safety: on success the shim returns a malloc'd buffer of exactly
-    // width*height*3 bytes, which is ours to copy out of and free.
-    let pixels = unsafe { std::slice::from_raw_parts(rgb, width * height * 3) }.to_vec();
-    unsafe { ffi::offgrid_sd_free_buf(rgb) };
+    // width*height*channels bytes, which is ours to copy out of and free.
+    let copied = unsafe { std::slice::from_raw_parts(pixels, width * height * channels) }.to_vec();
+    unsafe { ffi::offgrid_sd_free_buf(pixels) };
 
     let _ = tx.send(ImageEvent::Image {
         width,
         height,
-        rgb: pixels,
+        channels,
+        pixels: copied,
     });
     Ok(())
 }

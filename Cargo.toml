@@ -35,7 +35,7 @@ cuda = ["llama-cpp-2/cuda"]
 # The earlier candle implementation is in this branch's history. It was five
 # times slower on a CPU (47s a step, 31s with MKL, against 9.2s here), has no
 # Vulkan backend for non-NVIDIA cards, and could not use quantized weights.
-images = ["shared-ggml", "dep:cc"]
+images = ["shared-ggml", "dep:cc", "dep:png"]
 # Experiment, and the foundation of `images`: link llama.cpp against a ggml
 # built outside the crate, so a second consumer of ggml can link the same copy
 # instead of bringing its own and colliding on every symbol. GGML_MAX_NAME must
@@ -49,6 +49,10 @@ eframe = "0.35.0"
 egui_commonmark = "0.24.0"
 egui_extras = { version = "0.35", features = ["image", "syntect"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+# Saving a generated image writes the prompt and settings into the file as PNG
+# text chunks, which the `image` crate has no way to express; png is already in
+# the tree underneath it.
+png = { version = "0.18.1", optional = true }
 libc = "0.2"
 llama-cpp-2 = "0.1.154"
 open = "5.4.1"

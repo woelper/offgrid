@@ -2767,6 +2767,7 @@ dependencies = [
  "libc",
  "llama-cpp-2",
  "open",
+ "png",
  "rfd",
  "serde",
  "serde_json",

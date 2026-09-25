@@ -122,6 +122,39 @@ enum AgentItem {
     Info(String),
 }
 
+/// One finished image and what made it. The pixels are kept rather than the
+/// texture alone, because saving needs them and a texture cannot be read back.
+#[cfg(feature = "images")]
+struct Generated {
+    width: usize,
+    height: usize,
+    /// 3 or 4; Qwen-Image returns alpha, the others do not.
+    channels: usize,
+    pixels: Vec<u8>,
+    recipe: imagegen::Recipe,
+    took: Option<f32>,
+    /// Uploaded on first sight, then kept: re-uploading every frame would be
+    /// wasteful, and the history is small.
+    texture: Option<egui::TextureHandle>,
+}
+
+#[cfg(feature = "images")]
+impl Generated {
+    /// egui wants its own image type, and the channel count decides which.
+    fn color_image(&self) -> egui::ColorImage {
+        let size = [self.width, self.height];
+        if self.channels == 4 {
+            egui::ColorImage::from_rgba_unmultiplied(size, &self.pixels)
+        } else {
+            egui::ColorImage::from_rgb(size, &self.pixels)
+        }
+    }
+}
+
+/// How many generations a session keeps before the oldest falls off.
+#[cfg(feature = "images")]
+const HISTORY_LIMIT: usize = 24;
+
 /// Everything the images tab needs between frames. The worker is spawned on
 /// first use, not at startup: most sessions never open this tab, and the model
 /// is a 2 GB download nobody should pay for by accident.
@@ -147,8 +180,12 @@ struct ImagesState {
     /// Wall-clock seconds the last finished image took, the number this whole
     /// prototype exists to produce.
     took: Option<f32>,
-    image: Option<(usize, usize, Vec<u8>)>,
-    texture: Option<egui::TextureHandle>,
+    /// This session's generations, newest last. Bounded: at half a megabyte a
+    /// picture the cost is small, but it is not nothing, and a session that
+    /// ran all afternoon should not be holding all of it.
+    history: Vec<Generated>,
+    /// Which of them the result panel is showing; the newest by default.
+    shown: Option<usize>,
     /// Latent preview: tiny, blurry, and updated every step.
     preview: Option<(usize, usize, Vec<u8>)>,
     preview_texture: Option<egui::TextureHandle>,
@@ -176,8 +213,8 @@ impl Default for ImagesState {
             progress: None,
             started: None,
             took: None,
-            image: None,
-            texture: None,
+            history: Vec::new(),
+            shown: None,
             preview: None,
             preview_texture: None,
             first_step: None,
@@ -714,11 +751,40 @@ impl OffgridApp {
                     self.images.preview = Some((width, height, rgb));
                     self.images.preview_texture = None;
                 }
-                Ok(imagegen::ImageEvent::Image { width, height, rgb }) => {
+                Ok(imagegen::ImageEvent::Image {
+                    width,
+                    height,
+                    channels,
+                    pixels,
+                }) => {
                     // Keep the pixels; the texture is uploaded in the tab,
                     // which is the only place with a Context to hand.
-                    self.images.image = Some((width, height, rgb));
-                    self.images.texture = None;
+                    let (model, spec) = (self.images.model, &imagegen::MODELS[self.images.model]);
+                    let _ = model;
+                    self.images.history.push(Generated {
+                        width,
+                        height,
+                        channels,
+                        pixels,
+                        recipe: imagegen::Recipe {
+                            model: spec.name,
+                            prompt: self.images.prompt.clone(),
+                            steps: self.images.steps,
+                            cfg: spec.cfg,
+                            seed: self.images.seed,
+                            width,
+                            height,
+                        },
+                        took: self.images.first_step.map(|t| t.elapsed().as_secs_f32()),
+                        texture: None,
+                    });
+                    if self.images.history.len() > HISTORY_LIMIT {
+                        self.images.history.remove(0);
+                        if let Some(shown) = self.images.shown.as_mut() {
+                            *shown = shown.saturating_sub(1);
+                        }
+                    }
+                    self.images.shown = Some(self.images.history.len() - 1);
                     self.images.preview = None;
                     self.images.preview_texture = None;
                 }
@@ -917,26 +983,94 @@ impl OffgridApp {
                 });
             }
 
-            if let Some((width, height, rgb)) = self.images.image.clone() {
+            // The result panel shows one generation and the strip below it the
+            // rest of the session, so a prompt worth keeping is not lost to the
+            // next Generate.
+            if let Some(shown) = self.images.shown.filter(|i| *i < self.images.history.len()) {
                 theme::group(ui, "Result", Some(theme::icons().file.clone()), |ui| {
-                    let texture = self.images.texture.get_or_insert_with(|| {
-                        let image = egui::ColorImage::from_rgb([width, height], &rgb);
-                        ui.ctx()
-                            .load_texture("generated", image, egui::TextureOptions::LINEAR)
-                    });
-                    ui.image((texture.id(), texture.size_vec2()));
-                    if theme::button(ui, Some((theme::icons().disk.clone(), 18.0)), "Save as…")
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("offgrid.png")
-                            .save_file()
-                    {
-                        let saved = image::RgbImage::from_raw(width as u32, height as u32, rgb)
-                            .ok_or_else(|| "image data does not match its size".to_string())
-                            .and_then(|img| img.save(&path).map_err(|e| e.to_string()));
-                        if let Err(e) = saved {
-                            self.last_error = Some(format!("saving the image: {e}"));
+                    let entry = &mut self.images.history[shown];
+                    // Uploaded once, on first sight: building the ColorImage
+                    // first keeps the closure from borrowing what it assigns.
+                    if entry.texture.is_none() {
+                        let image = entry.color_image();
+                        entry.texture = Some(ui.ctx().load_texture(
+                            "generated",
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                    if let Some(texture) = &entry.texture {
+                        ui.image((texture.id(), texture.size_vec2()));
+                    }
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, Some((theme::icons().disk.clone(), 18.0)), "Save as…")
+                            .clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_file_name("offgrid.png")
+                                .save_file()
+                        {
+                            let entry = &self.images.history[shown];
+                            if let Err(e) = imagegen::save_png(
+                                &path,
+                                entry.width,
+                                entry.height,
+                                entry.channels,
+                                &entry.pixels,
+                                &entry.recipe,
+                            ) {
+                                self.last_error = Some(format!("saving the image: {e}"));
+                            }
                         }
+                        let entry = &self.images.history[shown];
+                        ui.weak(match entry.took {
+                            Some(took) => format!(
+                                "{} · {} steps · seed {} · {:.0}s",
+                                entry.recipe.model, entry.recipe.steps, entry.recipe.seed, took
+                            ),
+                            None => format!(
+                                "{} · {} steps · seed {}",
+                                entry.recipe.model, entry.recipe.steps, entry.recipe.seed
+                            ),
+                        });
+                    });
+                });
+            }
+
+            if self.images.history.len() > 1 {
+                theme::group(ui, "This session", Some(theme::icons().models.clone()), |ui| {
+                    // Newest first: the one just made is the one being looked
+                    // for. Thumbnails share the full-size textures, which the
+                    // history already holds.
+                    let mut pick = None;
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for i in (0..self.images.history.len()).rev() {
+                                let entry = &mut self.images.history[i];
+                                if entry.texture.is_none() {
+                                    let image = entry.color_image();
+                                    entry.texture = Some(ui.ctx().load_texture(
+                                        format!("generated{i}"),
+                                        image,
+                                        egui::TextureOptions::LINEAR,
+                                    ));
+                                }
+                                let Some(texture) = &entry.texture else {
+                                    continue;
+                                };
+                                let thumb = egui::Button::image(
+                                    egui::Image::new((texture.id(), texture.size_vec2()))
+                                        .fit_to_exact_size(egui::vec2(96.0, 96.0)),
+                                )
+                                .selected(Some(i) == self.images.shown);
+                                let prompt = entry.recipe.prompt.clone();
+                                if ui.add(thumb).on_hover_text(prompt).clicked() {
+                                    pick = Some(i);
+                                }
+                            }
+                        });
+                    });
+                    if let Some(i) = pick {
+                        self.images.shown = Some(i);
                     }
                 });
             }
