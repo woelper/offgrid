@@ -903,36 +903,46 @@ impl OffgridApp {
                     ui.horizontal(|ui| {
                         ui.label("Size:");
                         let (w, h) = self.images.size;
-                        let current = imagegen::SIZES
-                            .iter()
-                            .find(|(_, sw, sh)| (*sw, *sh) == (w, h))
-                            .map(|(label, _, _)| *label)
-                            .unwrap_or("custom");
+                        // Labelled against the selected model: the same 512 is
+                        // native to SD 1.5 and too small for Qwen, and a label
+                        // that says "native" while the line below calls it
+                        // incoherent is worse than no label.
+                        let spec = &imagegen::MODELS[self.images.model];
                         egui::ComboBox::from_id_salt("image_size")
-                            .selected_text(current)
+                            .selected_text(imagegen::size_label(spec, w, h))
                             .show_ui(ui, |ui| {
-                                for (label, sw, sh) in imagegen::SIZES {
-                                    ui.selectable_value(&mut self.images.size, (*sw, *sh), *label);
+                                for (sw, sh) in imagegen::SIZES {
+                                    ui.selectable_value(
+                                        &mut self.images.size,
+                                        (*sw, *sh),
+                                        imagegen::size_label(spec, *sw, *sh),
+                                    );
                                 }
                             });
-                        // Not just the pixel ratio: attention costs the square
-                        // of the latent area, so the wait climbs faster than
-                        // the size does — by a lot, measured.
-                        let (dw, dh) = imagegen::DEFAULT_SIZE;
-                        let ratio = (w * h) as f32 / (dw * dh) as f32;
-                        let min = imagegen::MODELS[self.images.model].min_size;
-                        if w.min(h) < min {
+                        if w.min(h) < spec.min_size {
                             ui.colored_label(
                                 theme::skin().bad,
-                                format!("below {min}px this model loses coherence"),
+                                format!(
+                                    "{} was trained at {}px and needs at least {}px here",
+                                    spec.name, spec.native, spec.min_size
+                                ),
                             );
-                        }
-                        if ratio > 1.01 {
-                            ui.weak(format!(
-                                "{ratio:.1}× the pixels of 512 × 512, and rather more than that in time"
-                            ));
-                        } else if ratio < 0.99 {
-                            ui.weak(format!("{ratio:.1}× the pixels of 512 × 512, and quicker"));
+                        } else {
+                            // Measured against the smallest size this model can
+                            // use, not a fixed one: the cheapest usable size
+                            // differs per model, and a ratio against someone
+                            // else's baseline says nothing useful. Attention
+                            // costs the square of the latent area, so the wait
+                            // climbs faster than the pixels do.
+                            let base = spec.min_size * spec.min_size;
+                            let ratio = (w * h) as f32 / base as f32;
+                            if ratio > 1.01 {
+                                ui.weak(format!(
+                                    "{ratio:.1}× the pixels of {0} × {0}, and rather more than \
+                                     that in time",
+                                    spec.min_size
+                                ));
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1073,42 +1083,47 @@ impl OffgridApp {
             }
 
             if self.images.history.len() > 1 {
-                theme::group(ui, "This session", Some(theme::icons().models.clone()), |ui| {
-                    // Newest first: the one just made is the one being looked
-                    // for. Thumbnails share the full-size textures, which the
-                    // history already holds.
-                    let mut pick = None;
-                    egui::ScrollArea::horizontal().show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for i in (0..self.images.history.len()).rev() {
-                                let entry = &mut self.images.history[i];
-                                if entry.texture.is_none() {
-                                    let image = entry.color_image();
-                                    entry.texture = Some(ui.ctx().load_texture(
-                                        format!("generated{i}"),
-                                        image,
-                                        egui::TextureOptions::LINEAR,
-                                    ));
+                theme::group(
+                    ui,
+                    "This session",
+                    Some(theme::icons().models.clone()),
+                    |ui| {
+                        // Newest first: the one just made is the one being looked
+                        // for. Thumbnails share the full-size textures, which the
+                        // history already holds.
+                        let mut pick = None;
+                        egui::ScrollArea::horizontal().show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for i in (0..self.images.history.len()).rev() {
+                                    let entry = &mut self.images.history[i];
+                                    if entry.texture.is_none() {
+                                        let image = entry.color_image();
+                                        entry.texture = Some(ui.ctx().load_texture(
+                                            format!("generated{i}"),
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        ));
+                                    }
+                                    let Some(texture) = &entry.texture else {
+                                        continue;
+                                    };
+                                    let thumb = egui::Button::image(
+                                        egui::Image::new((texture.id(), texture.size_vec2()))
+                                            .fit_to_exact_size(egui::vec2(96.0, 96.0)),
+                                    )
+                                    .selected(Some(i) == self.images.shown);
+                                    let prompt = entry.recipe.prompt.clone();
+                                    if ui.add(thumb).on_hover_text(prompt).clicked() {
+                                        pick = Some(i);
+                                    }
                                 }
-                                let Some(texture) = &entry.texture else {
-                                    continue;
-                                };
-                                let thumb = egui::Button::image(
-                                    egui::Image::new((texture.id(), texture.size_vec2()))
-                                        .fit_to_exact_size(egui::vec2(96.0, 96.0)),
-                                )
-                                .selected(Some(i) == self.images.shown);
-                                let prompt = entry.recipe.prompt.clone();
-                                if ui.add(thumb).on_hover_text(prompt).clicked() {
-                                    pick = Some(i);
-                                }
-                            }
+                            });
                         });
-                    });
-                    if let Some(i) = pick {
-                        self.images.shown = Some(i);
-                    }
-                });
+                        if let Some(i) = pick {
+                            self.images.shown = Some(i);
+                        }
+                    },
+                );
             }
         });
     }

@@ -59,18 +59,26 @@ mod ffi {
     }
 }
 
-/// The wait grows faster than the pixel count — attention costs the square of
-/// the latent area — so the labels rank by time rather than by resolution:
-/// going one size up costs noticeably more than the extra pixels suggest.
-pub const SIZES: &[(&str, usize, usize)] = &[
-    ("384 × 384 — quickest", 384, 384),
-    ("512 × 512 — native", 512, 512),
-    ("512 × 768 — portrait, much slower", 512, 768),
-    ("768 × 512 — landscape, much slower", 768, 512),
-    ("768 × 768 — slowest", 768, 768),
-];
+/// The sizes on offer. Every value is a multiple of 64, which the UNet's
+/// eight-fold downsampling requires. Deliberately bare: whether one of these
+/// is native, tolerable or too small is a property of the model selected, not
+/// of the number, so the labels are built per model by `size_label`.
+pub const SIZES: &[(usize, usize)] = &[(384, 384), (512, 512), (512, 768), (768, 512), (768, 768)];
 
-/// What SD 1.5 was trained at, and what every timing here quotes.
+/// How a size reads for a given model: its own resolution, one it copes with,
+/// or one it will answer with a lattice of unresolved patches.
+pub fn size_label(spec: &ImageModel, width: usize, height: usize) -> String {
+    let size = format!("{width} × {height}");
+    if width.min(height) < spec.min_size {
+        format!("{size} — too small for this model")
+    } else if (width, height) == (spec.native, spec.native) {
+        format!("{size} — native")
+    } else {
+        size
+    }
+}
+
+/// The size the estimates compare against.
 pub const DEFAULT_SIZE: (usize, usize) = (512, 512);
 
 /// Preview after every denoiser step: sd.cpp's projection preview skips the
@@ -112,6 +120,10 @@ pub struct ImageModel {
     /// sd.cpp's sample_method_t, or -1 for the library's default. Qwen-Image
     /// is trained for euler and gives noise under the default sampler.
     pub sampler: i32,
+    /// What the model was trained at. Bigger than anything this list offers for
+    /// the newer ones, which is the honest situation: 1024 is minutes a step on
+    /// a CPU, so the tab offers what is bearable and says what is native.
+    pub native: usize,
     /// The smallest edge this model still behaves at. Diffusion models are
     /// trained at a resolution and drift off-distribution below it: SD 1.5 was
     /// trained at 512 and copes at 384, while the newer ones are trained
@@ -171,6 +183,7 @@ pub const MODELS: &[ImageModel] = &[
         }],
         steps: 10,
         cfg: 7.5,
+        native: 512,
         min_size: 384,
         flash_attn: false,
         sampler: SAMPLER_DEFAULT,
@@ -205,6 +218,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        native: 1024,
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
@@ -237,6 +251,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        native: 1024,
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
@@ -276,6 +291,7 @@ pub const MODELS: &[ImageModel] = &[
         // have not been judged here, only the plumbing.
         steps: 20,
         cfg: 6.0,
+        native: 1024,
         min_size: 768,
         flash_attn: true,
         sampler: SAMPLER_EULER,
@@ -310,6 +326,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 20,
         cfg: 6.0,
+        native: 1024,
         min_size: 768,
         flash_attn: true,
         sampler: SAMPLER_EULER,
