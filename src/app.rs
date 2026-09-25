@@ -157,6 +157,19 @@ fn color_image(width: usize, height: usize, channels: usize, pixels: &[u8]) -> e
     }
 }
 
+/// A generated image is a picture, not a widget: it sits centred with a little
+/// shadow under it, so it reads as something produced rather than as part of
+/// the panel it happens to be in.
+#[cfg(feature = "images")]
+fn image_frame() -> egui::Frame {
+    egui::Frame::NONE.shadow(egui::epaint::Shadow {
+        offset: [0, 4],
+        blur: 12,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(60),
+    })
+}
+
 /// How many generations a session keeps before the oldest falls off.
 #[cfg(feature = "images")]
 const HISTORY_LIMIT: usize = 24;
@@ -1032,10 +1045,14 @@ impl OffgridApp {
                         // Drawn at the size the finished image will be, so the
                         // tab does not jump when the real one arrives.
                         let (w, h) = self.images.size;
-                        ui.add(
-                            egui::Image::new((texture.id(), texture.size_vec2()))
-                                .fit_to_exact_size(egui::vec2(w as f32, h as f32)),
-                        );
+                        ui.vertical_centered(|ui| {
+                            image_frame().show(ui, |ui| {
+                                ui.add(
+                                    egui::Image::new((texture.id(), texture.size_vec2()))
+                                        .fit_to_exact_size(egui::vec2(w as f32, h as f32)),
+                                );
+                            });
+                        });
                     }
                 });
             }
@@ -1057,37 +1074,46 @@ impl OffgridApp {
                         ));
                     }
                     if let Some(texture) = &entry.texture {
-                        ui.image((texture.id(), texture.size_vec2()));
+                        let (id, size) = (texture.id(), texture.size_vec2());
+                        ui.vertical_centered(|ui| {
+                            image_frame().show(ui, |ui| ui.image((id, size)));
+                        });
                     }
-                    ui.horizontal(|ui| {
-                        if theme::button(ui, Some((theme::icons().disk.clone(), 18.0)), "Save as…")
+                    ui.vertical_centered(|ui| {
+                        ui.horizontal(|ui| {
+                            if theme::button(
+                                ui,
+                                Some((theme::icons().disk.clone(), 18.0)),
+                                "Save as…",
+                            )
                             .clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .set_file_name("offgrid.png")
-                                .save_file()
-                        {
-                            let entry = &self.images.history[shown];
-                            if let Err(e) = imagegen::save_png(
-                                &path,
-                                entry.width,
-                                entry.height,
-                                entry.channels,
-                                &entry.pixels,
-                                &entry.recipe,
-                            ) {
-                                self.last_error = Some(format!("saving the image: {e}"));
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .set_file_name("offgrid.png")
+                                    .save_file()
+                            {
+                                let entry = &self.images.history[shown];
+                                if let Err(e) = imagegen::save_png(
+                                    &path,
+                                    entry.width,
+                                    entry.height,
+                                    entry.channels,
+                                    &entry.pixels,
+                                    &entry.recipe,
+                                ) {
+                                    self.last_error = Some(format!("saving the image: {e}"));
+                                }
                             }
-                        }
-                        let entry = &self.images.history[shown];
-                        ui.weak(match entry.took {
-                            Some(took) => format!(
-                                "{} · {} steps · seed {} · {:.0}s",
-                                entry.recipe.model, entry.recipe.steps, entry.recipe.seed, took
-                            ),
-                            None => format!(
-                                "{} · {} steps · seed {}",
-                                entry.recipe.model, entry.recipe.steps, entry.recipe.seed
-                            ),
+                            let entry = &self.images.history[shown];
+                            ui.weak(match entry.took {
+                                Some(took) => format!(
+                                    "{} · {} steps · seed {} · {:.0}s",
+                                    entry.recipe.model, entry.recipe.steps, entry.recipe.seed, took
+                                ),
+                                None => format!(
+                                    "{} · {} steps · seed {}",
+                                    entry.recipe.model, entry.recipe.steps, entry.recipe.seed
+                                ),
+                            });
                         });
                     });
                 });
