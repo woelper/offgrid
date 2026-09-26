@@ -40,12 +40,19 @@ jobs:
           - os: windows-2022
             target: windows-x86_64-cuda
             features: cuda
-          # Image generation. Linux only for now: the build script is bash and
-          # has only run there, and on macOS the shared ggml would have to be
-          # built with Metal or the same binary would lose GPU acceleration for
-          # chat — a worse trade than not shipping the artifact.
+          # Image generation, on all three. The shared ggml carries Metal on
+          # macOS, so the same binary keeps GPU acceleration for chat; the
+          # other two are CPU, as their plain artifacts are. All three are
+          # tarballs — the build goes through a script rather than
+          # cargo-bundle, so there is no .deb or .app.
           - os: ubuntu-latest
             target: linux-x86_64-images
+            features: images
+          - os: macos-latest
+            target: macos-arm64-images
+            features: images
+          - os: windows-latest
+            target: windows-x86_64-images
             features: images
     runs-on: ${{ matrix.os }}
     steps:
@@ -66,7 +73,9 @@ jobs:
       # cargo-bundle produces the .deb (Linux) and .app (macOS). Its Windows
       # (msi) support is still experimental, so Windows ships a plain zip.
       - name: Install cargo-bundle
-        if: runner.os != 'Windows'
+        # Not for the image builds: they ship a tarball and would otherwise
+        # spend two minutes compiling a tool they never call.
+        if: runner.os != 'Windows' && matrix.features != 'images'
         run: cargo install cargo-bundle
 
       # GPU toolkits live up here, before every build step: the Linux CUDA
@@ -111,8 +120,21 @@ jobs:
           fi
           tar -C target/release -czf "dist/offgrid-${VERSION}-${{ matrix.target }}.tar.gz" offgrid
 
+      - name: Build (macOS, image generation)
+        if: runner.os == 'macOS' && matrix.features == 'images'
+        shell: bash
+        run: |
+          # The script builds the shared ggml — with Metal, so this binary
+          # keeps GPU acceleration for chat — then stable-diffusion.cpp against
+          # it, then calls cargo. A plain tarball rather than a signed .app,
+          # because none of that goes through cargo-bundle.
+          ./scripts/images-build.sh build --release --features images
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          tar -C target/release -czf "dist/offgrid-${VERSION}-${{ matrix.target }}.tar.gz" offgrid
+
       - name: Build (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && matrix.features != 'images'
         shell: bash
         run: |
           cargo bundle --release
@@ -135,7 +157,11 @@ jobs:
             # runner's own core count. See .github/actions/setup-cuda.
             export NUM_JOBS=4
           fi
-          if [ -n "${{ matrix.features }}" ]; then
+          if [ "${{ matrix.features }}" = "images" ]; then
+            # ggml and stable-diffusion.cpp are built outside cargo and shared
+            # with llama.cpp; the script does that and then calls cargo.
+            ./scripts/images-build.sh build --release --features images
+          elif [ -n "${{ matrix.features }}" ]; then
             cargo build --release --features "${{ matrix.features }}"
           else
             cargo build --release
