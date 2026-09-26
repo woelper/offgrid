@@ -50,7 +50,35 @@ fn images() {
     );
     // stable-diffusion first, then the ggml it calls into: a static archive
     // only resolves symbols for the archives that follow it.
-    for lib in ["stable-diffusion", "ggml", "ggml-cpu", "ggml-base"] {
+    //
+    // Which ggml libraries exist depends on the backends it was built with —
+    // Metal adds a ggml-metal that nothing else references except ggml's own
+    // backend registry, so a hardcoded list linked fine on Linux and failed on
+    // macOS with an undefined _ggml_backend_metal_reg. Find them instead, and
+    // keep ggml-base last: everything else calls into it.
+    let mut libs = vec!["stable-diffusion".to_string(), "ggml".to_string()];
+    let mut backends: Vec<String> = std::fs::read_dir(prefix.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // libggml-metal.a, or ggml-metal.lib under MSVC.
+            let stem = name
+                .strip_suffix(".a")
+                .or_else(|| name.strip_suffix(".lib"))?;
+            let stem = stem.strip_prefix("lib").unwrap_or(stem);
+            match stem {
+                "ggml" | "ggml-base" => None,
+                _ if stem.starts_with("ggml-") => Some(stem.to_string()),
+                _ => None,
+            }
+        })
+        .collect();
+    backends.sort();
+    libs.extend(backends);
+    libs.push("ggml-base".to_string());
+    for lib in &libs {
         println!("cargo:rustc-link-lib=static={lib}");
     }
     // The C++ runtime sd.cpp needs, and whatever else the platform's ggml was
