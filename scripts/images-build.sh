@@ -34,7 +34,10 @@ cmpath() {
 # links against, so it needs no flag of its own.
 GGML_GPU=()
 if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
-    GGML_GPU=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON)
+    # BLAS off for the same reason llama-cpp-sys-2's own build script turns it
+    # off on Apple: ggml would enable it by default and the trimmed llama.cpp
+    # the crate vendors has no ggml-blas directory to build.
+    GGML_GPU=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=OFF)
 fi
 
 # llama.cpp's own ggml is the one to share: sd.cpp has an upstream-ggml mode
