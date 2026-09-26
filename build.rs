@@ -53,8 +53,33 @@ fn images() {
     for lib in ["stable-diffusion", "ggml", "ggml-cpu", "ggml-base"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    // sd.cpp is C++ and ggml's CPU backend uses OpenMP; llama-cpp-sys asks for
-    // both as well, and asking twice is harmless.
-    println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=gomp");
+    // The C++ runtime sd.cpp needs, and whatever else the platform's ggml was
+    // built against. llama-cpp-sys asks for its own copies of these too, and
+    // asking twice is harmless.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    match (os.as_str(), env.as_str()) {
+        ("macos", _) => {
+            println!("cargo:rustc-link-lib=c++");
+            // Metal — the shared ggml is built with it, so that an images
+            // build does not cost chat its GPU — and Accelerate, ggml's BLAS
+            // on that platform.
+            for framework in [
+                "Metal",
+                "MetalKit",
+                "Foundation",
+                "QuartzCore",
+                "Accelerate",
+            ] {
+                println!("cargo:rustc-link-lib=framework={framework}");
+            }
+        }
+        // MSVC links its own C++ runtime, and its OpenMP comes from flags
+        // ggml's own build already set.
+        (_, "msvc") => {}
+        _ => {
+            println!("cargo:rustc-link-lib=stdc++");
+            println!("cargo:rustc-link-lib=gomp");
+        }
+    }
 }

@@ -89,6 +89,39 @@ jobs:
       - name: clippy
         run: ./scripts/images-build.sh clippy --features images --all-targets -- -D warnings
 
+  # macOS and Windows for the same feature, on demand rather than per push:
+  # each is another ten-minute C++ build, and the Linux job above catches
+  # anything that is not platform-specific. Run this before tagging a release,
+  # since the release matrix builds all three.
+  images-cross:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the ggml and stable-diffusion.cpp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/sd-prefix
+            target/ggml-build
+            target/sd-build
+            target/stable-diffusion.cpp
+          key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
+
+      # bash on Windows too: the script is bash, and the runners have git-bash.
+      - name: build
+        shell: bash
+        run: ./scripts/images-build.sh build --release --features images
+
   # The GPU build compiles a whole second ggml backend and its shaders, which
   # takes many minutes — too much for every push, where the ordinary build
   # above is the check that matters. Run it from the Actions tab when the
