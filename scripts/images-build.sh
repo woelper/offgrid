@@ -13,7 +13,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PREFIX="$PWD/target/sd-prefix"
+# Deliberately not under target/: Swatinem/rust-cache prunes that directory
+# between runs, and it restored a stable-diffusion.cpp checkout with its
+# contents stripped — which the old "does the directory exist" guard took for a
+# working one, so the fetch was skipped and cmake found no CMakeLists.txt.
+SD_ROOT="$PWD/.sd-cpp"
+PREFIX="$SD_ROOT/prefix"
 DEF="-DGGML_MAX_NAME=160"
 JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
@@ -70,13 +75,17 @@ fi
 # stable-diffusion.cpp: a checkout you provide, or one fetched next to the
 # build. Nothing here is vendored into the repo yet — that is a decision for
 # when this stops being a prototype.
-SD_SRC="${OFFGRID_SD_SRC:-$PWD/target/stable-diffusion.cpp}"
+SD_SRC="${OFFGRID_SD_SRC:-$SD_ROOT/src}"
 # Pinned, not master: this is the revision the model list was tested against,
 # and sd.cpp moves fast enough that an unpinned build would be a different
 # program every week. Bump it deliberately, after running the models.
 SD_REF="${OFFGRID_SD_REF:-c92d73c408515c94beef32161bb5960764fde7a0}"
-if [[ ! -d "$SD_SRC" ]]; then
+if [[ ! -f "$SD_SRC/CMakeLists.txt" ]]; then
     echo "==> fetching stable-diffusion.cpp $SD_REF into $SD_SRC"
+    # A directory without the sources is worse than no directory: whatever is
+    # there is a remnant, not a checkout.
+    rm -rf "$SD_SRC"
+    mkdir -p "$SD_ROOT"
     git init -q "$SD_SRC"
     git -C "$SD_SRC" remote add origin https://github.com/leejet/stable-diffusion.cpp
     git -C "$SD_SRC" fetch -q --depth 1 origin "$SD_REF"
@@ -87,7 +96,7 @@ fi
 # library's name.
 if ! ls "$PREFIX"/lib/libggml-base.a "$PREFIX"/lib/ggml-base.lib > /dev/null 2>&1; then
     echo "==> building ggml (shared by llama.cpp and stable-diffusion.cpp)"
-    cmake -S "$(cmpath "$LLAMA")" -B target/ggml-build "${GGML_GPU[@]}" \
+    cmake -S "$(cmpath "$LLAMA")" -B "$(cmpath "$SD_ROOT/ggml-build")" "${GGML_GPU[@]}" \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(cmpath "$PREFIX")" \
         -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -95,21 +104,21 @@ if ! ls "$PREFIX"/lib/libggml-base.a "$PREFIX"/lib/ggml-base.lib > /dev/null 2>&
         -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
         -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_CURL=OFF
-    cmake --build target/ggml-build --config Release -j"$JOBS" --target install
+    cmake --build "$SD_ROOT/ggml-build" --config Release -j"$JOBS" --target install
 fi
 
 if ! ls "$PREFIX"/lib/libstable-diffusion.a "$PREFIX"/lib/stable-diffusion.lib > /dev/null 2>&1; then
     echo "==> building stable-diffusion.cpp against that ggml"
-    cmake -S "$(cmpath "$SD_SRC")" -B target/sd-build \
+    cmake -S "$(cmpath "$SD_SRC")" -B "$(cmpath "$SD_ROOT/sd-build")" \
         -DCMAKE_BUILD_TYPE=Release \
         -DSD_USE_SYSTEM_GGML=ON -DSD_USE_UPSTREAM_GGML=ON \
         -DSD_GGML_SOURCE_DIR="$(cmpath "$LLAMA/ggml")" -DSD_BUILD_EXAMPLES=OFF \
         -DCMAKE_C_FLAGS="$DEF" -DCMAKE_CXX_FLAGS="$DEF" \
         -DCMAKE_PREFIX_PATH="$(cmpath "$PREFIX")"
-    cmake --build target/sd-build --config Release -j"$JOBS"
+    cmake --build "$SD_ROOT/sd-build" --config Release -j"$JOBS"
     # libstable-diffusion.a on unix, stable-diffusion.lib under MSVC, and the
     # latter lands in a per-configuration subdirectory.
-    SD_LIB="$(find target/sd-build \( -name "libstable-diffusion.a" -o -name "stable-diffusion.lib" \) | head -1)"
+    SD_LIB="$(find "$SD_ROOT/sd-build" \( -name "libstable-diffusion.a" -o -name "stable-diffusion.lib" \) | head -1)"
     if [[ -z "$SD_LIB" ]]; then
         echo "error: stable-diffusion.cpp built but produced no static library" >&2
         exit 1

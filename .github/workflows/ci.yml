@@ -80,11 +80,7 @@ jobs:
       - name: Cache the ggml and stable-diffusion.cpp build
         uses: actions/cache@v4
         with:
-          path: |
-            target/sd-prefix
-            target/ggml-build
-            target/sd-build
-            target/stable-diffusion.cpp
+          path: .sd-cpp
           key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
 
       - name: build
@@ -114,11 +110,7 @@ jobs:
       - name: Cache the ggml and stable-diffusion.cpp build
         uses: actions/cache@v4
         with:
-          path: |
-            target/sd-prefix
-            target/ggml-build
-            target/sd-build
-            target/stable-diffusion.cpp
+          path: .sd-cpp
           key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
 
       # bash on Windows too: the script is bash, and the runners have git-bash.

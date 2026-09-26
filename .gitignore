@@ -5,3 +5,6 @@ offgrid-image-probe.png
 
 # Reference images dropped in for a look; not part of the app.
 refs/
+
+# ggml and stable-diffusion.cpp, built outside cargo for the images feature.
+/.sd-cpp
