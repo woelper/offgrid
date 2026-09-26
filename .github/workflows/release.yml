@@ -40,6 +40,13 @@ jobs:
           - os: windows-2022
             target: windows-x86_64-cuda
             features: cuda
+          # Image generation. Linux only for now: the build script is bash and
+          # has only run there, and on macOS the shared ggml would have to be
+          # built with Metal or the same binary would lose GPU acceleration for
+          # chat — a worse trade than not shipping the artifact.
+          - os: ubuntu-latest
+            target: linux-x86_64-images
+            features: images
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -85,14 +92,23 @@ jobs:
             # runner's own core count. See .github/actions/setup-cuda.
             export NUM_JOBS=4
           fi
-          if [ -n "${{ matrix.features }}" ]; then
-            cargo bundle --release --format deb --features "${{ matrix.features }}"
-          else
-            cargo bundle --release --format deb
-          fi
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist
-          cp target/release/bundle/deb/*.deb "dist/offgrid-${VERSION}-${{ matrix.target }}.deb"
+          if [ "${{ matrix.features }}" = "images" ]; then
+            # ggml and stable-diffusion.cpp are built outside cargo and shared
+            # with llama.cpp, so the script drives the build. Tarball only, and
+            # no .deb: this is exactly the command CI runs on every push, where
+            # cargo-bundle is not involved, and a release is a poor place to
+            # find out that it is.
+            ./scripts/images-build.sh build --release --features images
+          else
+            if [ -n "${{ matrix.features }}" ]; then
+              cargo bundle --release --format deb --features "${{ matrix.features }}"
+            else
+              cargo bundle --release --format deb
+            fi
+            cp target/release/bundle/deb/*.deb "dist/offgrid-${VERSION}-${{ matrix.target }}.deb"
+          fi
           tar -C target/release -czf "dist/offgrid-${VERSION}-${{ matrix.target }}.tar.gz" offgrid
 
       - name: Build (macOS)

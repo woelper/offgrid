@@ -220,8 +220,9 @@ in on macOS with or without this feature.
 ## Image generation
 
 Optional, and off by default: it needs the Vulkan-style build machinery all
-over again — cmake, a C++ toolchain — and most people want a chat client.
-Build it with the script rather than cargo directly:
+over again — cmake, a C++ toolchain — and most people want a chat client. The
+releases page carries a `-images` build for Linux; everywhere else, build it
+with the script rather than cargo directly:
 
 ```sh
 ./scripts/images-build.sh run --release --features images
