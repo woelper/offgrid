@@ -9,6 +9,10 @@ on:
       cuda:
         description: 'CUDA toolkit version for the cuda job'
         default: '12.9.1'
+      gpu:
+        description: 'Also build the Vulkan and CUDA jobs (hours, not minutes)'
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -133,7 +137,7 @@ jobs:
   # runners have no GPU, so nothing here exercises the offload at runtime —
   # that is what the layer-counting unit tests are for.
   vulkan:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
     strategy:
       fail-fast: false
       matrix:
@@ -169,7 +173,7 @@ jobs:
   # here exercises the offload at runtime — that is what the layer-counting
   # unit tests and a physical NVIDIA box are for.
   cuda:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.gpu
     # Capped, but generously: a cold Windows CUDA build ran well over two
     # hours before the architecture list was trimmed, and a wedged toolkit
     # installer must still fail the job instead of sitting on it.
