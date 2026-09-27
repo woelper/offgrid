@@ -37,6 +37,7 @@ mod ffi {
             diffusion_path: *const c_char,
             vae_path: *const c_char,
             llm_path: *const c_char,
+            llm_vision_path: *const c_char,
             n_threads: c_int,
             flash_attn: c_int,
             offload_to_cpu: c_int,
@@ -53,6 +54,10 @@ mod ffi {
             cfg: f32,
             seed: i64,
             sampler: c_int,
+            ref_pixels: *const c_uchar,
+            ref_width: c_int,
+            ref_height: c_int,
+            ref_channels: c_int,
             out_pixels: *mut *mut c_uchar,
             out_width: *mut c_int,
             out_height: *mut c_int,
@@ -115,6 +120,9 @@ pub enum Role {
     /// The text encoder, which for Z-Image is a Qwen3 4B — the same file
     /// offgrid's own model catalog offers for chat.
     Llm,
+    /// The text encoder's eyes: an mmproj file, without which a reference
+    /// image is simply ignored.
+    LlmVision,
 }
 
 pub struct ImageModel {
@@ -141,6 +149,9 @@ pub struct ImageModel {
     /// around 1024 and answer a small canvas with a lattice of unresolved
     /// patches rather than a picture.
     pub min_size: usize,
+    /// Whether the model can compose from a reference image — a photograph of
+    /// a product, say, kept recognisable in a scene the prompt describes.
+    pub reference: bool,
     /// Whether the model can be asked for a transparent background. Only
     /// Qwen-Image 2.1 can, and it is asked in the prompt rather than through a
     /// switch — see `transparent_prompt`.
@@ -169,16 +180,34 @@ impl ImageModel {
 
     /// Everything this model needs on disk, whether or not it is there yet.
     /// Quants of the same model share their VAE and text encoder, so switching
-    /// between them fetches only the part that differs.
+    /// between them fetches only the part that differs. The vision weights are
+    /// not counted: they are fetched the first time a reference image is used
+    /// and never otherwise, so folding them in would overstate the cost of
+    /// every ordinary prompt.
     pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
+        self.files
+            .iter()
+            .filter(|f| f.role != Role::LlmVision)
+            .map(|f| f.size)
+            .sum()
     }
 
     /// Bytes still to fetch before this model can run.
     pub fn missing_bytes(&self) -> u64 {
         self.files
             .iter()
-            .filter(|f| !local_path(f).exists())
+            .filter(|f| f.role != Role::LlmVision && !local_path(f).exists())
+            .map(|f| f.size)
+            .sum()
+    }
+
+    /// Bytes still to fetch before this model can take a reference image, for
+    /// the warning that has to appear before someone waits on a surprise
+    /// download.
+    pub fn missing_vision_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|f| f.role == Role::LlmVision && !local_path(f).exists())
             .map(|f| f.size)
             .sum()
     }
@@ -201,6 +230,7 @@ pub const MODELS: &[ImageModel] = &[
         min_size: 384,
         flash_attn: false,
         sampler: SAMPLER_DEFAULT,
+        reference: false,
         transparency: false,
         preview: (PREVIEW_PROJECTION, 1),
     },
@@ -236,6 +266,7 @@ pub const MODELS: &[ImageModel] = &[
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
+        reference: false,
         transparency: false,
         preview: (PREVIEW_PROJECTION, 1),
     },
@@ -269,6 +300,7 @@ pub const MODELS: &[ImageModel] = &[
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
+        reference: false,
         transparency: false,
         preview: (PREVIEW_PROJECTION, 1),
     },
@@ -298,6 +330,15 @@ pub const MODELS: &[ImageModel] = &[
                 size: 5_027_784_800,
                 role: Role::Llm,
             },
+            WeightFile {
+                // The text encoder's vision half, for composing from a
+                // reference image. Q8_0 rather than F16: it is the difference
+                // between 0.75 and 1.2 GB for weights that only look.
+                repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+                path: "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+                size: 752_289_728,
+                role: Role::LlmVision,
+            },
         ],
         // Guidance at 6.0 means two forwards a step, where Z-Image needs one:
         // twenty steps of an 8B model is why this wants better hardware. The
@@ -313,6 +354,7 @@ pub const MODELS: &[ImageModel] = &[
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_EULER,
+        reference: true,
         transparency: true,
         // Every fourth step: a VAE decode is not free, and at this model's
         // pace four steps is minutes of waiting to fill.
@@ -341,6 +383,15 @@ pub const MODELS: &[ImageModel] = &[
                 size: 5_027_784_800,
                 role: Role::Llm,
             },
+            WeightFile {
+                // The text encoder's vision half, for composing from a
+                // reference image. Q8_0 rather than F16: it is the difference
+                // between 0.75 and 1.2 GB for weights that only look.
+                repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+                path: "mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf",
+                size: 752_289_728,
+                role: Role::LlmVision,
+            },
         ],
         steps: 20,
         cfg: 6.0,
@@ -352,6 +403,7 @@ pub const MODELS: &[ImageModel] = &[
         min_size: 512,
         flash_attn: true,
         sampler: SAMPLER_EULER,
+        reference: true,
         transparency: true,
         // Every fourth step: a VAE decode is not free, and at this model's
         // pace four steps is minutes of waiting to fill.
@@ -477,7 +529,47 @@ pub enum ImageCmd {
         seed: u64,
         width: usize,
         height: usize,
+        /// A picture to compose from, for the models that can: the product in
+        /// the ad, rather than a product the model imagines. Shared rather
+        /// than copied — it is megabytes, and the UI keeps it to show a
+        /// thumbnail.
+        reference: Option<Arc<Reference>>,
     },
+}
+
+/// The longest side a reference image is kept at.
+const REFERENCE_MAX: u32 = 1024;
+
+/// A decoded reference image, in the form sd.cpp wants it: 8-bit RGB, no
+/// alpha. Sizing is the model's business — Qwen scales it to its own
+/// conditioning resolution.
+pub struct Reference {
+    pub width: usize,
+    pub height: usize,
+    /// `width * height * 3` bytes.
+    pub pixels: Vec<u8>,
+}
+
+/// Decode an image file into a reference. Accepts whatever the `image` crate
+/// is built for, which is PNG, JPEG and WebP: the formats a phone or a product
+/// shot arrives in.
+pub fn load_reference(path: &std::path::Path) -> Result<Reference, String> {
+    let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // A photograph off a phone is twelve megapixels, which is 36 MB of RGB to
+    // hold, hand to the worker and upload as a thumbnail — for a conditioning
+    // pass that works at a fraction of that anyway. Scale the long side down
+    // and let the model see a picture rather than a wallpaper.
+    let img = if img.width().max(img.height()) > REFERENCE_MAX {
+        img.resize(REFERENCE_MAX, REFERENCE_MAX, image::imageops::CatmullRom)
+    } else {
+        img
+    };
+    let rgb = img.to_rgb8();
+    Ok(Reference {
+        width: rgb.width() as usize,
+        height: rgb.height() as usize,
+        pixels: rgb.into_raw(),
+    })
 }
 
 pub enum ImageEvent {
@@ -654,7 +746,7 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
     // because two of these do not fit in RAM together.
     // The offload choice is baked into the context, so it is part of what
     // identifies the loaded model.
-    let mut loaded: Option<(usize, bool, Model)> = None;
+    let mut loaded: Option<(usize, bool, bool, Model)> = None;
 
     for cmd in cmd_rx {
         match cmd {
@@ -663,7 +755,7 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                 let result = MODELS
                     .get(model)
                     .ok_or_else(|| "no such model".to_string())
-                    .and_then(|spec| fetch_weights(spec, &tx, &stop));
+                    .and_then(|spec| fetch_weights(spec, false, &tx, &stop));
                 if let Err(e) = result {
                     let _ = tx.send(ImageEvent::Error(e));
                 }
@@ -677,15 +769,22 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                 seed,
                 width,
                 height,
+                reference,
             } => {
                 stop.store(false, Ordering::Relaxed);
                 let result = MODELS
                     .get(model)
                     .ok_or_else(|| "no such model".to_string())
                     .and_then(|spec| {
-                        fetch_weights(spec, &tx, &stop)?;
-                        let ctx = load(&mut loaded, model, spec, offload, &tx)?;
-                        generate(ctx, spec, &prompt, steps, seed, width, height, &stop, &tx)
+                        // The vision weights are only worth their 0.75 GB to
+                        // someone who actually hands the model a picture.
+                        let vision = reference.is_some() && spec.reference;
+                        fetch_weights(spec, vision, &tx, &stop)?;
+                        let ctx = load(&mut loaded, model, spec, offload, vision, &tx)?;
+                        let reference = vision.then_some(reference.as_deref()).flatten();
+                        generate(
+                            ctx, spec, &prompt, steps, seed, width, height, reference, &stop, &tx,
+                        )
                     });
                 if let Err(e) = result {
                     let _ = tx.send(ImageEvent::Error(e));
@@ -700,10 +799,14 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
 /// downloader the model tab uses.
 fn fetch_weights(
     spec: &ImageModel,
+    vision: bool,
     tx: &Sender<ImageEvent>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     for file in spec.files {
+        if file.role == Role::LlmVision && !vision {
+            continue;
+        }
         let dest = local_path(file);
         if dest.exists() {
             continue;
@@ -740,13 +843,17 @@ fn fetch_weights(
 }
 
 fn load<'a>(
-    loaded: &'a mut Option<(usize, bool, Model)>,
+    loaded: &'a mut Option<(usize, bool, bool, Model)>,
     index: usize,
     spec: &ImageModel,
     offload: bool,
+    vision: bool,
     tx: &Sender<ImageEvent>,
 ) -> Result<&'a Model, String> {
-    if loaded.as_ref().map(|(i, o, _)| (*i, *o)) != Some((index, offload)) {
+    // The vision weights are chosen when the context is built, so turning a
+    // reference image on or off costs a reload the same way switching models
+    // does.
+    if loaded.as_ref().map(|(i, o, v, _)| (*i, *o, *v)) != Some((index, offload, vision)) {
         // Free the old one before allocating the new: 4 GB each.
         *loaded = None;
         let _ = tx.send(ImageEvent::Note(format!("loading {}…", spec.name)));
@@ -756,6 +863,13 @@ fn load<'a>(
         let diffusion = cstr(spec.path_for(Role::Diffusion))?;
         let vae = cstr(spec.path_for(Role::Vae))?;
         let llm = cstr(spec.path_for(Role::Llm))?;
+        // Empty unless a reference image is in play: loading the vision half
+        // costs both the download and the memory.
+        let llm_vision = cstr(if vision {
+            spec.path_for(Role::LlmVision)
+        } else {
+            String::new()
+        })?;
         // Every logical core, unlike the LLM worker. Token generation is
         // memory-bound, so SMT siblings buy it nothing; diffusion is
         // convolution and compute-bound, and using them all was worth nearly a
@@ -773,6 +887,7 @@ fn load<'a>(
                 diffusion.as_ptr(),
                 vae.as_ptr(),
                 llm.as_ptr(),
+                llm_vision.as_ptr(),
                 threads,
                 spec.flash_attn as c_int,
                 offload as c_int,
@@ -784,11 +899,11 @@ fn load<'a>(
                 None => format!("could not load {}", spec.name),
             });
         }
-        *loaded = Some((index, offload, Model(ctx)));
+        *loaded = Some((index, offload, vision, Model(ctx)));
     }
     loaded
         .as_ref()
-        .map(|(_, _, model)| model)
+        .map(|(_, _, _, model)| model)
         .ok_or_else(|| "model vanished".to_string())
 }
 
@@ -801,6 +916,7 @@ fn generate(
     seed: u64,
     width: usize,
     height: usize,
+    reference: Option<&Reference>,
     stop: &AtomicBool,
     tx: &Sender<ImageEvent>,
 ) -> Result<(), String> {
@@ -843,6 +959,12 @@ fn generate(
             spec.cfg,
             seed as i64,
             spec.sampler as c_int,
+            // A null pointer is how the shim is told there is no reference;
+            // the pixels stay borrowed only for the duration of the call.
+            reference.map_or(std::ptr::null(), |r| r.pixels.as_ptr()),
+            reference.map_or(0, |r| r.width as c_int),
+            reference.map_or(0, |r| r.height as c_int),
+            3,
             &mut pixels,
             &mut out_width,
             &mut out_height,

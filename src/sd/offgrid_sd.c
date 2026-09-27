@@ -92,14 +92,16 @@ static const char *or_null(const char *s) {
 }
 
 void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
-                     const char *vae_path, const char *llm_path, int n_threads,
-                     int flash_attn, int offload_to_cpu) {
+                     const char *vae_path, const char *llm_path,
+                     const char *llm_vision_path, int n_threads, int flash_attn,
+                     int offload_to_cpu) {
     sd_ctx_params_t params;
     sd_ctx_params_init(&params);
     params.model_path = or_null(model_path);
     params.diffusion_model_path = or_null(diffusion_path);
     params.vae_path = or_null(vae_path);
     params.llm_path = or_null(llm_path);
+    params.llm_vision_path = or_null(llm_vision_path);
     params.n_threads = n_threads;
     /* Flash attention in the diffusion model: recommended for Z-Image, and
      * what the sd.cpp docs use in their own examples. */
@@ -127,8 +129,10 @@ void offgrid_sd_free(void *ctx) {
 
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, unsigned char **out_pixels,
-                        int *out_width, int *out_height, int *out_channels) {
+                        int64_t seed, int sampler, const unsigned char *ref_pixels,
+                        int ref_width, int ref_height, int ref_channels,
+                        unsigned char **out_pixels, int *out_width,
+                        int *out_height, int *out_channels) {
     if (!ctx || !out_pixels) {
         return 0;
     }
@@ -142,6 +146,17 @@ int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
     params.height = height;
     params.seed = seed;
     params.batch_count = 1;
+    /* The library reads the reference but does not take it: the buffer is the
+     * caller's and outlives this call. */
+    sd_image_t reference;
+    if (ref_pixels && ref_width > 0 && ref_height > 0) {
+        reference.width = (uint32_t)ref_width;
+        reference.height = (uint32_t)ref_height;
+        reference.channel = (uint32_t)ref_channels;
+        reference.data = (uint8_t *)ref_pixels;
+        params.ref_images = &reference;
+        params.ref_images_count = 1;
+    }
     params.sample_params.sample_steps = steps;
     params.sample_params.guidance.txt_cfg = cfg;
     if (sampler >= 0 && sampler < SAMPLE_METHOD_COUNT) {

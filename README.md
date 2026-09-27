@@ -251,6 +251,23 @@ of quantisations; quants of one model share their VAE and text encoder, so
 moving between them only fetches the part that differs. Z-Image's text encoder
 is a Qwen3 4B — the same model the chat catalog offers.
 
+Qwen-Image 2.1 can also take a reference picture and compose from it: hand it a
+photograph of a product and ask for "an advert with a man holding this bottle in
+a sunlit kitchen", and the bottle that comes out is yours rather than one the
+model invented. The dog from the table above, handed back as a reference with "a
+photograph of this dog wearing a red knitted scarf, sitting in a snowy park":
+
+| Reference | Result |
+|---|---|
+| ![the reference](assets/dog-z-image.png) | ![the result](assets/dog-scarf-reference.png) |
+
+The Images tab grows a Reference row for the models that can do it; looking at a
+picture needs the text encoder's vision half, a further 0.75 GB that is fetched
+the first time you use one and never otherwise. Expect it to be
+slow: the reference is denoised alongside the image rather than glanced at, so
+attention works over a much longer sequence and every step costs several times
+what a plain prompt does.
+
 Saved images carry their own recipe: the prompt, steps, CFG, seed, size and
 model go into the PNG as text chunks, in the form the diffusion tools have
 settled on, so a picture filed away still says what made it. (The three above

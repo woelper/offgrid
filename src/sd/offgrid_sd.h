@@ -30,9 +30,13 @@ typedef void (*offgrid_sd_preview_cb)(int width, int height, int channels,
  * as each is needed: the only way a 10 GB model runs on an 8 GB card. It is
  * what the sd-cli flag of that name does, expressed as a backend assignment.
  * On a CPU-only build it changes nothing, the weights already being in RAM. */
+/* llm_vision_path is the text encoder's vision weights (an mmproj file). They
+ * are what lets the model look at a reference image; without them a reference
+ * is ignored. NULL when there is none. */
 void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
-                     const char *vae_path, const char *llm_path, int n_threads,
-                     int flash_attn, int offload_to_cpu);
+                     const char *vae_path, const char *llm_path,
+                     const char *llm_vision_path, int n_threads, int flash_attn,
+                     int offload_to_cpu);
 void offgrid_sd_free(void *ctx);
 
 /* Ask a running generation to stop, or clear a stale request before starting
@@ -47,10 +51,15 @@ void offgrid_sd_cancel(void *ctx, int reset);
 /* sampler is sd.cpp's sample_method_t; -1 keeps the library's default. Models
  * are distilled for particular samplers — Qwen-Image wants euler — and the
  * wrong one produces noise rather than an error. */
+/* ref_pixels, when not NULL, is a reference image the model composes from —
+ * "an advert with a man holding this bottle" — as tightly packed rows of
+ * ref_channels bytes. Only some models can use one. */
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, unsigned char **out_pixels,
-                        int *out_width, int *out_height, int *out_channels);
+                        int64_t seed, int sampler, const unsigned char *ref_pixels,
+                        int ref_width, int ref_height, int ref_channels,
+                        unsigned char **out_pixels, int *out_width,
+                        int *out_height, int *out_channels);
 void offgrid_sd_free_buf(unsigned char *buf);
 
 /* Warnings and errors from sd.cpp, so a failure can say what went wrong

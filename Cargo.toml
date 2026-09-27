@@ -48,7 +48,10 @@ directories = "6.0.0"
 eframe = "0.35.0"
 egui_commonmark = "0.24.0"
 egui_extras = { version = "0.35", features = ["image", "syntect"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+# jpeg and webp are here for reference images: a product photograph arrives as
+# whatever the phone or the shop produced, and png alone would turn most of
+# them away.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Saving a generated image writes the prompt and settings into the file as PNG
 # text chunks, which the `image` crate has no way to express; png is already in
 # the tree underneath it.

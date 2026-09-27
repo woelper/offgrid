@@ -223,6 +223,12 @@ struct ImagesState {
     /// The image as it forms: width, height, channels, pixels.
     preview: Option<(usize, usize, usize, Vec<u8>)>,
     preview_texture: Option<egui::TextureHandle>,
+    /// A picture to compose from — the shampoo bottle the advert is about.
+    /// Shared with the worker rather than copied into every command.
+    reference: Option<std::sync::Arc<imagegen::Reference>>,
+    /// What to call it in the UI, and the texture for its thumbnail.
+    reference_name: String,
+    reference_texture: Option<egui::TextureHandle>,
     /// When the first step landed. Loading the model dominates the first
     /// minute, so steps have to be timed from their own start for an estimate
     /// to mean anything.
@@ -252,6 +258,9 @@ impl Default for ImagesState {
             shown: None,
             preview: None,
             preview_texture: None,
+            reference: None,
+            reference_name: String::new(),
+            reference_texture: None,
             first_step: None,
         }
     }
@@ -916,6 +925,9 @@ impl OffgridApp {
                             .desired_width(f32::INFINITY)
                             .hint_text("a rusty robot walking on a sandy beach"),
                     );
+                    if imagegen::MODELS[self.images.model].reference {
+                        self.reference_ui(ui);
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Steps:");
                         ui.add(egui::Slider::new(&mut self.images.steps, 1..=50));
@@ -1218,6 +1230,79 @@ impl OffgridApp {
         }
     }
 
+    /// The reference-image row: pick a picture the model composes from, keep a
+    /// thumbnail of it, drop it again. Only drawn for models that can use one.
+    #[cfg(feature = "images")]
+    fn reference_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Reference:");
+            if self.images.reference.is_some() {
+                // A thumbnail rather than the filename alone: the whole point
+                // of the feature is that this exact object comes out the other
+                // end, and it is worth seeing which one was picked.
+                if let Some(reference) = self.images.reference.clone() {
+                    let texture = self.images.reference_texture.get_or_insert_with(|| {
+                        ui.ctx().load_texture(
+                            "image-reference",
+                            egui::ColorImage::from_rgb(
+                                [reference.width, reference.height],
+                                &reference.pixels,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    let scale = 48.0 / reference.height.max(1) as f32;
+                    ui.add(
+                        egui::Image::new(&*texture)
+                            .fit_to_exact_size(egui::vec2(reference.width as f32 * scale, 48.0))
+                            .corner_radius(theme::skin().border_radius),
+                    );
+                }
+                ui.weak(self.images.reference_name.clone());
+                if theme::button(ui, None, "Clear").clicked() {
+                    self.images.reference = None;
+                    self.images.reference_texture = None;
+                    self.images.reference_name.clear();
+                }
+            } else if theme::button(ui, None, "Choose image…").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                    .pick_file()
+            {
+                match imagegen::load_reference(&path) {
+                    Ok(reference) => {
+                        self.images.reference_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.images.reference = Some(std::sync::Arc::new(reference));
+                        self.images.reference_texture = None;
+                    }
+                    // The same banner a worker failure uses; `note` would not
+                    // do, being drawn only while a generation is running.
+                    Err(e) => self.last_error = Some(format!("image: {e}")),
+                }
+            }
+        });
+        if self.images.reference.is_some() {
+            ui.weak(
+                "The prompt describes the scene to put it in — \"a photograph of a man \
+                 holding this bottle in a sunlit kitchen\". The output keeps the size \
+                 chosen below, not the reference's. The reference is denoised alongside \
+                 the image rather than looked at once, so every step costs several times \
+                 what it would without one.",
+            );
+            let vision = imagegen::MODELS[self.images.model].missing_vision_bytes();
+            if vision > 0 && !self.images.busy {
+                ui.weak(format!(
+                    "Looking at a picture needs the text encoder's vision weights — {} \
+                     fetched the first time you generate with one.",
+                    fmt_bytes(vision)
+                ));
+            }
+        }
+    }
+
     #[cfg(feature = "images")]
     fn start_image(&mut self) {
         // Built before the worker is borrowed: it reads the rest of self.
@@ -1235,6 +1320,7 @@ impl OffgridApp {
             seed: self.images.seed,
             width,
             height,
+            reference: self.images.reference.clone(),
         };
         if worker.cmd_tx.send(cmd).is_ok() {
             self.images.busy = true;
