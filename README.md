@@ -261,12 +261,14 @@ photograph of this dog wearing a red knitted scarf, sitting in a snowy park":
 |---|---|
 | ![the reference](assets/dog-z-image.png) | ![the result](assets/dog-scarf-reference.png) |
 
-The Images tab grows a Reference row for the models that can do it; looking at a
-picture needs the text encoder's vision half, a further 0.75 GB that is fetched
-the first time you use one and never otherwise. Expect it to be
-slow: the reference is denoised alongside the image rather than glanced at, so
-attention works over a much longer sequence and every step costs several times
-what a plain prompt does.
+The Images tab grows a Reference row for the models that can do it, taking up to
+four pictures — the prompt refers to them by the position shown under each
+thumbnail, so "the bottle from the first picture on the shelf in the second"
+works. Looking at a picture needs the text encoder's vision half, a further
+0.75 GB that is fetched the first time you use one and never otherwise. Expect
+it to be slow: each reference is denoised alongside the image rather than
+glanced at, so attention works over a much longer sequence and every step costs
+several times what a plain prompt does.
 
 Saved images carry their own recipe: the prompt, steps, CFG, seed, size and
 model go into the PNG as text chunks, in the form the diffusion tools have

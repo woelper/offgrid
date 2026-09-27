@@ -31,6 +31,16 @@ mod ffi {
         data: *mut c_void,
     );
 
+    /// The shim's own four-field descriptor for an image handed to sd.cpp, not
+    /// one of the library's structs — see offgrid_sd.h.
+    #[repr(C)]
+    pub struct SdImage {
+        pub pixels: *const c_uchar,
+        pub width: c_int,
+        pub height: c_int,
+        pub channels: c_int,
+    }
+
     unsafe extern "C" {
         pub fn offgrid_sd_new(
             model_path: *const c_char,
@@ -54,10 +64,8 @@ mod ffi {
             cfg: f32,
             seed: i64,
             sampler: c_int,
-            ref_pixels: *const c_uchar,
-            ref_width: c_int,
-            ref_height: c_int,
-            ref_channels: c_int,
+            refs: *const SdImage,
+            ref_count: c_int,
             out_pixels: *mut *mut c_uchar,
             out_width: *mut c_int,
             out_height: *mut c_int,
@@ -529,16 +537,22 @@ pub enum ImageCmd {
         seed: u64,
         width: usize,
         height: usize,
-        /// A picture to compose from, for the models that can: the product in
-        /// the ad, rather than a product the model imagines. Shared rather
-        /// than copied — it is megabytes, and the UI keeps it to show a
-        /// thumbnail.
-        reference: Option<Arc<Reference>>,
+        /// Pictures to compose from, for the models that can: the product in
+        /// the ad, rather than a product the model imagines. In the order the
+        /// model sees them, which is the order a prompt naming two of them
+        /// refers to. Shared rather than copied — each is megabytes, and the
+        /// UI keeps them to show thumbnails.
+        references: Vec<Arc<Reference>>,
     },
 }
 
 /// The longest side a reference image is kept at.
 const REFERENCE_MAX: u32 = 1024;
+
+/// The most references one generation will take, matching OFFGRID_SD_MAX_REFS
+/// in the shim. Each one is denoised alongside the image, so this is a bound on
+/// patience as much as on an array.
+pub const REFERENCE_LIMIT: usize = 4;
 
 /// A decoded reference image, in the form sd.cpp wants it: 8-bit RGB, no
 /// alpha. Sizing is the model's business — Qwen scales it to its own
@@ -769,7 +783,7 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                 seed,
                 width,
                 height,
-                reference,
+                references,
             } => {
                 stop.store(false, Ordering::Relaxed);
                 let result = MODELS
@@ -778,12 +792,12 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                     .and_then(|spec| {
                         // The vision weights are only worth their 0.75 GB to
                         // someone who actually hands the model a picture.
-                        let vision = reference.is_some() && spec.reference;
+                        let vision = !references.is_empty() && spec.reference;
                         fetch_weights(spec, vision, &tx, &stop)?;
                         let ctx = load(&mut loaded, model, spec, offload, vision, &tx)?;
-                        let reference = vision.then_some(reference.as_deref()).flatten();
+                        let references: &[Arc<Reference>] = if vision { &references } else { &[] };
                         generate(
-                            ctx, spec, &prompt, steps, seed, width, height, reference, &stop, &tx,
+                            ctx, spec, &prompt, steps, seed, width, height, references, &stop, &tx,
                         )
                     });
                 if let Err(e) = result {
@@ -916,7 +930,7 @@ fn generate(
     seed: u64,
     width: usize,
     height: usize,
-    reference: Option<&Reference>,
+    references: &[Arc<Reference>],
     stop: &AtomicBool,
     tx: &Sender<ImageEvent>,
 ) -> Result<(), String> {
@@ -944,6 +958,19 @@ fn generate(
         ffi::offgrid_sd_set_preview(Some(on_preview), preview_mode, preview_interval, data);
     }
 
+    // Repacked into the shim's descriptor, capped where the shim caps it so
+    // the two never disagree about the size of that array.
+    let refs: Vec<ffi::SdImage> = references
+        .iter()
+        .take(REFERENCE_LIMIT)
+        .map(|r| ffi::SdImage {
+            pixels: r.pixels.as_ptr(),
+            width: r.width as c_int,
+            height: r.height as c_int,
+            channels: 3,
+        })
+        .collect();
+
     let mut pixels: *mut c_uchar = std::ptr::null_mut();
     // Filled by the shim — kept distinct from the requested size, which they
     // would otherwise shadow.
@@ -959,12 +986,11 @@ fn generate(
             spec.cfg,
             seed as i64,
             spec.sampler as c_int,
-            // A null pointer is how the shim is told there is no reference;
-            // the pixels stay borrowed only for the duration of the call.
-            reference.map_or(std::ptr::null(), |r| r.pixels.as_ptr()),
-            reference.map_or(0, |r| r.width as c_int),
-            reference.map_or(0, |r| r.height as c_int),
-            3,
+            // Borrowed for the duration of the call: `refs` points into
+            // `references`, which outlives it, and an empty slice gives the
+            // count of zero the shim reads as "no reference".
+            refs.as_ptr(),
+            refs.len() as c_int,
             &mut pixels,
             &mut out_width,
             &mut out_height,

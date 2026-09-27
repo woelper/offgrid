@@ -22,6 +22,22 @@ typedef void (*offgrid_sd_progress_cb)(int step, int steps, void *data);
 typedef void (*offgrid_sd_preview_cb)(int width, int height, int channels,
                                       const unsigned char *pixels, void *data);
 
+/* One image handed to the library: tightly packed rows of `channels` bytes,
+ * borrowed for the duration of the call. This is the shim's own struct, not one
+ * of sd.cpp's — it is four fields that will not move, unlike the parameter
+ * blocks the rest of this file exists to keep on the C side. */
+/* The most references one generation will take. Each is denoised alongside the
+ * image, so the cost climbs with every one — this is a bound on the array, and
+ * on how long anyone is willing to wait. */
+#define OFFGRID_SD_MAX_REFS 4
+
+typedef struct {
+    const unsigned char *pixels;
+    int width;
+    int height;
+    int channels;
+} offgrid_sd_image;
+
 /* Load a model. Either model_path names a single checkpoint (SD 1.5), or the
  * three split paths do (Z-Image and the other recent models ship the diffusion
  * model, the VAE and the text encoder separately). Pass NULL for what does not
@@ -51,13 +67,14 @@ void offgrid_sd_cancel(void *ctx, int reset);
 /* sampler is sd.cpp's sample_method_t; -1 keeps the library's default. Models
  * are distilled for particular samplers — Qwen-Image wants euler — and the
  * wrong one produces noise rather than an error. */
-/* ref_pixels, when not NULL, is a reference image the model composes from —
- * "an advert with a man holding this bottle" — as tightly packed rows of
- * ref_channels bytes. Only some models can use one. */
+/* refs is an array of ref_count reference images the model composes from — "an
+ * advert with a man holding this bottle", or with several, "put this bottle on
+ * that shelf". Order is the order the model sees them in, and the prompt refers
+ * to them by it. Pass NULL or 0 for none; only some models can use any. */
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, const unsigned char *ref_pixels,
-                        int ref_width, int ref_height, int ref_channels,
+                        int64_t seed, int sampler,
+                        const offgrid_sd_image *refs, int ref_count,
                         unsigned char **out_pixels, int *out_width,
                         int *out_height, int *out_channels);
 void offgrid_sd_free_buf(unsigned char *buf);

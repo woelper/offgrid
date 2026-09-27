@@ -183,6 +183,15 @@ fn centered(ui: &mut egui::Ui, width: f32, shadow: bool, add: impl FnOnce(&mut e
     });
 }
 
+/// A reference image as the tab holds it: the pixels the worker will be given,
+/// shared rather than copied, plus what to call it and its thumbnail.
+#[cfg(feature = "images")]
+struct ReferenceImage {
+    image: std::sync::Arc<imagegen::Reference>,
+    name: String,
+    texture: Option<egui::TextureHandle>,
+}
+
 /// How many generations a session keeps before the oldest falls off.
 #[cfg(feature = "images")]
 const HISTORY_LIMIT: usize = 24;
@@ -223,12 +232,10 @@ struct ImagesState {
     /// The image as it forms: width, height, channels, pixels.
     preview: Option<(usize, usize, usize, Vec<u8>)>,
     preview_texture: Option<egui::TextureHandle>,
-    /// A picture to compose from — the shampoo bottle the advert is about.
-    /// Shared with the worker rather than copied into every command.
-    reference: Option<std::sync::Arc<imagegen::Reference>>,
-    /// What to call it in the UI, and the texture for its thumbnail.
-    reference_name: String,
-    reference_texture: Option<egui::TextureHandle>,
+    /// Pictures to compose from — the shampoo bottle the advert is about, and
+    /// the shelf to stand it on. In the order the model sees them, which is
+    /// the order a prompt naming two of them refers to.
+    references: Vec<ReferenceImage>,
     /// When the first step landed. Loading the model dominates the first
     /// minute, so steps have to be timed from their own start for an estimate
     /// to mean anything.
@@ -258,9 +265,7 @@ impl Default for ImagesState {
             shown: None,
             preview: None,
             preview_texture: None,
-            reference: None,
-            reference_name: String::new(),
-            reference_texture: None,
+            references: Vec::new(),
             first_step: None,
         }
     }
@@ -1234,63 +1239,86 @@ impl OffgridApp {
     /// thumbnail of it, drop it again. Only drawn for models that can use one.
     #[cfg(feature = "images")]
     fn reference_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        let limit = imagegen::REFERENCE_LIMIT;
+        // Collected rather than acted on in the loop: removing an entry while
+        // iterating over it is the one thing this row must not do.
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
             ui.label("Reference:");
-            if self.images.reference.is_some() {
-                // A thumbnail rather than the filename alone: the whole point
-                // of the feature is that this exact object comes out the other
-                // end, and it is worth seeing which one was picked.
-                if let Some(reference) = self.images.reference.clone() {
-                    let texture = self.images.reference_texture.get_or_insert_with(|| {
+            for (i, reference) in self.images.references.iter_mut().enumerate() {
+                ui.vertical(|ui| {
+                    // A thumbnail rather than the filename alone: the whole
+                    // point of the feature is that these exact objects come
+                    // out the other end, and with several of them the order
+                    // is what the prompt refers to.
+                    let image = &reference.image;
+                    let texture = reference.texture.get_or_insert_with(|| {
                         ui.ctx().load_texture(
-                            "image-reference",
-                            egui::ColorImage::from_rgb(
-                                [reference.width, reference.height],
-                                &reference.pixels,
-                            ),
+                            format!("image-reference-{i}"),
+                            egui::ColorImage::from_rgb([image.width, image.height], &image.pixels),
                             egui::TextureOptions::LINEAR,
                         )
                     });
-                    let scale = 48.0 / reference.height.max(1) as f32;
+                    let scale = 48.0 / image.height.max(1) as f32;
                     ui.add(
                         egui::Image::new(&*texture)
-                            .fit_to_exact_size(egui::vec2(reference.width as f32 * scale, 48.0))
+                            .fit_to_exact_size(egui::vec2(image.width as f32 * scale, 48.0))
                             .corner_radius(theme::skin().border_radius),
-                    );
-                }
-                ui.weak(self.images.reference_name.clone());
-                if theme::button(ui, None, "Clear").clicked() {
-                    self.images.reference = None;
-                    self.images.reference_texture = None;
-                    self.images.reference_name.clear();
-                }
-            } else if theme::button(ui, None, "Choose image…").clicked()
-                && let Some(path) = rfd::FileDialog::new()
+                    )
+                    .on_hover_text(&reference.name);
+                    ui.horizontal(|ui| {
+                        // The position, because the prompt refers to it: "the
+                        // bottle in the first picture, on the shelf in the
+                        // second".
+                        ui.weak(format!("{}.", i + 1));
+                        if theme::button(ui, None, "✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if self.images.references.len() < limit
+                && theme::button(ui, None, "Add image…").clicked()
+                && let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-                    .pick_file()
+                    .pick_files()
             {
-                match imagegen::load_reference(&path) {
-                    Ok(reference) => {
-                        self.images.reference_name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        self.images.reference = Some(std::sync::Arc::new(reference));
-                        self.images.reference_texture = None;
+                for path in paths {
+                    if self.images.references.len() >= limit {
+                        break;
                     }
-                    // The same banner a worker failure uses; `note` would not
-                    // do, being drawn only while a generation is running.
-                    Err(e) => self.last_error = Some(format!("image: {e}")),
+                    match imagegen::load_reference(&path) {
+                        Ok(image) => self.images.references.push(ReferenceImage {
+                            image: std::sync::Arc::new(image),
+                            name: path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            texture: None,
+                        }),
+                        // The same banner a worker failure uses; `note` would
+                        // not do, being drawn only while a generation runs.
+                        Err(e) => self.last_error = Some(format!("image: {e}")),
+                    }
                 }
             }
         });
-        if self.images.reference.is_some() {
+        if let Some(i) = remove {
+            self.images.references.remove(i);
+            // The textures are keyed by position, so everything after the gap
+            // is now pointing at its neighbour's picture.
+            for reference in &mut self.images.references[i..] {
+                reference.texture = None;
+            }
+        }
+        if !self.images.references.is_empty() {
             ui.weak(
-                "The prompt describes the scene to put it in — \"a photograph of a man \
-                 holding this bottle in a sunlit kitchen\". The output keeps the size \
-                 chosen below, not the reference's. The reference is denoised alongside \
-                 the image rather than looked at once, so every step costs several times \
-                 what it would without one.",
+                "The prompt describes the scene to put them in — \"a photograph of a man \
+                 holding this bottle in a sunlit kitchen\", or with several, \"put the \
+                 bottle from the first picture on the shelf in the second\". The output \
+                 keeps the size chosen below, not the references'. Each one is denoised \
+                 alongside the image rather than looked at once, so every step costs \
+                 several times what it would without them.",
             );
             let vision = imagegen::MODELS[self.images.model].missing_vision_bytes();
             if vision > 0 && !self.images.busy {
@@ -1320,7 +1348,12 @@ impl OffgridApp {
             seed: self.images.seed,
             width,
             height,
-            reference: self.images.reference.clone(),
+            references: self
+                .images
+                .references
+                .iter()
+                .map(|r| r.image.clone())
+                .collect(),
         };
         if worker.cmd_tx.send(cmd).is_ok() {
             self.images.busy = true;

@@ -129,8 +129,8 @@ void offgrid_sd_free(void *ctx) {
 
 int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
                         int steps, int width, int height, float cfg,
-                        int64_t seed, int sampler, const unsigned char *ref_pixels,
-                        int ref_width, int ref_height, int ref_channels,
+                        int64_t seed, int sampler,
+                        const offgrid_sd_image *refs, int ref_count,
                         unsigned char **out_pixels, int *out_width,
                         int *out_height, int *out_channels) {
     if (!ctx || !out_pixels) {
@@ -146,16 +146,31 @@ int offgrid_sd_generate(void *ctx, const char *prompt, const char *negative,
     params.height = height;
     params.seed = seed;
     params.batch_count = 1;
-    /* The library reads the reference but does not take it: the buffer is the
-     * caller's and outlives this call. */
-    sd_image_t reference;
-    if (ref_pixels && ref_width > 0 && ref_height > 0) {
-        reference.width = (uint32_t)ref_width;
-        reference.height = (uint32_t)ref_height;
-        reference.channel = (uint32_t)ref_channels;
-        reference.data = (uint8_t *)ref_pixels;
-        params.ref_images = &reference;
-        params.ref_images_count = 1;
+    /* sd_image_t is laid out differently from our own descriptor, so the
+     * references are repacked here. The library reads the pixels but does not
+     * take them: the buffers are the caller's and outlive this call. The cap is
+     * this array, not the library — a request for more than it holds would
+     * otherwise scribble past the end. */
+    sd_image_t references[OFFGRID_SD_MAX_REFS];
+    if (refs && ref_count > 0) {
+        if (ref_count > OFFGRID_SD_MAX_REFS) {
+            ref_count = OFFGRID_SD_MAX_REFS;
+        }
+        int kept = 0;
+        for (int i = 0; i < ref_count; i++) {
+            if (!refs[i].pixels || refs[i].width <= 0 || refs[i].height <= 0) {
+                continue;
+            }
+            references[kept].width = (uint32_t)refs[i].width;
+            references[kept].height = (uint32_t)refs[i].height;
+            references[kept].channel = (uint32_t)refs[i].channels;
+            references[kept].data = (uint8_t *)refs[i].pixels;
+            kept++;
+        }
+        if (kept > 0) {
+            params.ref_images = references;
+            params.ref_images_count = kept;
+        }
     }
     params.sample_params.sample_steps = steps;
     params.sample_params.guidance.txt_cfg = cfg;

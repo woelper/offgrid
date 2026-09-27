@@ -292,20 +292,22 @@ fn image_probe(prompt: &str) {
     } else {
         prompt.to_string()
     };
-    // IMAGE_REF=<path> hands the model a picture to compose from, which is the
-    // only way to exercise reference images without a UI.
-    let reference = match std::env::var("IMAGE_REF") {
-        Ok(path) if !path.is_empty() => {
-            let reference = imagegen::load_reference(std::path::Path::new(&path))
+    // IMAGE_REF=<path>[:<path>…] hands the model pictures to compose from,
+    // which is the only way to exercise reference images without a UI.
+    let references: Vec<_> = std::env::var("IMAGE_REF")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .map(|path| {
+            let reference = imagegen::load_reference(std::path::Path::new(path))
                 .unwrap_or_else(|e| panic!("reference image: {e}"));
             println!(
                 "reference: {path} ({}x{})",
                 reference.width, reference.height
             );
-            Some(std::sync::Arc::new(reference))
-        }
-        _ => None,
-    };
+            std::sync::Arc::new(reference)
+        })
+        .collect();
     println!(
         "model: {}\nprompt: {prompt}\nsteps: {steps}\nsize: {width}x{height}",
         imagegen::MODELS[model].name
@@ -326,7 +328,7 @@ fn image_probe(prompt: &str) {
             seed: 42,
             width,
             height,
-            reference,
+            references,
         })
         .unwrap();
 
