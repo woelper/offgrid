@@ -313,6 +313,60 @@ pub const MODELS: &[ImageModel] = &[
         preview: (PREVIEW_PROJECTION, 1),
     },
     ImageModel {
+        name: "Mage-Flow-Edit-Turbo",
+        note: "2026, and the one to reach for: four steps rather than eight or \
+               twenty, good pictures from a plain prompt, and the only model \
+               here under 6 GB that can compose from a picture you give it.",
+        files: &[
+            WeightFile {
+                // Quantized for offgrid: upstream ships bf16 and int8 only,
+                // and the int8 variant needs a ggml patch this build does not
+                // have. Q5_K is the floor — see the repository for what 4-bit
+                // does to this transformer.
+                repo: "johnsor/Mage-Flow-Edit-Turbo-GGUF",
+                path: "mage-flow-edit-turbo-Q5_K.gguf",
+                size: 2_841_935_584,
+                role: Role::Diffusion,
+            },
+            WeightFile {
+                repo: "Comfy-Org/Mage-Flow",
+                path: "vae/mage_flow_vae_bf16.safetensors",
+                size: 345_053_056,
+                role: Role::Vae,
+            },
+            WeightFile {
+                // The 4B Qwen3-VL, against Qwen-Image 2.1's 8B: half the
+                // download and half the wait for the text encode.
+                repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                path: "Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+                size: 2_497_281_664,
+                role: Role::Llm,
+            },
+            WeightFile {
+                repo: "Qwen/Qwen3-VL-4B-Instruct-GGUF",
+                path: "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf",
+                size: 453_974_304,
+                role: Role::LlmVision,
+            },
+        ],
+        // Distilled for four steps at cfg 1, which is one forward a step
+        // rather than two. The base checkpoint wants thirty; these are the
+        // Turbo numbers and the wrong ones produce mush.
+        steps: 4,
+        cfg: 1.0,
+        native: 1024,
+        min_size: 512,
+        flash_attn: true,
+        sampler: SAMPLER_EULER,
+        reference: true,
+        // Untested here, and the model is not documented as doing it.
+        transparency: false,
+        // Its latents are 128-channel, which the cheap projection has no
+        // matrix for; a VAE decode is the only preview it can give. Every
+        // other step, because four steps is a short run to interrupt twice.
+        preview: (PREVIEW_VAE, 2),
+    },
+    ImageModel {
         name: "Qwen-Image 2.1",
         note: "2026, the newest of these. An order of magnitude slower than \
                SD 1.5 on a CPU, and the largest download — meant for a GPU \
