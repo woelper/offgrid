@@ -276,10 +276,24 @@ settled on, so a picture filed away still says what made it. (The three above
 do.)
 
 On a CPU this is minutes an image, not seconds; the tab shows measured seconds
-per step and what is left. A GPU build is where these models belong, and
-"Offload weights to RAM" is what lets one larger than VRAM run on a small
-card. `--image-probe "a prompt"` runs the whole thing without a display, with
-`IMAGE_MODEL`, `IMAGE_STEPS`, `IMAGE_SIZE` and `IMAGE_THREADS` to vary it.
+per step and what is left. The released `-images` builds are GPU-accelerated —
+Metal on macOS, Vulkan on Linux and Windows — and building it yourself picks
+Vulkan up automatically when `glslc` is on the PATH or `VULKAN_SDK` is set.
+`OFFGRID_IMAGES_GPU` overrides that: `none` for a CPU-only build, `vulkan` to
+fail rather than fall back silently.
+
+That acceleration is shared. One ggml serves both stable-diffusion.cpp and
+llama.cpp, so the backend it is built with is the backend chat gets too — which
+is why this matters even to someone who never opens the tab, and why a CPU-only
+images build would have been a downgrade rather than a sidegrade. Measured on a
+Ryzen 7 4800H with its integrated Vega: Stable Diffusion 1.5 at 512 px goes
+from 9.2 to 5.0 seconds a step, and a discrete card is a different league
+again. "Offload weights to RAM" is what lets a model larger than VRAM run on a
+small one.
+
+`--image-probe "a prompt"` runs the whole thing without a display, with
+`IMAGE_MODEL`, `IMAGE_STEPS`, `IMAGE_SIZE`, `IMAGE_THREADS` and `IMAGE_REF` to
+vary it.
 
 ## macOS releases
 

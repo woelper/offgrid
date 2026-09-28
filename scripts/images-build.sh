@@ -33,16 +33,48 @@ cmpath() {
     fi
 }
 
-# On macOS the shared ggml keeps Metal, or an images build would take GPU
-# acceleration away from chat in the same binary, which is a poor trade for a
-# feature you might never open. sd.cpp picks the backend up from the ggml it
-# links against, so it needs no flag of its own.
+# The shared ggml keeps whatever GPU backend the platform has, or an images
+# build would take acceleration away from chat in the same binary too — one
+# ggml serves both, so a CPU-only ggml means a CPU-only everything. sd.cpp and
+# llama.cpp both pick the backend up from the ggml they link against, so
+# neither needs a flag of its own.
+#
+# OFFGRID_IMAGES_GPU forces the choice: `none` for a CPU-only build, `vulkan`
+# to insist (and fail loudly if the SDK is missing) rather than quietly
+# falling back. The default detects.
 GGML_GPU=()
+GPU_TAG=cpu
+WANT="${OFFGRID_IMAGES_GPU:-auto}"
 if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
-    # BLAS off for the same reason llama-cpp-sys-2's own build script turns it
-    # off on Apple: ggml would enable it by default and the trimmed llama.cpp
-    # the crate vendors has no ggml-blas directory to build.
-    GGML_GPU=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=OFF)
+    if [[ "$WANT" != "none" ]]; then
+        # BLAS off for the same reason llama-cpp-sys-2's own build script turns
+        # it off on Apple: ggml would enable it by default and the trimmed
+        # llama.cpp the crate vendors has no ggml-blas directory to build.
+        GGML_GPU=(-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BLAS=OFF)
+        GPU_TAG=metal
+    fi
+elif [[ "$WANT" != "none" ]]; then
+    # Vulkan rather than CUDA: one backend for every vendor, and the only one
+    # that can be built on a runner without a card in it. glslc compiles the
+    # shaders and is the part that is actually missing when it is missing;
+    # VULKAN_SDK is how the Windows SDK announces itself.
+    if command -v glslc > /dev/null 2>&1 || [[ -n "${VULKAN_SDK:-}" ]]; then
+        GGML_GPU=(-DGGML_VULKAN=ON)
+        GPU_TAG=vulkan
+    elif [[ "$WANT" == "vulkan" ]]; then
+        echo "error: OFFGRID_IMAGES_GPU=vulkan but no glslc and no VULKAN_SDK" >&2
+        exit 1
+    fi
+fi
+echo "==> ggml backend: $GPU_TAG"
+
+# A prefix built for one backend is wrong for another, and the guards below
+# only ask whether the libraries exist. Without this, adding the Vulkan SDK to
+# a tree that has already been built once gets you a silently CPU-only binary.
+STAMP="$PREFIX/.offgrid-ggml-backend"
+if [[ -f "$STAMP" && "$(cat "$STAMP")" != "$GPU_TAG" ]]; then
+    echo "==> backend changed ($(cat "$STAMP") -> $GPU_TAG), rebuilding ggml and sd.cpp"
+    rm -rf "$PREFIX" "$SD_ROOT/ggml-build" "$SD_ROOT/sd-build"
 fi
 
 # llama.cpp's own ggml is the one to share: sd.cpp has an upstream-ggml mode
@@ -126,6 +158,9 @@ if ! ls "$PREFIX"/lib/libstable-diffusion.a "$PREFIX"/lib/stable-diffusion.lib >
     cp "$SD_LIB" "$PREFIX/lib/"
     cp "$SD_SRC/include/stable-diffusion.h" "$PREFIX/include/"
 fi
+
+mkdir -p "$PREFIX"
+printf '%s' "$GPU_TAG" > "$STAMP"
 
 echo "==> cargo $*"
 # CFLAGS/CXXFLAGS reach llama.cpp's own build through the cc crate, so its

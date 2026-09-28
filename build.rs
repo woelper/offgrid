@@ -10,6 +10,9 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=OFFGRID_SD_PREFIX");
+    // Declared unconditionally: a build without `images` never sets it, and
+    // an undeclared cfg is a warning wherever it is tested.
+    println!("cargo::rustc-check-cfg=cfg(ggml_gpu)");
     #[cfg(feature = "images")]
     images();
 }
@@ -76,6 +79,21 @@ fn images() {
         })
         .collect();
     backends.sort();
+    // Whether any of them is an accelerator, so the System panel can tell
+    // "no GPU in this machine" from "no GPU support in this build". An images
+    // build gets its backend from the shared ggml rather than a cargo
+    // feature, so the feature flags alone would call a Vulkan build CPU-only.
+    if backends
+        .iter()
+        .any(|b| matches!(b.as_str(), "ggml-vulkan" | "ggml-cuda" | "ggml-metal"))
+    {
+        println!("cargo:rustc-cfg=ggml_gpu");
+    }
+    // ggml-vulkan calls the Vulkan loader, which is a shared library on every
+    // platform — it is what finds the driver's ICD at runtime. ggml's own
+    // cmake links it, but nothing carries that over to a cargo build linking
+    // the static archive, and the failure is a page of undefined vk* symbols.
+    let vulkan = backends.iter().any(|b| b == "ggml-vulkan");
     libs.extend(backends);
     libs.push("ggml-base".to_string());
     for lib in &libs {
@@ -86,6 +104,18 @@ fn images() {
     // asking twice is harmless.
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if vulkan {
+        if os == "windows" {
+            // The SDK's import library, and the directory holding it: unlike
+            // unix there is no default search path that would find it.
+            if let Ok(sdk) = std::env::var("VULKAN_SDK") {
+                println!("cargo:rustc-link-search=native={sdk}/Lib");
+            }
+            println!("cargo:rustc-link-lib=dylib=vulkan-1");
+        } else {
+            println!("cargo:rustc-link-lib=dylib=vulkan");
+        }
+    }
     match (os.as_str(), env.as_str()) {
         ("macos", _) => {
             println!("cargo:rustc-link-lib=c++");

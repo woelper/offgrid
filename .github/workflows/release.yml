@@ -83,8 +83,15 @@ jobs:
       # the plain builds exactly as they were.
       # ggml compiles its Vulkan shaders with glslc at build time, so the SDK
       # has to be there before cargo runs — the runtime loader is not enough.
+      #
+      # The images builds want it too, on the platforms that have no backend
+      # of their own: one ggml serves both sd.cpp and llama.cpp, so a CPU-only
+      # ggml would ship an images binary that is CPU-only for chat as well.
+      # macOS is excluded because the script gives it Metal instead.
       - uses: ./.github/actions/setup-vulkan
-        if: matrix.features == 'vulkan'
+        if: >-
+          matrix.features == 'vulkan' ||
+          (matrix.features == 'images' && runner.os != 'macOS')
 
       # nvcc compiles ggml's CUDA kernels at build time, so the toolkit has
       # to be there before cargo runs — the driver alone is not enough.
@@ -109,7 +116,11 @@ jobs:
             # no .deb: this is exactly the command CI runs on every push, where
             # cargo-bundle is not involved, and a release is a poor place to
             # find out that it is.
-            ./scripts/images-build.sh build --release --features images
+            #
+            # `vulkan`, not `auto`: a missing SDK should fail the release
+            # rather than quietly ship the CPU-only binary it would otherwise
+            # build, which nothing downstream would notice.
+            OFFGRID_IMAGES_GPU=vulkan ./scripts/images-build.sh build --release --features images
           else
             if [ -n "${{ matrix.features }}" ]; then
               cargo bundle --release --format deb --features "${{ matrix.features }}"
@@ -125,8 +136,8 @@ jobs:
         shell: bash
         run: |
           # The script builds the shared ggml — with Metal, so this binary
-          # keeps GPU acceleration for chat — then stable-diffusion.cpp against
-          # it, then calls cargo. A plain tarball rather than a signed .app,
+          # keeps GPU acceleration for both images and chat — then
+          # stable-diffusion.cpp against it, then calls cargo. A plain tarball rather than a signed .app,
           # because none of that goes through cargo-bundle.
           ./scripts/images-build.sh build --release --features images
           VERSION=${GITHUB_REF_NAME#v}
@@ -160,7 +171,9 @@ jobs:
           if [ "${{ matrix.features }}" = "images" ]; then
             # ggml and stable-diffusion.cpp are built outside cargo and shared
             # with llama.cpp; the script does that and then calls cargo.
-            ./scripts/images-build.sh build --release --features images
+            # Vulkan for the same reason as the Linux job: a silent fallback
+            # to CPU is the one outcome nobody would catch.
+            OFFGRID_IMAGES_GPU=vulkan ./scripts/images-build.sh build --release --features images
           elif [ -n "${{ matrix.features }}" ]; then
             cargo build --release --features "${{ matrix.features }}"
           else

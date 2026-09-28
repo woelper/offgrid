@@ -83,10 +83,19 @@ jobs:
           path: .sd-cpp
           key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
 
+      # CPU-only on purpose. The Vulkan backend is another several minutes of
+      # shader compilation, and this job runs on every push; what it is here
+      # to catch is the shim and the Rust side failing to compile, which the
+      # backend has no bearing on. `images-cross` and the release build the
+      # accelerated one.
       - name: build
+        env:
+          OFFGRID_IMAGES_GPU: none
         run: ./scripts/images-build.sh build --features images
 
       - name: clippy
+        env:
+          OFFGRID_IMAGES_GPU: none
         run: ./scripts/images-build.sh clippy --features images --all-targets -- -D warnings
 
   # macOS and Windows for the same feature, on demand rather than per push:
@@ -107,15 +116,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # macOS takes Metal from the script with no setup; Windows needs the
+      # SDK for glslc, and the action's CMAKE_GENERATOR=Ninja with it — the
+      # shader sub-build races under MSBuild, and the script's cmake calls
+      # read that variable like any other.
+      - uses: ./.github/actions/setup-vulkan
+        if: runner.os == 'Windows'
+
       - name: Cache the ggml and stable-diffusion.cpp build
         uses: actions/cache@v4
         with:
           path: .sd-cpp
-          key: sd-cpp-${{ runner.os }}-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
+          key: sd-cpp-${{ runner.os }}-gpu-${{ hashFiles('scripts/images-build.sh', 'Cargo.lock') }}
 
       # bash on Windows too: the script is bash, and the runners have git-bash.
       - name: build
         shell: bash
+        env:
+          OFFGRID_IMAGES_GPU: ${{ runner.os == 'Windows' && 'vulkan' || 'auto' }}
         run: ./scripts/images-build.sh build --release --features images
 
   # The GPU build compiles a whole second ggml backend and its shaders, which

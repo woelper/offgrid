@@ -293,7 +293,10 @@ impl HardwareProfile {
                 fmt_bytes(g.vram_total),
                 fmt_bytes(g.vram_free)
             ),
-            None if cfg!(any(feature = "vulkan", feature = "cuda")) => {
+            // `ggml_gpu` comes from build.rs, which knows what backends the
+            // shared ggml was built with: an images build takes its GPU from
+            // there rather than from a cargo feature.
+            None if cfg!(any(feature = "vulkan", feature = "cuda", ggml_gpu)) => {
                 "none found — running on the CPU (no GPU device)".into()
             }
             None => {
