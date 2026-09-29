@@ -66,6 +66,18 @@ elif [[ "$WANT" != "none" ]]; then
         exit 1
     fi
 fi
+# Under git-bash on Windows, cmake with the Ninja generator takes the first
+# compiler on PATH, and that is MinGW — which builds ggml into .a archives the
+# MSVC-targeting cargo build cannot link, and a vulkan-shaders-gen.exe that
+# dies at startup (0xc0000139) for want of its runtime DLLs. cmake-rs passes
+# the compiler explicitly for exactly this reason; calling cmake ourselves, we
+# have to. The Visual Studio generator would pick cl on its own, but ggml's
+# shader sub-build races under MSBuild, so Ninja it is.
+CC_ARGS=()
+if command -v cl > /dev/null 2>&1; then
+    CC_ARGS=(-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl)
+fi
+
 echo "==> ggml backend: $GPU_TAG"
 
 # A prefix built for one backend is wrong for another, and the guards below
@@ -128,7 +140,9 @@ fi
 # library's name.
 if ! ls "$PREFIX"/lib/libggml-base.a "$PREFIX"/lib/ggml-base.lib > /dev/null 2>&1; then
     echo "==> building ggml (shared by llama.cpp and stable-diffusion.cpp)"
-    cmake -S "$(cmpath "$LLAMA")" -B "$(cmpath "$SD_ROOT/ggml-build")" "${GGML_GPU[@]}" \
+    cmake -S "$(cmpath "$LLAMA")" -B "$(cmpath "$SD_ROOT/ggml-build")" \
+        ${GGML_GPU[@]+"${GGML_GPU[@]}"} \
+        ${CC_ARGS[@]+"${CC_ARGS[@]}"} \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$(cmpath "$PREFIX")" \
         -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -142,6 +156,7 @@ fi
 if ! ls "$PREFIX"/lib/libstable-diffusion.a "$PREFIX"/lib/stable-diffusion.lib > /dev/null 2>&1; then
     echo "==> building stable-diffusion.cpp against that ggml"
     cmake -S "$(cmpath "$SD_SRC")" -B "$(cmpath "$SD_ROOT/sd-build")" \
+        ${CC_ARGS[@]+"${CC_ARGS[@]}"} \
         -DCMAKE_BUILD_TYPE=Release \
         -DSD_USE_SYSTEM_GGML=ON -DSD_USE_UPSTREAM_GGML=ON \
         -DSD_GGML_SOURCE_DIR="$(cmpath "$LLAMA/ggml")" -DSD_BUILD_EXAMPLES=OFF \

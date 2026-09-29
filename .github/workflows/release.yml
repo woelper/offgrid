@@ -93,6 +93,14 @@ jobs:
           matrix.features == 'vulkan' ||
           (matrix.features == 'images' && runner.os != 'macOS')
 
+      # cl.exe and its INCLUDE/LIB on PATH. With CMAKE_GENERATOR=Ninja set
+      # above, cmake takes the first compiler it finds, and under git-bash
+      # that is MinGW: ggml then builds .a archives the MSVC cargo build
+      # cannot link, and a shader generator that cannot start. The `vulkan`
+      # job needs none of this because cmake-rs passes the compiler itself.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows' && matrix.features == 'images'
+
       # nvcc compiles ggml's CUDA kernels at build time, so the toolkit has
       # to be there before cargo runs — the driver alone is not enough.
       - uses: ./.github/actions/setup-cuda
