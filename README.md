@@ -291,6 +291,15 @@ from 9.2 to 5.0 seconds a step, and a discrete card is a different league
 again. "Offload weights to RAM" is what lets a model larger than VRAM run on a
 small one.
 
+Integrated graphics come with a caveat the number above hides. What the GPU may
+allocate is a BIOS setting, often 512 MB however much RAM the machine has, and
+the desktop is already using most of it — so the larger models do not fit and
+the measurement depends on what else is drawing. sd.cpp quietly puts the work
+back on the CPU when it is short, and when it cannot, offgrid catches the
+failure, rebuilds the context CPU-only and runs it again rather than handing
+back an error for something the CPU can do. Raising the UMA frame buffer in
+firmware is the real fix on such a machine.
+
 `--image-probe "a prompt"` runs the whole thing without a display, with
 `IMAGE_MODEL`, `IMAGE_STEPS`, `IMAGE_SIZE`, `IMAGE_THREADS` and `IMAGE_REF` to
 vary it.

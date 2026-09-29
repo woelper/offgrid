@@ -312,6 +312,17 @@ fn image_probe(prompt: &str) {
         "model: {}\nprompt: {prompt}\nsteps: {steps}\nsize: {width}x{height}",
         imagegen::MODELS[model].name
     );
+    // What the GPU decision is made on, since it is made silently otherwise.
+    match crate::hardware::gpu() {
+        Some(gpu) => println!(
+            "gpu: {} — {} free of {}, needs {}",
+            gpu.name,
+            crate::hardware::fmt_bytes(gpu.vram_free),
+            crate::hardware::fmt_bytes(gpu.vram_total),
+            crate::hardware::fmt_bytes(imagegen::device_memory_needed(width, height))
+        ),
+        None => println!("gpu: none"),
+    }
 
     let handle = imagegen::spawn_worker();
     handle

@@ -48,6 +48,7 @@ mod ffi {
             vae_path: *const c_char,
             llm_path: *const c_char,
             llm_vision_path: *const c_char,
+            backend: *const c_char,
             n_threads: c_int,
             flash_attn: c_int,
             offload_to_cpu: c_int,
@@ -600,6 +601,50 @@ pub enum ImageCmd {
     },
 }
 
+/// Whether this generation would ask the GPU for more memory than it has, and
+/// a line saying so. `None` means it fits, or that there is no GPU in play.
+///
+/// The check is in front rather than behind because a short GPU does not
+/// reliably fail. Below the line sd.cpp refuses and returns an error; just
+/// above it the allocation succeeds and the arithmetic quietly goes wrong,
+/// which arrives on screen as a field of confetti rather than a picture. A
+/// wrong answer that looks like an answer is the one outcome worth spending
+/// some speed to avoid, so the doubtful case goes to the CPU.
+fn gpu_shortfall(width: usize, height: usize) -> Option<String> {
+    let gpu = crate::hardware::gpu()?;
+    let need = device_memory_needed(width, height);
+    if gpu.vram_free >= need {
+        return None;
+    }
+    Some(format!(
+        "{} has {} free of {}, and this needs about {}. Running on the CPU instead: slower, but it will not produce a corrupted image.",
+        gpu.name,
+        crate::hardware::fmt_bytes(gpu.vram_free),
+        crate::hardware::fmt_bytes(gpu.vram_total),
+        crate::hardware::fmt_bytes(need),
+    ))
+}
+
+/// Device memory one generation wants, in bytes.
+///
+/// Two parts, both from sd.cpp's own accounting on this tree. It refused
+/// Mage-Flow with "need 663.90 MB device / 151.90 MB budget", where the budget
+/// is the diffusion model's compute buffer — so around half a gigabyte has to
+/// be resident whatever the model, and the buffer sits on top of it. The
+/// buffers were measured at 512 px across the catalog: 152 MB for Mage-Flow,
+/// 173 MB for Z-Image, 560 MB for Stable Diffusion 1.5. The largest is the one
+/// to size against, and it scales with the pixel count, because that is what
+/// the activations are made of.
+///
+/// Deliberately generous. Being wrong towards the CPU costs minutes; being
+/// wrong towards the GPU costs a picture that looks like an answer and is not.
+pub fn device_memory_needed(width: usize, height: usize) -> u64 {
+    const RESIDENT: u64 = 512 << 20;
+    const BUFFER_AT_512: u64 = 600 << 20;
+    let scale = (width * height) as f64 / (512.0 * 512.0);
+    RESIDENT + (BUFFER_AT_512 as f64 * scale) as u64
+}
+
 /// The longest side a reference image is kept at.
 const REFERENCE_MAX: u32 = 1024;
 
@@ -814,7 +859,7 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
     // because two of these do not fit in RAM together.
     // The offload choice is baked into the context, so it is part of what
     // identifies the loaded model.
-    let mut loaded: Option<(usize, bool, bool, Model)> = None;
+    let mut loaded: Option<(usize, bool, bool, bool, Model)> = None;
 
     for cmd in cmd_rx {
         match cmd {
@@ -848,8 +893,23 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                         // someone who actually hands the model a picture.
                         let vision = !references.is_empty() && spec.reference;
                         fetch_weights(spec, vision, &tx, &stop)?;
-                        let ctx = load(&mut loaded, model, spec, offload, vision, &tx)?;
                         let references: &[Arc<Reference>] = if vision { &references } else { &[] };
+                        // Decided before the model is loaded, not after it
+                        // fails. A GPU that is short of memory does not
+                        // reliably fail: below the line sd.cpp refuses, but
+                        // just above it the allocation succeeds and the
+                        // arithmetic quietly goes wrong, which reaches the
+                        // screen as a picture of confetti. There is no error
+                        // to react to, so the only honest place to decide is
+                        // in front.
+                        let cpu_only = match gpu_shortfall(width, height) {
+                            Some(note) => {
+                                let _ = tx.send(ImageEvent::Note(note));
+                                true
+                            }
+                            None => false,
+                        };
+                        let ctx = load(&mut loaded, model, spec, offload, vision, cpu_only, &tx)?;
                         generate(
                             ctx, spec, &prompt, steps, seed, width, height, references, &stop, &tx,
                         )
@@ -911,20 +971,27 @@ fn fetch_weights(
 }
 
 fn load<'a>(
-    loaded: &'a mut Option<(usize, bool, bool, Model)>,
+    loaded: &'a mut Option<(usize, bool, bool, bool, Model)>,
     index: usize,
     spec: &ImageModel,
     offload: bool,
     vision: bool,
+    cpu_only: bool,
     tx: &Sender<ImageEvent>,
 ) -> Result<&'a Model, String> {
-    // The vision weights are chosen when the context is built, so turning a
-    // reference image on or off costs a reload the same way switching models
-    // does.
-    if loaded.as_ref().map(|(i, o, v, _)| (*i, *o, *v)) != Some((index, offload, vision)) {
+    // The vision weights and the backend are both chosen when the context is
+    // built, so turning a reference image on or off — or falling back to the
+    // CPU — costs a reload the same way switching models does.
+    if loaded.as_ref().map(|(i, o, v, c, _)| (*i, *o, *v, *c))
+        != Some((index, offload, vision, cpu_only))
+    {
         // Free the old one before allocating the new: 4 GB each.
         *loaded = None;
-        let _ = tx.send(ImageEvent::Note(format!("loading {}…", spec.name)));
+        let _ = tx.send(ImageEvent::Note(if cpu_only {
+            format!("loading {} on the CPU…", spec.name)
+        } else {
+            format!("loading {}…", spec.name)
+        }));
         let cstr =
             |p: String| CString::new(p).map_err(|_| "a path contains a nul byte".to_string());
         let checkpoint = cstr(spec.path_for(Role::Checkpoint))?;
@@ -938,6 +1005,9 @@ fn load<'a>(
         } else {
             String::new()
         })?;
+        // Empty lets sd.cpp pick; "cpu" keeps this context off the accelerator
+        // without touching the one llama.cpp uses in the same process.
+        let backend = cstr(if cpu_only { "cpu" } else { "" }.to_string())?;
         // Every logical core, unlike the LLM worker. Token generation is
         // memory-bound, so SMT siblings buy it nothing; diffusion is
         // convolution and compute-bound, and using them all was worth nearly a
@@ -956,6 +1026,7 @@ fn load<'a>(
                 vae.as_ptr(),
                 llm.as_ptr(),
                 llm_vision.as_ptr(),
+                backend.as_ptr(),
                 threads,
                 spec.flash_attn as c_int,
                 offload as c_int,
@@ -967,11 +1038,11 @@ fn load<'a>(
                 None => format!("could not load {}", spec.name),
             });
         }
-        *loaded = Some((index, offload, vision, Model(ctx)));
+        *loaded = Some((index, offload, vision, cpu_only, Model(ctx)));
     }
     loaded
         .as_ref()
-        .map(|(_, _, _, model)| model)
+        .map(|(_, _, _, _, model)| model)
         .ok_or_else(|| "model vanished".to_string())
 }
 

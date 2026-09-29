@@ -973,33 +973,6 @@ impl OffgridApp {
                                     );
                                 }
                             });
-                        if w.min(h) < spec.min_size {
-                            ui.colored_label(
-                                theme::skin().bad,
-                                format!(
-                                    "{} was trained at {}px and needs at least {}px here",
-                                    spec.name, spec.native, spec.min_size
-                                ),
-                            );
-                        } else {
-                            // Measured against the smallest size this model can
-                            // use, not a fixed one: the cheapest usable size
-                            // differs per model, and a ratio against someone
-                            // else's baseline says nothing useful. Attention
-                            // costs the square of the latent area, so the wait
-                            // climbs faster than the pixels do.
-                            let base = spec.min_size * spec.min_size;
-                            let ratio = (w * h) as f32 / base as f32;
-                            if ratio > 1.01 {
-                                ui.weak(format!(
-                                    "{ratio:.1}× the pixels of {0} × {0}, and rather more than \
-                                     that in time",
-                                    spec.min_size
-                                ));
-                            }
-                        }
-                    });
-                    ui.horizontal(|ui| {
                         let ready = !self.images.busy && !self.images.prompt.trim().is_empty();
                         if ui
                             .add_enabled(ready, egui::Button::new("Generate"))
@@ -1032,6 +1005,57 @@ impl OffgridApp {
                             ui.weak(format!("last image: {took:.1}s"));
                         }
                     });
+                    // The notes belong under the row rather than in it: each
+                    // is a sentence, and a sentence beside a combo box pushes
+                    // the buttons off the edge of a narrow window.
+                    {
+                        let (w, h) = self.images.size;
+                        let spec = &imagegen::MODELS[self.images.model];
+                        if w.min(h) < spec.min_size {
+                            ui.colored_label(
+                                theme::skin().bad,
+                                format!(
+                                    "{} was trained at {}px and needs at least {}px here",
+                                    spec.name, spec.native, spec.min_size
+                                ),
+                            );
+                        } else {
+                            // Measured against the smallest size this model can
+                            // use, not a fixed one: the cheapest usable size
+                            // differs per model, and a ratio against someone
+                            // else's baseline says nothing useful. Attention
+                            // costs the square of the latent area, so the wait
+                            // climbs faster than the pixels do.
+                            let base = spec.min_size * spec.min_size;
+                            let ratio = (w * h) as f32 / base as f32;
+                            if ratio > 1.01 {
+                                ui.weak(format!(
+                                    "{ratio:.1}× the pixels of {0} × {0}, and rather more than \
+                                     that in time",
+                                    spec.min_size
+                                ));
+                            }
+                        }
+                    }
+                    // Said before Generate, not after: the GPU decision is
+                    // made on these numbers, and someone choosing a size
+                    // should see what it costs them.
+                    if let Some(gpu) = crate::hardware::gpu() {
+                        let (w, h) = self.images.size;
+                        let need = imagegen::device_memory_needed(w, h);
+                        if gpu.vram_free < need {
+                            ui.colored_label(
+                                theme::skin().bad,
+                                format!(
+                                    "{} has {} free and this size needs about {} — it will \
+                                     run on the CPU, which is slower but correct",
+                                    gpu.name,
+                                    fmt_bytes(gpu.vram_free),
+                                    fmt_bytes(need)
+                                ),
+                            );
+                        }
+                    }
                     let missing = imagegen::MODELS[self.images.model].missing_bytes();
                     if missing > 0 && !self.images.busy {
                         ui.weak(format!(

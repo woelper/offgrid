@@ -49,10 +49,14 @@ typedef struct {
 /* llm_vision_path is the text encoder's vision weights (an mmproj file). They
  * are what lets the model look at a reference image; without them a reference
  * is ignored. NULL when there is none. */
+/* backend names the runtime backend for the model's graphs — "cpu" to keep it
+ * off the accelerator entirely, NULL or "" to let sd.cpp choose. This is a
+ * property of the context, not the process, so forcing a generation onto the
+ * CPU leaves llama.cpp's GPU offload in the same binary alone. */
 void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
                      const char *vae_path, const char *llm_path,
-                     const char *llm_vision_path, int n_threads, int flash_attn,
-                     int offload_to_cpu);
+                     const char *llm_vision_path, const char *backend,
+                     int n_threads, int flash_attn, int offload_to_cpu);
 void offgrid_sd_free(void *ctx);
 
 /* Ask a running generation to stop, or clear a stale request before starting

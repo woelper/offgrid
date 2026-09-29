@@ -93,8 +93,8 @@ static const char *or_null(const char *s) {
 
 void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
                      const char *vae_path, const char *llm_path,
-                     const char *llm_vision_path, int n_threads, int flash_attn,
-                     int offload_to_cpu) {
+                     const char *llm_vision_path, const char *backend,
+                     int n_threads, int flash_attn, int offload_to_cpu) {
     sd_ctx_params_t params;
     sd_ctx_params_init(&params);
     params.model_path = or_null(model_path);
@@ -102,6 +102,7 @@ void *offgrid_sd_new(const char *model_path, const char *diffusion_path,
     params.vae_path = or_null(vae_path);
     params.llm_path = or_null(llm_path);
     params.llm_vision_path = or_null(llm_vision_path);
+    params.backend = or_null(backend);
     params.n_threads = n_threads;
     /* Flash attention in the diffusion model: recommended for Z-Image, and
      * what the sd.cpp docs use in their own examples. */

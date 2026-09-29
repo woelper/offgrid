@@ -78,6 +78,42 @@ pub fn gpu() -> Option<&'static Gpu> {
 /// Pick the best device ggml reports: a discrete GPU over an integrated one,
 /// and the roomiest when there are several. `None` when the build has no GPU
 /// backend (then ggml lists only the CPU) or the machine has no GPU.
+/// The real device-local VRAM on an amdgpu card, as (total, used).
+///
+/// Vulkan on an integrated Radeon reports the shared GTT pool — 15.9 GB on a
+/// machine whose BIOS gave the GPU 512 MB — and a caller sizing against that
+/// number will happily ask for memory the driver cannot give it. The kernel
+/// exposes the truth here. Linux and amdgpu only; elsewhere the reported
+/// figures are all there is.
+#[cfg(target_os = "linux")]
+fn amdgpu_vram() -> Option<(u64, u64)> {
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    std::fs::read_dir("/sys/class/drm")
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("card"))
+        .filter_map(|e| {
+            let dev = e.path().join("device");
+            let total = read(dev.join("mem_info_vram_total"))?;
+            let used = read(dev.join("mem_info_vram_used"))?;
+            (total > 0).then_some((total, used))
+        })
+        // The smallest is the integrated one where both are present, and it is
+        // the one whose budget is easy to overrun.
+        .min_by_key(|(total, _)| *total)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn amdgpu_vram() -> Option<(u64, u64)> {
+    None
+}
+
 fn detect_gpu() -> Option<Gpu> {
     use llama_cpp_2::{LlamaBackendDeviceType as Type, list_llama_ggml_backend_devices};
 
@@ -95,6 +131,18 @@ fn detect_gpu() -> Option<Gpu> {
             backend: d.backend,
             vram_total: d.memory_total as u64,
             vram_free: d.memory_free as u64,
+        })
+        .map(|mut gpu| {
+            // Only for the integrated case: a discrete card reports its own
+            // memory correctly, and there is nothing to correct.
+            if gpu.unified
+                && let Some((total, used)) = amdgpu_vram()
+                && total < gpu.vram_total
+            {
+                gpu.vram_total = total;
+                gpu.vram_free = total.saturating_sub(used);
+            }
+            gpu
         })
 }
 
