@@ -76,6 +76,14 @@ fi
 CC_ARGS=()
 if command -v cl > /dev/null 2>&1; then
     CC_ARGS=(-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl)
+    # Git for Windows ships a coreutils `link.exe` in its /usr/bin, and under
+    # git-bash that directory sits ahead of the MSVC tools, so rustc resolves
+    # the linker to a program that makes hard links and fails with "extra
+    # operand". Everything compiled and nothing linked. Putting the directory
+    # that holds cl.exe first fixes it for cmake and for the cargo run below,
+    # which inherits this PATH.
+    PATH="$(dirname "$(command -v cl)"):$PATH"
+    export PATH
 fi
 
 echo "==> ggml backend: $GPU_TAG"
