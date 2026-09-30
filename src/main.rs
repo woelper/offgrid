@@ -308,6 +308,7 @@ fn image_probe(prompt: &str) {
             std::sync::Arc::new(reference)
         })
         .collect();
+    let references_present = !references.is_empty();
     println!(
         "model: {}\nprompt: {prompt}\nsteps: {steps}\nsize: {width}x{height}",
         imagegen::MODELS[model].name
@@ -340,6 +341,18 @@ fn image_probe(prompt: &str) {
             width,
             height,
             references,
+            // IMAGE_REF_FIT=crop trims to fill; the default keeps all of it.
+            fit: match std::env::var("IMAGE_REF_FIT").as_deref() {
+                Ok("crop") => imagegen::RefFit::Crop,
+                _ => imagegen::RefFit::Letterbox,
+            },
+            // The reference figure when there is a reference, since that is
+            // the case the default is wrong for; IMAGE_CFG overrides either.
+            cfg: if references_present {
+                imagegen::MODELS[model].cfg_reference
+            } else {
+                imagegen::MODELS[model].cfg
+            },
         })
         .unwrap();
 

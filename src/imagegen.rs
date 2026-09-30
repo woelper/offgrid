@@ -180,6 +180,13 @@ pub struct ImageModel {
     /// measured from sd.cpp's own "compute buffer size" line. It scales with
     /// the pixel count, and the GPU decision is made against it.
     pub vram: u64,
+    /// Guidance to use when a reference image is in play, where the model has
+    /// to invent most of the picture against a reference that would otherwise
+    /// dominate it. A distilled checkpoint runs at 1.0 — no classifier-free
+    /// guidance at all, one forward a step — which is right for a plain prompt
+    /// and leaves invented content soft when there is a reference pulling the
+    /// other way. Costs a second forward pass a step.
+    pub cfg_reference: f32,
     /// Whether the model can compose from a reference image — a photograph of
     /// a product, say, kept recognisable in a scene the prompt describes.
     pub reference: bool,
@@ -278,6 +285,7 @@ pub const MODELS: &[ImageModel] = &[
         }],
         steps: 10,
         cfg: 7.5,
+        cfg_reference: 7.0,
         native: 512,
         min_size: 384,
         // 512 is what it knows. It holds at 768 and past that starts
@@ -318,6 +326,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        cfg_reference: 1.0,
         native: 1024,
         min_size: 512,
         // Native at 1024, and sd.cpp's own example runs it at 1024
@@ -356,6 +365,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 8,
         cfg: 1.0,
+        cfg_reference: 1.0,
         native: 1024,
         min_size: 512,
         // The quant changes the weights, not the geometry.
@@ -409,6 +419,7 @@ pub const MODELS: &[ImageModel] = &[
         // Turbo numbers and the wrong ones produce mush.
         steps: 4,
         cfg: 1.0,
+        cfg_reference: 3.0,
         native: 1024,
         min_size: 512,
         // "native-resolution": the upstream docs give 512 to 2048,
@@ -467,6 +478,7 @@ pub const MODELS: &[ImageModel] = &[
         // have not been judged here, only the plumbing.
         steps: 20,
         cfg: 6.0,
+        cfg_reference: 6.0,
         native: 1024,
         // 512 was the first size anyone produced a good picture at, once the
         // step count was right: the lattice that looked like a resolution
@@ -520,6 +532,7 @@ pub const MODELS: &[ImageModel] = &[
         ],
         steps: 20,
         cfg: 6.0,
+        cfg_reference: 6.0,
         native: 1024,
         // 512 was the first size anyone produced a good picture at, once the
         // step count was right: the lattice that looked like a resolution
@@ -663,6 +676,10 @@ pub enum ImageCmd {
         /// refers to. Shared rather than copied — each is megabytes, and the
         /// UI keeps them to show thumbnails.
         references: Vec<Arc<Reference>>,
+        /// How those references are made to fit the chosen output shape.
+        fit: RefFit,
+        /// Guidance scale, as chosen in the tab.
+        cfg: f32,
     },
 }
 
@@ -690,43 +707,10 @@ fn gpu_shortfall(spec: &ImageModel, width: usize, height: usize) -> Option<Strin
     ))
 }
 
-/// The output size to use for a reference of `ref_w` × `ref_h`, keeping the
-/// pixel budget the chosen size represents but taking the reference's shape.
-///
-/// sd.cpp resizes a reference to the output dimensions before encoding it —
-/// the mage_flow preset says so outright, "VAE input resized to target" — and
-/// that resize does not letterbox. Give a 3:4 photograph a square canvas and
-/// the man in it comes out wide, which is not a subtle degradation but the
-/// whole subject skewed. sd-cli never shows this because it defaults the
-/// output dimensions to the reference's own; we always pass explicit ones, so
-/// we have to do the same sum.
-///
-/// The budget is kept rather than the size, so choosing a larger size still
-/// means a larger picture, and the shape still follows the reference.
-pub fn fit_to_reference(
-    spec: &ImageModel,
-    width: usize,
-    height: usize,
-    ref_w: usize,
-    ref_h: usize,
-) -> (usize, usize) {
-    if ref_w == 0 || ref_h == 0 {
-        return (width, height);
-    }
-    let budget = (width * height) as f64;
-    let aspect = ref_w as f64 / ref_h as f64;
-    let w = (budget * aspect).sqrt();
-    let h = if aspect > 0.0 { budget / w } else { budget };
-    // The same 64 px grid `generate` rounds to, applied here so the number the
-    // user is told is the number that runs.
-    let snap = |n: f64| {
-        ((n / 64.0).round().max(1.0) as usize * 64).clamp(spec.min_size, spec.max_size) / 64 * 64
-    };
-    (snap(w), snap(h))
-}
-
-/// The longest side a reference image is kept at.
-const REFERENCE_MAX: u32 = 1024;
+/// The longest side a reference image is kept at on load. Matches the largest
+/// output any model here allows, so the one resample that matters is the one
+/// onto the output grid rather than this one.
+const REFERENCE_MAX: u32 = 2048;
 
 /// The most references one generation will take, matching OFFGRID_SD_MAX_REFS
 /// in the shim. Each one is denoised alongside the image, so this is a bound on
@@ -743,6 +727,141 @@ pub struct Reference {
     pub pixels: Vec<u8>,
 }
 
+/// How a reference of one shape is made to fit a canvas of another.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RefFit {
+    /// Scale the whole picture down until it fits, and pad the rest. Nothing
+    /// is lost and nothing is distorted; the cost is bands the model can see,
+    /// and a smaller subject.
+    #[default]
+    Letterbox,
+    /// Fill the canvas and trim what hangs over. Nothing is distorted either,
+    /// but a wide picture on a square canvas loses most of itself.
+    Crop,
+}
+
+impl RefFit {
+    pub const ALL: &'static [RefFit] = &[RefFit::Letterbox, RefFit::Crop];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            RefFit::Letterbox => "Fit whole picture",
+            RefFit::Crop => "Fill and crop",
+        }
+    }
+
+    pub fn hint(&self) -> &'static str {
+        match self {
+            RefFit::Letterbox => {
+                "Scales the reference to fit and pads the rest, so all of it is                  visible and in proportion. Best when the subject spans the frame."
+            }
+            RefFit::Crop => {
+                "Fills the canvas from the middle of the reference and trims the                  rest. Best when the subject is central and the frame is close to                  the output's shape."
+            }
+        }
+    }
+}
+
+/// The largest rectangle of a `src_w` × `src_h` picture that has the shape of
+/// an `out_w` × `out_h` canvas, centred: `(x, y, width, height)`.
+///
+/// The output keeps the size that was chosen; the reference is trimmed to suit
+/// it rather than stretched into it. What the picture depicts then arrives in
+/// its own proportions whatever shape it started as, which is the point — a
+/// knife photographed across a wide frame should look like that knife on a
+/// square canvas, not a shorter, fatter one.
+fn cover_crop(
+    src_w: usize,
+    src_h: usize,
+    out_w: usize,
+    out_h: usize,
+) -> (usize, usize, usize, usize) {
+    if src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0 {
+        return (0, 0, src_w, src_h);
+    }
+    // Compared as products rather than ratios: integers throughout, and no
+    // rounding to argue with.
+    if src_w * out_h > out_w * src_h {
+        // Wider than the canvas: take a full-height slice from the middle.
+        let w = (src_h * out_w / out_h).min(src_w);
+        ((src_w - w) / 2, 0, w, src_h)
+    } else {
+        // Taller than the canvas, or the same shape.
+        let h = (src_w * out_h / out_w).min(src_h);
+        (0, (src_h - h) / 2, src_w, h)
+    }
+}
+
+impl Reference {
+    /// The same picture on the output's grid: cropped to the canvas's shape,
+    /// then resampled with a filter that takes every source pixel into
+    /// account.
+    ///
+    /// sd.cpp resizes each reference to the output dimensions before encoding
+    /// it, and `sd::ops::interpolate` defaults to nearest-neighbour with
+    /// antialiasing off — `image.cpp` calls it with no mode. That both drops
+    /// pixels rather than averaging them, which lays a wavy moiré over any
+    /// detailed photograph, and stretches whatever shape it was given into
+    /// whatever shape was asked for. Handing it a reference already cropped
+    /// and scaled to the target leaves it nothing to do.
+    fn on_grid(&self, width: usize, height: usize, fit: RefFit) -> Reference {
+        let same = (self.width, self.height) == (width, height);
+        let buffer =
+            image::RgbImage::from_raw(self.width as u32, self.height as u32, self.pixels.clone());
+        // A buffer that disagrees with its own dimensions would be a bug here
+        // rather than bad input; pass it along and let sd.cpp do as it did.
+        let (Some(mut buffer), false) = (buffer, same) else {
+            return Reference {
+                width: self.width,
+                height: self.height,
+                pixels: self.pixels.clone(),
+            };
+        };
+        let out = match fit {
+            RefFit::Crop => {
+                let (x, y, w, h) = cover_crop(self.width, self.height, width, height);
+                let cropped =
+                    image::imageops::crop(&mut buffer, x as u32, y as u32, w as u32, h as u32)
+                        .to_image();
+                image::imageops::resize(
+                    &cropped,
+                    width as u32,
+                    height as u32,
+                    image::imageops::Lanczos3,
+                )
+            }
+            RefFit::Letterbox => {
+                // The whole picture, scaled until the tighter of the two edges
+                // meets the canvas, on a neutral field. Grey rather than black
+                // or white: it is the least like a subject, so the least
+                // likely to be taken for one.
+                let scale =
+                    (width as f64 / self.width as f64).min(height as f64 / self.height as f64);
+                let w = ((self.width as f64 * scale).round() as u32).clamp(1, width as u32);
+                let h = ((self.height as f64 * scale).round() as u32).clamp(1, height as u32);
+                let scaled = image::imageops::resize(&buffer, w, h, image::imageops::Lanczos3);
+                let mut canvas = image::RgbImage::from_pixel(
+                    width as u32,
+                    height as u32,
+                    image::Rgb([128, 128, 128]),
+                );
+                image::imageops::replace(
+                    &mut canvas,
+                    &scaled,
+                    ((width as u32 - w) / 2) as i64,
+                    ((height as u32 - h) / 2) as i64,
+                );
+                canvas
+            }
+        };
+        Reference {
+            width,
+            height,
+            pixels: out.into_raw(),
+        }
+    }
+}
+
 /// Decode an image file into a reference. Accepts whatever the `image` crate
 /// is built for, which is PNG, JPEG and WebP: the formats a phone or a product
 /// shot arrives in.
@@ -753,7 +872,7 @@ pub fn load_reference(path: &std::path::Path) -> Result<Reference, String> {
     // pass that works at a fraction of that anyway. Scale the long side down
     // and let the model see a picture rather than a wallpaper.
     let img = if img.width().max(img.height()) > REFERENCE_MAX {
-        img.resize(REFERENCE_MAX, REFERENCE_MAX, image::imageops::CatmullRom)
+        img.resize(REFERENCE_MAX, REFERENCE_MAX, image::imageops::Lanczos3)
     } else {
         img
     };
@@ -963,6 +1082,8 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                 width,
                 height,
                 references,
+                fit,
+                cfg,
             } => {
                 stop.store(false, Ordering::Relaxed);
                 let result = MODELS
@@ -982,24 +1103,6 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                         // screen as a picture of confetti. There is no error
                         // to react to, so the only honest place to decide is
                         // in front.
-                        // The reference decides the shape; the size picker
-                        // decides how many pixels. Announced, because a
-                        // generation that quietly ignores the size you chose
-                        // is its own kind of surprise.
-                        let (width, height) = match references.first() {
-                            Some(r) => {
-                                let fitted =
-                                    fit_to_reference(spec, width, height, r.width, r.height);
-                                if fitted != (width, height) {
-                                    let _ = tx.send(ImageEvent::Note(format!(
-                                        "matching the reference's shape: {} × {}",
-                                        fitted.0, fitted.1
-                                    )));
-                                }
-                                fitted
-                            }
-                            None => (width, height),
-                        };
                         let cpu_only = match gpu_shortfall(spec, width, height) {
                             Some(note) => {
                                 let _ = tx.send(ImageEvent::Note(note));
@@ -1007,9 +1110,29 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                             }
                             None => false,
                         };
+                        // Onto the output grid before sd.cpp gets them, so
+                        // its nearest-neighbour resize has nothing to do.
+                        if fit == RefFit::Crop
+                            && let Some(r) = references.first()
+                        {
+                            let (_, _, cw, ch) = cover_crop(r.width, r.height, width, height);
+                            let kept = (cw * ch) as f32 / (r.width * r.height).max(1) as f32;
+                            if kept < 0.9 {
+                                let _ = tx.send(ImageEvent::Note(format!(
+                                    "cropping the reference to fit {width} × {height} — keeping \
+                                     {:.0}% of it; \"Fit whole picture\" keeps all of it",
+                                    kept * 100.0
+                                )));
+                            }
+                        }
+                        let fitted: Vec<Reference> = references
+                            .iter()
+                            .map(|r| r.on_grid(width, height, fit))
+                            .collect();
                         let ctx = load(&mut loaded, model, spec, offload, vision, cpu_only, &tx)?;
                         generate(
-                            ctx, spec, &prompt, steps, seed, width, height, references, &stop, &tx,
+                            ctx, spec, &prompt, steps, seed, cfg, width, height, &fitted, &stop,
+                            &tx,
                         )
                     });
                 if let Err(e) = result {
@@ -1151,9 +1274,10 @@ fn generate(
     prompt: &str,
     steps: usize,
     seed: u64,
+    cfg: f32,
     width: usize,
     height: usize,
-    references: &[Arc<Reference>],
+    references: &[Reference],
     stop: &AtomicBool,
     tx: &Sender<ImageEvent>,
 ) -> Result<(), String> {
@@ -1163,6 +1287,16 @@ fn generate(
     // below what three of them are native at.
     let round = |n: usize| (n.clamp(256, spec.max_size) / 64 * 64) as c_int;
     let (width, height) = (round(width), round(height));
+    // IMAGE_CFG overrides the model's own guidance scale. Turbo checkpoints are
+    // distilled for 1.0, which runs one forward a step and applies no
+    // classifier-free guidance at all — the prompt pulls only through the
+    // conditioning. Worth being able to vary while working out why a
+    // generation came out soft.
+    let cfg = std::env::var("IMAGE_CFG")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|c| *c > 0.0)
+        .unwrap_or(cfg);
     let prompt_c =
         CString::new(prompt).map_err(|_| "the prompt contains a nul byte".to_string())?;
     let negative = CString::new("").unwrap();
@@ -1208,7 +1342,7 @@ fn generate(
             steps as c_int,
             width,
             height,
-            spec.cfg,
+            cfg,
             seed as i64,
             spec.sampler as c_int,
             // Borrowed for the duration of the call: `refs` points into
@@ -1259,50 +1393,38 @@ fn generate(
 mod tests {
     use super::*;
 
-    fn mage() -> &'static ImageModel {
-        MODELS
-            .iter()
-            .find(|m| m.name == "Mage-Flow-Edit-Turbo")
-            .expect("Mage-Flow is in the catalog")
-    }
-
-    /// The bug this exists for: a portrait reference on a square canvas came
-    /// back stretched, because sd.cpp resizes the reference to the output
-    /// dimensions and does not letterbox.
+    /// The knife: a 771 x 247 reference on a square canvas came back squashed
+    /// to half its width, because sd.cpp resizes a reference to the output
+    /// dimensions and does not preserve its shape. Cropping is the answer the
+    /// output size gets to keep — the picture is trimmed, never stretched.
     #[test]
-    fn a_reference_decides_the_shape_and_the_size_picker_the_pixels() {
-        let spec = mage();
-        // 3:4 portrait, asked for at 1024 × 1024.
-        let (w, h) = fit_to_reference(spec, 1024, 1024, 768, 1024);
-        assert!(w < h, "a portrait reference should give a portrait canvas");
-        let asked = (1024 * 1024) as f64;
-        let got = (w * h) as f64;
-        assert!(
-            (got / asked - 1.0).abs() < 0.15,
-            "the pixel budget should survive: asked {asked}, got {got}"
-        );
-        assert_eq!((w % 64, h % 64), (0, 0), "both edges sit on the 64 px grid");
+    fn a_wide_reference_is_cropped_rather_than_squashed() {
+        let (x, y, w, h) = cover_crop(771, 247, 512, 512);
+        assert_eq!((w, h), (247, 247), "a square canvas takes a square piece");
+        assert_eq!(y, 0, "nothing to trim vertically");
+        assert_eq!(x, (771 - 247) / 2, "and the piece comes from the middle");
     }
 
     #[test]
-    fn a_square_reference_changes_nothing() {
-        let spec = mage();
-        assert_eq!(fit_to_reference(spec, 1024, 1024, 512, 512), (1024, 1024));
+    fn a_tall_reference_is_cropped_the_other_way() {
+        let (x, y, w, h) = cover_crop(400, 1000, 512, 512);
+        assert_eq!((w, h), (400, 400));
+        assert_eq!(x, 0);
+        assert_eq!(y, (1000 - 400) / 2);
     }
 
-    /// A panorama must not be allowed to talk the model past its range, nor a
-    /// sliver below the size it stops being coherent at.
+    /// A wide output wants a wide piece: the crop follows the size chosen in
+    /// the dropdown, not the reference.
     #[test]
-    fn the_models_own_limits_still_bound_the_result() {
-        let spec = mage();
-        let (w, h) = fit_to_reference(spec, 1024, 1024, 4000, 500);
-        assert!(w <= spec.max_size && h <= spec.max_size, "{w} × {h}");
-        assert!(w >= spec.min_size && h >= spec.min_size, "{w} × {h}");
+    fn the_crop_follows_the_chosen_size() {
+        let (_, _, w, h) = cover_crop(1000, 1000, 1536, 1024);
+        let want = 1536.0 / 1024.0;
+        let got = w as f32 / h as f32;
+        assert!((got / want - 1.0).abs() < 0.01, "{w} × {h} is not 3:2");
     }
 
     #[test]
-    fn a_degenerate_reference_is_left_alone() {
-        let spec = mage();
-        assert_eq!(fit_to_reference(spec, 768, 768, 0, 0), (768, 768));
+    fn a_reference_already_the_right_shape_is_left_whole() {
+        assert_eq!(cover_crop(800, 400, 1024, 512), (0, 0, 800, 400));
     }
 }

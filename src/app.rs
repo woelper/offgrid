@@ -211,6 +211,10 @@ struct ImagesState {
     offload: bool,
     prompt: String,
     steps: usize,
+    /// Guidance scale. Follows the model, and rises when a reference is added:
+    /// a distilled checkpoint's 1.0 leaves invented content soft when there is
+    /// a reference pulling against the prompt.
+    cfg: f32,
     seed: u64,
     /// Output size. Cost follows the pixel count, and past 512 SD 1.5 starts
     /// repeating subjects, so this is a short list rather than free numbers.
@@ -236,6 +240,8 @@ struct ImagesState {
     /// the shelf to stand it on. In the order the model sees them, which is
     /// the order a prompt naming two of them refers to.
     references: Vec<ReferenceImage>,
+    /// How a reference of one shape is made to fit a canvas of another.
+    reference_fit: imagegen::RefFit,
     /// When the first step landed. Loading the model dominates the first
     /// minute, so steps have to be timed from their own start for an estimate
     /// to mean anything.
@@ -254,6 +260,7 @@ impl Default for ImagesState {
             offload: true,
             prompt: String::new(),
             steps: imagegen::MODELS[0].steps,
+            cfg: imagegen::MODELS[0].cfg,
             seed: 42,
             size: imagegen::DEFAULT_SIZE,
             busy: false,
@@ -266,6 +273,7 @@ impl Default for ImagesState {
             preview: None,
             preview_texture: None,
             references: Vec::new(),
+            reference_fit: imagegen::RefFit::default(),
             first_step: None,
         }
     }
@@ -826,7 +834,7 @@ impl OffgridApp {
                             // own metadata reproduces the image.
                             prompt: self.image_prompt(),
                             steps: self.images.steps,
-                            cfg: spec.cfg,
+                            cfg: self.images.cfg,
                             seed: self.images.seed,
                             width,
                             height,
@@ -881,6 +889,11 @@ impl OffgridApp {
                                 // Each model is distilled for its own step
                                 // count, and the last one's is wrong here.
                                 self.images.steps = model.steps;
+                                self.images.cfg = if self.images.references.is_empty() {
+                                    model.cfg
+                                } else {
+                                    model.cfg_reference
+                                };
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -938,6 +951,11 @@ impl OffgridApp {
                         ui.add(egui::Slider::new(&mut self.images.steps, 1..=50));
                         ui.label("Seed:");
                         ui.add(egui::DragValue::new(&mut self.images.seed));
+                        ui.label("Guidance:");
+                        ui.add(egui::Slider::new(&mut self.images.cfg, 1.0..=10.0).step_by(0.5))
+                            .on_hover_text(
+                                "How hard the prompt pulls. 1.0 applies none at all and runs                                  one pass a step; above it, each step costs two. Distilled                                  models want 1.0 for a plain prompt, and more than that when                                  a reference image is competing with the prompt.",
+                            );
                     });
                     // Turning steps down is the obvious way to wait less, and
                     // on a model that is not distilled for it the result is not
@@ -1312,14 +1330,27 @@ impl OffgridApp {
                         break;
                     }
                     match imagegen::load_reference(&path) {
-                        Ok(image) => self.images.references.push(ReferenceImage {
-                            image: std::sync::Arc::new(image),
-                            name: path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                            texture: None,
-                        }),
+                        Ok(image) => {
+                            // The first reference changes what good guidance
+                            // is, and leaving it at a distilled 1.0 is how a
+                            // sharp model produces a soft picture. Only when
+                            // it is still the model's own default, so a value
+                            // chosen by hand is never overwritten.
+                            let spec = &imagegen::MODELS[self.images.model];
+                            if self.images.references.is_empty()
+                                && (self.images.cfg - spec.cfg).abs() < f32::EPSILON
+                            {
+                                self.images.cfg = spec.cfg_reference;
+                            }
+                            self.images.references.push(ReferenceImage {
+                                image: std::sync::Arc::new(image),
+                                name: path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                                texture: None,
+                            });
+                        }
                         // The same banner a worker failure uses; `note` would
                         // not do, being drawn only while a generation runs.
                         Err(e) => self.last_error = Some(format!("image: {e}")),
@@ -1336,6 +1367,19 @@ impl OffgridApp {
             }
         }
         if !self.images.references.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Fit:");
+                egui::ComboBox::from_id_salt("reference_fit")
+                    .selected_text(self.images.reference_fit.label())
+                    .show_ui(ui, |ui| {
+                        for fit in imagegen::RefFit::ALL {
+                            ui.selectable_value(&mut self.images.reference_fit, *fit, fit.label())
+                                .on_hover_text(fit.hint());
+                        }
+                    })
+                    .response
+                    .on_hover_text(self.images.reference_fit.hint());
+            });
             ui.weak(
                 "The prompt describes the scene to put them in — \"a photograph of a man \
                  holding this bottle in a sunlit kitchen\", or with several, \"put the \
@@ -1378,6 +1422,8 @@ impl OffgridApp {
                 .iter()
                 .map(|r| r.image.clone())
                 .collect(),
+            fit: self.images.reference_fit,
+            cfg: self.images.cfg,
         };
         if worker.cmd_tx.send(cmd).is_ok() {
             self.images.busy = true;
