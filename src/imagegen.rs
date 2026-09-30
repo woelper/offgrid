@@ -88,7 +88,18 @@ mod ffi {
 /// eight-fold downsampling requires. Deliberately bare: whether one of these
 /// is native, tolerable or too small is a property of the model selected, not
 /// of the number, so the labels are built per model by `size_label`.
-pub const SIZES: &[(usize, usize)] = &[(384, 384), (512, 512), (512, 768), (768, 512), (768, 768)];
+pub const SIZES: &[(usize, usize)] = &[
+    (384, 384),
+    (512, 512),
+    (512, 768),
+    (768, 512),
+    (768, 768),
+    (1024, 1024),
+    (1024, 1536),
+    (1536, 1024),
+    (1536, 1536),
+    (2048, 2048),
+];
 
 /// How a size reads for a given model: its own resolution, one it copes with,
 /// or one it will answer with a lattice of unresolved patches.
@@ -96,6 +107,8 @@ pub fn size_label(spec: &ImageModel, width: usize, height: usize) -> String {
     let size = format!("{width} × {height}");
     if width.min(height) < spec.min_size {
         format!("{size} — too small for this model")
+    } else if width.max(height) > spec.max_size {
+        format!("{size} — beyond this model's range")
     } else if (width, height) == (spec.native, spec.native) {
         format!("{size} — native")
     } else {
@@ -158,6 +171,15 @@ pub struct ImageModel {
     /// around 1024 and answer a small canvas with a lattice of unresolved
     /// patches rather than a picture.
     pub min_size: usize,
+    /// The largest edge this model is documented or observed to hold together
+    /// at. Past its training resolution a diffusion model does not simply blur
+    /// — it starts repeating the subject, because a canvas twice the size it
+    /// knows looks to it like room for two of them.
+    pub max_size: usize,
+    /// Device memory the diffusion model's compute buffer takes at 512 px,
+    /// measured from sd.cpp's own "compute buffer size" line. It scales with
+    /// the pixel count, and the GPU decision is made against it.
+    pub vram: u64,
     /// Whether the model can compose from a reference image — a photograph of
     /// a product, say, kept recognisable in a scene the prompt describes.
     pub reference: bool,
@@ -210,6 +232,27 @@ impl ImageModel {
             .sum()
     }
 
+    /// Device memory one generation on this model wants, in bytes.
+    ///
+    /// Two parts, both from sd.cpp's own accounting. It refused Mage-Flow with
+    /// "need 663.90 MB device / 151.90 MB budget", where the budget is exactly
+    /// that model's compute buffer — so around half a gigabyte has to be
+    /// resident whatever is running, and the buffer sits on top of it. The
+    /// buffer scales with the pixel count, because that is what the
+    /// activations are made of.
+    ///
+    /// This was a single constant for every model until resolution started to
+    /// matter. Sizing everything against Stable Diffusion 1.5, the heaviest of
+    /// them, puts a 2048 px generation at 9.6 GB — which would send an 8 GB
+    /// card to the CPU for a job that needs 2.4 GB. The newer models are three
+    /// to four times lighter here, and at high resolution that stops being a
+    /// rounding error.
+    pub fn device_memory_needed(&self, width: usize, height: usize) -> u64 {
+        const RESIDENT: u64 = 512 << 20;
+        let scale = (width * height) as f64 / (512.0 * 512.0);
+        RESIDENT + (self.vram as f64 * scale) as u64
+    }
+
     /// Bytes still to fetch before this model can take a reference image, for
     /// the warning that has to appear before someone waits on a surprise
     /// download.
@@ -237,6 +280,10 @@ pub const MODELS: &[ImageModel] = &[
         cfg: 7.5,
         native: 512,
         min_size: 384,
+        // 512 is what it knows. It holds at 768 and past that starts
+        // fitting two of the subject on the canvas rather than one.
+        max_size: 768,
+        vram: 559_900_000,
         flash_attn: false,
         sampler: SAMPLER_DEFAULT,
         reference: false,
@@ -273,6 +320,10 @@ pub const MODELS: &[ImageModel] = &[
         cfg: 1.0,
         native: 1024,
         min_size: 512,
+        // Native at 1024, and sd.cpp's own example runs it at 1024
+        // tall. 1536 is the edge of what has been seen to hold.
+        max_size: 1536,
+        vram: 173_310_000,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
         reference: false,
@@ -307,6 +358,9 @@ pub const MODELS: &[ImageModel] = &[
         cfg: 1.0,
         native: 1024,
         min_size: 512,
+        // The quant changes the weights, not the geometry.
+        max_size: 1536,
+        vram: 173_310_000,
         flash_attn: true,
         sampler: SAMPLER_DEFAULT,
         reference: false,
@@ -357,6 +411,10 @@ pub const MODELS: &[ImageModel] = &[
         cfg: 1.0,
         native: 1024,
         min_size: 512,
+        // "native-resolution": the upstream docs give 512 to 2048,
+        // in multiples of 16, which the 64 px rounding satisfies.
+        max_size: 2048,
+        vram: 151_740_000,
         flash_attn: true,
         sampler: SAMPLER_EULER,
         reference: true,
@@ -415,6 +473,10 @@ pub const MODELS: &[ImageModel] = &[
         // problem was eight steps on a twenty-step model. Below 512 it does
         // degrade, so the floor stays — one step lower than it was.
         min_size: 512,
+        // Native at 1024; sd.cpp asks only for multiples of 32 and
+        // picks the flow schedule from the resolution itself.
+        max_size: 1536,
+        vram: 227_430_000,
         flash_attn: true,
         sampler: SAMPLER_EULER,
         reference: true,
@@ -464,6 +526,9 @@ pub const MODELS: &[ImageModel] = &[
         // problem was eight steps on a twenty-step model. Below 512 it does
         // degrade, so the floor stays — one step lower than it was.
         min_size: 512,
+        // As the Q4_K above.
+        max_size: 1536,
+        vram: 227_430_000,
         flash_attn: true,
         sampler: SAMPLER_EULER,
         reference: true,
@@ -610,9 +675,9 @@ pub enum ImageCmd {
 /// which arrives on screen as a field of confetti rather than a picture. A
 /// wrong answer that looks like an answer is the one outcome worth spending
 /// some speed to avoid, so the doubtful case goes to the CPU.
-fn gpu_shortfall(width: usize, height: usize) -> Option<String> {
+fn gpu_shortfall(spec: &ImageModel, width: usize, height: usize) -> Option<String> {
     let gpu = crate::hardware::gpu()?;
-    let need = device_memory_needed(width, height);
+    let need = spec.device_memory_needed(width, height);
     if gpu.vram_free >= need {
         return None;
     }
@@ -625,24 +690,39 @@ fn gpu_shortfall(width: usize, height: usize) -> Option<String> {
     ))
 }
 
-/// Device memory one generation wants, in bytes.
+/// The output size to use for a reference of `ref_w` × `ref_h`, keeping the
+/// pixel budget the chosen size represents but taking the reference's shape.
 ///
-/// Two parts, both from sd.cpp's own accounting on this tree. It refused
-/// Mage-Flow with "need 663.90 MB device / 151.90 MB budget", where the budget
-/// is the diffusion model's compute buffer — so around half a gigabyte has to
-/// be resident whatever the model, and the buffer sits on top of it. The
-/// buffers were measured at 512 px across the catalog: 152 MB for Mage-Flow,
-/// 173 MB for Z-Image, 560 MB for Stable Diffusion 1.5. The largest is the one
-/// to size against, and it scales with the pixel count, because that is what
-/// the activations are made of.
+/// sd.cpp resizes a reference to the output dimensions before encoding it —
+/// the mage_flow preset says so outright, "VAE input resized to target" — and
+/// that resize does not letterbox. Give a 3:4 photograph a square canvas and
+/// the man in it comes out wide, which is not a subtle degradation but the
+/// whole subject skewed. sd-cli never shows this because it defaults the
+/// output dimensions to the reference's own; we always pass explicit ones, so
+/// we have to do the same sum.
 ///
-/// Deliberately generous. Being wrong towards the CPU costs minutes; being
-/// wrong towards the GPU costs a picture that looks like an answer and is not.
-pub fn device_memory_needed(width: usize, height: usize) -> u64 {
-    const RESIDENT: u64 = 512 << 20;
-    const BUFFER_AT_512: u64 = 600 << 20;
-    let scale = (width * height) as f64 / (512.0 * 512.0);
-    RESIDENT + (BUFFER_AT_512 as f64 * scale) as u64
+/// The budget is kept rather than the size, so choosing a larger size still
+/// means a larger picture, and the shape still follows the reference.
+pub fn fit_to_reference(
+    spec: &ImageModel,
+    width: usize,
+    height: usize,
+    ref_w: usize,
+    ref_h: usize,
+) -> (usize, usize) {
+    if ref_w == 0 || ref_h == 0 {
+        return (width, height);
+    }
+    let budget = (width * height) as f64;
+    let aspect = ref_w as f64 / ref_h as f64;
+    let w = (budget * aspect).sqrt();
+    let h = if aspect > 0.0 { budget / w } else { budget };
+    // The same 64 px grid `generate` rounds to, applied here so the number the
+    // user is told is the number that runs.
+    let snap = |n: f64| {
+        ((n / 64.0).round().max(1.0) as usize * 64).clamp(spec.min_size, spec.max_size) / 64 * 64
+    };
+    (snap(w), snap(h))
 }
 
 /// The longest side a reference image is kept at.
@@ -902,7 +982,25 @@ fn worker(cmd_rx: Receiver<ImageCmd>, tx: Sender<ImageEvent>, stop: Arc<AtomicBo
                         // screen as a picture of confetti. There is no error
                         // to react to, so the only honest place to decide is
                         // in front.
-                        let cpu_only = match gpu_shortfall(width, height) {
+                        // The reference decides the shape; the size picker
+                        // decides how many pixels. Announced, because a
+                        // generation that quietly ignores the size you chose
+                        // is its own kind of surprise.
+                        let (width, height) = match references.first() {
+                            Some(r) => {
+                                let fitted =
+                                    fit_to_reference(spec, width, height, r.width, r.height);
+                                if fitted != (width, height) {
+                                    let _ = tx.send(ImageEvent::Note(format!(
+                                        "matching the reference's shape: {} × {}",
+                                        fitted.0, fitted.1
+                                    )));
+                                }
+                                fitted
+                            }
+                            None => (width, height),
+                        };
+                        let cpu_only = match gpu_shortfall(spec, width, height) {
                             Some(note) => {
                                 let _ = tx.send(ImageEvent::Note(note));
                                 true
@@ -1060,8 +1158,10 @@ fn generate(
     tx: &Sender<ImageEvent>,
 ) -> Result<(), String> {
     // A size the UNet cannot halve three times over produces garbage rather
-    // than an error, so round rather than trust the caller.
-    let round = |n: usize| (n.clamp(256, 1024) / 64 * 64) as c_int;
+    // than an error, so round rather than trust the caller. The ceiling is the
+    // model's own: 1024 was a single constant covering every model, and it sat
+    // below what three of them are native at.
+    let round = |n: usize| (n.clamp(256, spec.max_size) / 64 * 64) as c_int;
     let (width, height) = (round(width), round(height));
     let prompt_c =
         CString::new(prompt).map_err(|_| "the prompt contains a nul byte".to_string())?;
@@ -1153,4 +1253,56 @@ fn generate(
         pixels: copied,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mage() -> &'static ImageModel {
+        MODELS
+            .iter()
+            .find(|m| m.name == "Mage-Flow-Edit-Turbo")
+            .expect("Mage-Flow is in the catalog")
+    }
+
+    /// The bug this exists for: a portrait reference on a square canvas came
+    /// back stretched, because sd.cpp resizes the reference to the output
+    /// dimensions and does not letterbox.
+    #[test]
+    fn a_reference_decides_the_shape_and_the_size_picker_the_pixels() {
+        let spec = mage();
+        // 3:4 portrait, asked for at 1024 × 1024.
+        let (w, h) = fit_to_reference(spec, 1024, 1024, 768, 1024);
+        assert!(w < h, "a portrait reference should give a portrait canvas");
+        let asked = (1024 * 1024) as f64;
+        let got = (w * h) as f64;
+        assert!(
+            (got / asked - 1.0).abs() < 0.15,
+            "the pixel budget should survive: asked {asked}, got {got}"
+        );
+        assert_eq!((w % 64, h % 64), (0, 0), "both edges sit on the 64 px grid");
+    }
+
+    #[test]
+    fn a_square_reference_changes_nothing() {
+        let spec = mage();
+        assert_eq!(fit_to_reference(spec, 1024, 1024, 512, 512), (1024, 1024));
+    }
+
+    /// A panorama must not be allowed to talk the model past its range, nor a
+    /// sliver below the size it stops being coherent at.
+    #[test]
+    fn the_models_own_limits_still_bound_the_result() {
+        let spec = mage();
+        let (w, h) = fit_to_reference(spec, 1024, 1024, 4000, 500);
+        assert!(w <= spec.max_size && h <= spec.max_size, "{w} × {h}");
+        assert!(w >= spec.min_size && h >= spec.min_size, "{w} × {h}");
+    }
+
+    #[test]
+    fn a_degenerate_reference_is_left_alone() {
+        let spec = mage();
+        assert_eq!(fit_to_reference(spec, 768, 768, 0, 0), (768, 768));
+    }
 }

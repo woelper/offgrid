@@ -319,7 +319,7 @@ fn image_probe(prompt: &str) {
             gpu.name,
             crate::hardware::fmt_bytes(gpu.vram_free),
             crate::hardware::fmt_bytes(gpu.vram_total),
-            crate::hardware::fmt_bytes(imagegen::device_memory_needed(width, height))
+            crate::hardware::fmt_bytes(imagegen::MODELS[model].device_memory_needed(width, height))
         ),
         None => println!("gpu: none"),
     }

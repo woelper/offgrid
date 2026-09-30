@@ -1042,7 +1042,7 @@ impl OffgridApp {
                     // should see what it costs them.
                     if let Some(gpu) = crate::hardware::gpu() {
                         let (w, h) = self.images.size;
-                        let need = imagegen::device_memory_needed(w, h);
+                        let need = imagegen::MODELS[self.images.model].device_memory_needed(w, h);
                         if gpu.vram_free < need {
                             ui.colored_label(
                                 theme::skin().bad,
