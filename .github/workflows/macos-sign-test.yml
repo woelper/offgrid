@@ -1,0 +1,51 @@
+# Exercises the signing and notarisation path on demand, without a tag.
+#
+# Signing only ever runs during a release, which is the worst place to find
+# out that a keychain import or an Apple credential is wrong: the matrix is
+# nine jobs and over an hour, and the version number is already spent. This
+# builds the one bundle that gets signed and does nothing else.
+name: macOS signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: Submit to Apple and staple (slower; leave off to test signing alone)
+        type: boolean
+        default: true
+
+jobs:
+  sign:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build the bundle
+        run: cargo bundle --release
+
+      - uses: ./.github/actions/macos-sign
+        with:
+          app-path: target/release/bundle/osx/offgrid.app
+          certificate-p12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          notarize: ${{ inputs.notarize }}
+          team-id: ${{ secrets.MACOS_TEAM_ID }}
+          api-key-p8: ${{ secrets.MACOS_API_KEY_P8 }}
+          api-key-id: ${{ secrets.MACOS_API_KEY_ID }}
+          api-issuer-id: ${{ secrets.MACOS_API_ISSUER_ID }}
+
+      # What a person downloading it would get, so the result can be opened on
+      # a real machine rather than taken on trust from a green tick.
+      - name: Package
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent target/release/bundle/osx/offgrid.app dist/offgrid-signed.app.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offgrid-signed-app
+          path: dist/offgrid-signed.app.zip

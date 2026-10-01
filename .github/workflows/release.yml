@@ -157,12 +157,30 @@ jobs:
         shell: bash
         run: |
           cargo bundle --release
+
+      # Signs with the Developer ID certificate when one is configured, and
+      # falls back to the ad-hoc signature otherwise — without any signature
+      # at all, Apple Silicon calls the app "damaged" and refuses it.
+      - name: Sign and notarise (macOS)
+        if: runner.os == 'macOS' && matrix.features != 'images'
+        uses: ./.github/actions/macos-sign
+        with:
+          app-path: target/release/bundle/osx/offgrid.app
+          certificate-p12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          team-id: ${{ secrets.MACOS_TEAM_ID }}
+          api-key-p8: ${{ secrets.MACOS_API_KEY_P8 }}
+          api-key-id: ${{ secrets.MACOS_API_KEY_ID }}
+          api-issuer-id: ${{ secrets.MACOS_API_ISSUER_ID }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS' && matrix.features != 'images'
+        shell: bash
+        run: |
           VERSION=${GITHUB_REF_NAME#v}
           mkdir -p dist
-          # Ad-hoc signature: without any signature, Apple Silicon macOS
-          # refuses to launch the app and reports it as "damaged".
-          codesign --force --deep --sign - target/release/bundle/osx/offgrid.app
-          # ditto is Apple's archiver; it preserves bundle metadata that zip drops.
+          # ditto is Apple's archiver; it preserves bundle metadata that zip
+          # drops, including the stapled notarisation ticket.
           ditto -c -k --keepParent target/release/bundle/osx/offgrid.app \
             "dist/offgrid-${VERSION}-${{ matrix.target }}.app.zip"
 
