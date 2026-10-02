@@ -20,6 +20,14 @@ inputs:
   certificate-password:
     description: The password the .p12 was exported with.
     required: true
+  entitlements:
+    description: >
+      Entitlements plist for the outer bundle. The hardened runtime, which
+      notarisation requires, denies capabilities an app does not ask for — a
+      recorder signed without com.apple.security.device.audio-input
+      notarises cleanly and then cannot hear anything. Nested code is signed
+      without these; entitlements belong to the app.
+    default: ""
   identity:
     description: >
       Which identity to sign with, e.g. "Developer ID Application: Someone
@@ -62,6 +70,7 @@ runs:
         CERT_P12: ${{ inputs.certificate-p12 }}
         CERT_PASSWORD: ${{ inputs.certificate-password }}
         IDENTITY: ${{ inputs.identity }}
+        ENTITLEMENTS: ${{ inputs.entitlements }}
         NOTARIZE: ${{ inputs.notarize }}
         TEAM_ID: ${{ inputs.team-id }}
         APPLE_ID: ${{ inputs.apple-id }}
@@ -125,9 +134,22 @@ runs:
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$binary"
         done < <(find "$APP_PATH/Contents" \( -name "*.dylib" -o -name "*.so" -o -name "*.framework" \) -print 2>/dev/null)
 
+        ENTITLEMENT_ARGS=()
+        if [ -n "$ENTITLEMENTS" ]; then
+          if [ ! -f "$ENTITLEMENTS" ]; then
+            echo "::error::entitlements file $ENTITLEMENTS does not exist"
+            exit 1
+          fi
+          echo "entitlements: $ENTITLEMENTS"
+          ENTITLEMENT_ARGS=(--entitlements "$ENTITLEMENTS")
+        fi
         codesign --force --timestamp --options runtime \
+          ${ENTITLEMENT_ARGS[@]+"${ENTITLEMENT_ARGS[@]}"} \
           --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP_PATH"
         codesign --verify --strict --verbose=2 "$APP_PATH"
+        # Printed so a missing capability is visible here rather than as a
+        # feature that does nothing on a user's machine.
+        codesign --display --entitlements - --xml "$APP_PATH" 2>/dev/null | head -20 || true
 
         if [ "$NOTARIZE" != "true" ]; then
           echo "::notice::signed but not notarised — first open will still warn"
