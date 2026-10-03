@@ -13,6 +13,14 @@ on:
         description: Submit to Apple and staple (slower; leave off to test signing alone)
         type: boolean
         default: true
+      images:
+        description: >
+          Build the image-generation variant instead. Slower — ggml and
+          stable-diffusion.cpp are a ten-minute compile — but it is a
+          different bundle produced a different way, so a signature on the
+          plain one says nothing about it.
+        type: boolean
+        default: false
 
 jobs:
   sign:
@@ -26,7 +34,15 @@ jobs:
         run: cargo install cargo-bundle --locked
 
       - name: Build the bundle
-        run: cargo bundle --release
+        run: |
+          if [ "${{ inputs.images }}" = "true" ]; then
+            # The script builds the shared ggml and sd.cpp, then execs the
+            # cargo subcommand it was given — `bundle` here, so the images
+            # build produces the same .app the plain one does.
+            ./scripts/images-build.sh bundle --release --features images
+          else
+            cargo bundle --release
+          fi
 
       - uses: ./.github/actions/macos-sign
         with:

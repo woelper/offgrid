@@ -73,9 +73,12 @@ jobs:
       # cargo-bundle produces the .deb (Linux) and .app (macOS). Its Windows
       # (msi) support is still experimental, so Windows ships a plain zip.
       - name: Install cargo-bundle
-        # Not for the image builds: they ship a tarball and would otherwise
-        # spend two minutes compiling a tool they never call.
-        if: runner.os != 'Windows' && matrix.features != 'images'
+        # The Linux image build still ships a tarball and would spend two
+        # minutes compiling a tool it never calls; the macOS one wants a
+        # bundle like every other macOS artifact, so that it can be signed.
+        if: >-
+          runner.os != 'Windows' &&
+          (matrix.features != 'images' || runner.os == 'macOS')
         run: cargo install cargo-bundle
 
       # GPU toolkits live up here, before every build step: the Linux CUDA
@@ -145,12 +148,12 @@ jobs:
         run: |
           # The script builds the shared ggml — with Metal, so this binary
           # keeps GPU acceleration for both images and chat — then
-          # stable-diffusion.cpp against it, then calls cargo. A plain tarball rather than a signed .app,
-          # because none of that goes through cargo-bundle.
-          ./scripts/images-build.sh build --release --features images
-          VERSION=${GITHUB_REF_NAME#v}
-          mkdir -p dist
-          tar -C target/release -czf "dist/offgrid-${VERSION}-${{ matrix.target }}.tar.gz" offgrid
+          # stable-diffusion.cpp against it, then hands its arguments to
+          # cargo. `bundle` rather than `build`, because the script execs
+          # whatever cargo subcommand it is given, and this one needs the
+          # same .app treatment as every other macOS artifact: a tarballed
+          # binary cannot be signed into something Gatekeeper will open.
+          ./scripts/images-build.sh bundle --release --features images
 
       - name: Build (macOS)
         if: runner.os == 'macOS' && matrix.features != 'images'
@@ -162,7 +165,7 @@ jobs:
       # falls back to the ad-hoc signature otherwise — without any signature
       # at all, Apple Silicon calls the app "damaged" and refuses it.
       - name: Sign and notarise (macOS)
-        if: runner.os == 'macOS' && matrix.features != 'images'
+        if: runner.os == 'macOS'
         uses: ./.github/actions/macos-sign
         with:
           app-path: target/release/bundle/osx/offgrid.app
@@ -174,7 +177,7 @@ jobs:
           api-issuer-id: ${{ secrets.MACOS_API_ISSUER_ID }}
 
       - name: Package (macOS)
-        if: runner.os == 'macOS' && matrix.features != 'images'
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
