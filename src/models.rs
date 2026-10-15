@@ -1010,7 +1010,7 @@ mod tests {
     /// developer's box), and is a no-op elsewhere.
     #[test]
     fn kv_per_token_from_gguf_header() {
-        let dir = crate::config::models_dir();
+        let dir = crate::config::Config::load().models_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };

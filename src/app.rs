@@ -9,7 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agent::{self, AgentEvent, AgentRun};
 use crate::bridge;
-use crate::config::{Config, models_dir};
+use crate::config::{Config, default_models_dir};
 use crate::hardware::{self, HardwareProfile, fmt_bytes, fmt_bytes_precise};
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 #[cfg(feature = "images")]
@@ -374,7 +374,7 @@ impl OffgridApp {
         if let Some(stored) = &config.gpu_bandwidth {
             hardware.adopt_gpu_bandwidth(stored);
         }
-        let models_dir = models_dir();
+        let models_dir = config.models_dir();
         let _ = std::fs::create_dir_all(&models_dir);
         let (hub_tx, hub_rx) = std::sync::mpsc::channel();
         let llm = llm::spawn_worker(hardware.physical_cores);
@@ -508,6 +508,46 @@ impl OffgridApp {
                 self.config.save();
             }
         }
+    }
+
+    /// Rebind the server so it picks up changed settings. No-op when it is
+    /// not running.
+    fn restart_server(&mut self) {
+        if let Some(s) = self.api_server.take() {
+            // Give the old listener a moment to release the port (its
+            // accept loop ticks every 200ms).
+            s.stop();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.start_server();
+        }
+    }
+
+    /// Switch the models folder; None goes back to the default. Models
+    /// already downloaded stay where they are.
+    fn set_models_dir(&mut self, dir: Option<PathBuf>) {
+        let dir = dir.filter(|d| *d != default_models_dir());
+        if dir == self.config.models_dir {
+            return;
+        }
+        let path = dir.clone().unwrap_or_else(default_models_dir);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            self.last_error = Some(format!("could not use {}: {e}", path.display()));
+            return;
+        }
+        self.config.models_dir = dir;
+        self.config.save();
+        self.models_dir = path;
+        self.rescan();
+        // The server lists models from the folder it was started with.
+        self.restart_server();
+    }
+
+    /// The images worker is fetching weights or generating.
+    fn images_busy(&self) -> bool {
+        #[cfg(feature = "images")]
+        return self.images.busy;
+        #[cfg(not(feature = "images"))]
+        false
     }
 
     fn set_loaded(&mut self, name: Option<String>) {
@@ -1500,6 +1540,51 @@ impl OffgridApp {
             ui.weak(
                 "Larger context windows let agent tasks run longer before compaction, \
                  at the cost of RAM (KV cache) and slower long-context generation.",
+            );
+        });
+
+        theme::group(ui, "Storage", Some(theme::icons().folder.clone()), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Models:");
+                ui.monospace(self.models_dir.display().to_string());
+            });
+            ui.horizontal(|ui| {
+                // A running download writes into the folder it started in;
+                // switching underneath it would lose track of the file.
+                let idle = self.downloads.is_empty() && !self.images_busy();
+                ui.add_enabled_ui(idle, |ui| {
+                    let browse =
+                        theme::button(ui, Some((theme::icons().folder.clone(), 16.0)), "Browse…")
+                            .on_disabled_hover_text("Wait for downloads to finish");
+                    if browse.clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_directory(&self.models_dir)
+                            .pick_folder()
+                    {
+                        self.set_models_dir(Some(dir));
+                    }
+                    if self.config.models_dir.is_some()
+                        && theme::button(ui, None, "Use default")
+                            .on_hover_text(default_models_dir().display().to_string())
+                            .on_disabled_hover_text("Wait for downloads to finish")
+                            .clicked()
+                    {
+                        self.set_models_dir(None);
+                    }
+                });
+                if theme::button(ui, None, "Open folder").clicked()
+                    && let Err(e) = open::that_detached(&self.models_dir)
+                {
+                    self.last_error = Some(format!("could not open folder: {e}"));
+                }
+            });
+            if let Some(free) = self.free_space {
+                ui.weak(format!("{} free on this drive.", fmt_bytes(free)));
+            }
+            ui.weak(
+                "New downloads go here, and the model list shows what is in this folder. \
+                 Switching does not move models you already have — move them over \
+                 yourself if you want to keep using them.",
             );
         });
 
@@ -2759,14 +2844,8 @@ impl OffgridApp {
             if theme::checkbox(ui, &mut lan, "Allow LAN access").changed() {
                 self.config.server_lan = lan;
                 self.config.save();
-                if let Some(s) = self.api_server.take() {
-                    // Rebind on the new address; give the old listener a
-                    // moment to release the port (its accept loop ticks
-                    // every 200ms).
-                    s.stop();
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    self.start_server();
-                }
+                // Rebind on the new address.
+                self.restart_server();
             }
             if self.config.server_lan {
                 ui.colored_label(

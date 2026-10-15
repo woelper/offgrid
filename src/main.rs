@@ -166,7 +166,7 @@ fn main() -> eframe::Result {
 /// whether chat searches the web — if the model does not emit a tool call
 /// here, chat silently answers from memory.
 fn web_probe(model_match: &str, question: &str) {
-    let dir = config::models_dir();
+    let dir = config::Config::load().models_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("no models dir at {}", dir.display());
         return;
@@ -450,7 +450,7 @@ fn image_probe(prompt: &str) {
 fn smoke(agent_mode: bool) {
     use std::sync::{Arc, Mutex};
 
-    let dir = config::models_dir();
+    let dir = config::Config::load().models_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let entry = &models::catalog()[0]; // smallest model
     let path = dir.join(entry.file);

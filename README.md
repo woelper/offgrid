@@ -74,10 +74,11 @@ internet was there in the first place.
   machine — so all of it is off by default.
 - **Settings**: three UI styles (a loving Haiku OS recreation as default, a
   clean Material look, and stock egui for the purists), context window size,
-  and a summary of what your hardware can actually do.
+  where models are stored, and a summary of what your hardware can actually do.
 
-Models live in `~/.local/share/offgrid/models/`, config in
-`~/.config/offgrid/`. Delete those two folders and it is like we never met.
+Models live in `~/.local/share/offgrid/models/` unless you pick another folder
+in Settings → Storage (handy when they outgrow your system drive), config in
+`~/.config/offgrid/`. Delete those folders and it is like we never met.
 
 ## Headless / terminal mode
 

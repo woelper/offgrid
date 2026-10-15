@@ -35,6 +35,9 @@ pub struct Config {
     /// instead of reverting to the conservative assumption every launch.
     #[serde(default)]
     pub gpu_bandwidth: Option<crate::hardware::GpuBandwidth>,
+    /// Where models are downloaded to and listed from. None means the
+    /// platform data directory (`default_models_dir`).
+    pub models_dir: Option<PathBuf>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -59,6 +62,10 @@ impl Config {
             }
         }
     }
+
+    pub fn models_dir(&self) -> PathBuf {
+        self.models_dir.clone().unwrap_or_else(default_models_dir)
+    }
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -67,8 +74,22 @@ pub fn logs_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./logs"))
 }
 
-pub fn models_dir() -> PathBuf {
+pub fn default_models_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "offgrid")
         .map(|d| d.data_dir().join("models"))
         .unwrap_or_else(|| PathBuf::from("./models"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_dir_falls_back_to_default() {
+        // Configs written before the option existed have no key at all.
+        let old: Config = serde_json::from_str(r#"{"server_enabled": true}"#).unwrap();
+        assert_eq!(old.models_dir(), default_models_dir());
+        let custom: Config = serde_json::from_str(r#"{"models_dir": "/mnt/big/models"}"#).unwrap();
+        assert_eq!(custom.models_dir(), PathBuf::from("/mnt/big/models"));
+    }
 }

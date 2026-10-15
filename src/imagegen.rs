@@ -572,13 +572,18 @@ const SAMPLER_DEFAULT: i32 = -1;
 /// `EULER_SAMPLE_METHOD`, the first of sd.cpp's sample_method_t.
 const SAMPLER_EULER: i32 = 0;
 
-/// Where a weight file lands: `<models>/images/<basename>`.
+/// Where a weight file lands: `<models>/images/<basename>`. Reads the folder
+/// from the saved config, so a change in Settings applies without threading
+/// the path through the worker.
 fn local_path(file: &WeightFile) -> PathBuf {
     let base = Path::new(file.path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.path.to_string());
-    crate::config::models_dir().join("images").join(base)
+    crate::config::Config::load()
+        .models_dir()
+        .join("images")
+        .join(base)
 }
 
 /// What produced an image, kept with it and written into the file.

@@ -14,7 +14,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::{cursor, execute, style, terminal};
 
 use crate::agent::{self, AgentEvent, AgentRun};
-use crate::config::{Config, models_dir};
+use crate::config::Config;
 use crate::hardware::HardwareProfile;
 use crate::hub::{self, ActiveDownload, DownloadEvent, HubEvent, RepoFile, RepoResult};
 use crate::llm::{self, LlmCmd, LlmEvent, Role};
@@ -670,7 +670,7 @@ impl Tui {
         }
         if done {
             self.downloads.retain(|d| d.bytes != u64::MAX);
-            self.models = models::scan_local(&models_dir());
+            self.models = models::scan_local(&self.config.models_dir());
             self.status = "download finished".into();
         }
         dirty
@@ -867,7 +867,7 @@ impl Tui {
             .models
             .iter()
             .any(|m| m.name == entry.file.trim_end_matches(".gguf"))
-            || models_dir().join(entry.file).exists()
+            || self.config.models_dir().join(entry.file).exists()
         {
             self.status = format!("{} is already downloaded", entry.name);
             return;
@@ -880,7 +880,7 @@ impl Tui {
             entry.repo,
             entry.file,
             entry.size,
-            &models_dir(),
+            &self.config.models_dir(),
         ));
         self.status = format!("downloading {}", entry.name);
     }
@@ -948,8 +948,12 @@ impl Tui {
                 if let Some((repo, files, _)) = &self.repo_files
                     && let Some(f) = files.get(self.selected)
                 {
-                    self.downloads
-                        .push(hub::start_download(repo, &f.name, f.size, &models_dir()));
+                    self.downloads.push(hub::start_download(
+                        repo,
+                        &f.name,
+                        f.size,
+                        &self.config.models_dir(),
+                    ));
                     self.status = format!("downloading {}", f.name);
                 }
             }
@@ -970,7 +974,7 @@ impl Tui {
                     self.config.server_port.unwrap_or(server::DEFAULT_PORT),
                     self.config.server_lan,
                     self.llm.cmd_tx.clone(),
-                    models_dir(),
+                    self.config.models_dir(),
                     self.loaded_shared.clone(),
                     Arc::new(std::sync::atomic::AtomicU32::new(
                         self.config.n_ctx.unwrap_or(llm::DEFAULT_N_CTX),
@@ -1097,7 +1101,7 @@ impl Tui {
             Ok(()) => self.status = format!("deleted {}", m.name),
             Err(e) => self.status = format!("delete failed: {e}"),
         }
-        self.models = models::scan_local(&models_dir());
+        self.models = models::scan_local(&self.config.models_dir());
         self.selected = self.selected.min(self.models.len().saturating_sub(1));
     }
 
@@ -1139,7 +1143,7 @@ pub fn run() -> Result<(), String> {
         hardware.adopt_gpu_bandwidth(stored);
     }
     let llm = llm::spawn_worker(hardware.physical_cores);
-    let models = models::scan_local(&models_dir());
+    let models = models::scan_local(&config.models_dir());
     let loaded_shared: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (hub_tx, hub_rx) = std::sync::mpsc::channel();
 
