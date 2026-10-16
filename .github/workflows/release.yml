@@ -79,7 +79,13 @@ jobs:
         if: >-
           runner.os != 'Windows' &&
           (matrix.features != 'images' || runner.os == 'macOS')
-        run: cargo install cargo-bundle
+        # --locked, or this stops working whenever one of cargo-bundle's
+        # transitive dependencies is yanked: every 2.x release of `zip` was,
+        # which broke v0.10.0 for the four jobs that bundle. A lockfile is
+        # permitted to name yanked versions, and the one cargo-bundle ships
+        # pins zip 2.4.2, so installing from it resolves where a fresh
+        # resolution cannot.
+        run: cargo install cargo-bundle --locked
 
       # GPU toolkits live up here, before every build step: the Linux CUDA
       # job needs nvcc just like the Windows one does. The `if` gates keep
