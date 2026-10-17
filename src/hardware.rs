@@ -78,13 +78,16 @@ pub fn gpu() -> Option<&'static Gpu> {
 /// Pick the best device ggml reports: a discrete GPU over an integrated one,
 /// and the roomiest when there are several. `None` when the build has no GPU
 /// backend (then ggml lists only the CPU) or the machine has no GPU.
-/// The real device-local VRAM on an amdgpu card, as (total, used).
+/// The BIOS carve-out on an amdgpu card, as (total, used).
 ///
-/// Vulkan on an integrated Radeon reports the shared GTT pool — 15.9 GB on a
-/// machine whose BIOS gave the GPU 512 MB — and a caller sizing against that
-/// number will happily ask for memory the driver cannot give it. The kernel
-/// exposes the truth here. Linux and amdgpu only; elsewhere the reported
-/// figures are all there is.
+/// Vulkan on an integrated Radeon reports the shared GTT pool rather than the
+/// carve-out — 31.5 GB on a machine whose BIOS gave the GPU 512 MB — and RADV
+/// really does allocate from it: on a Radeon 890M, Stable Diffusion 1.5 and
+/// Z-Image at 1024 px (about 6 GB of weights) both came out clean on the GPU
+/// with 9 MB of the carve-out free, three to four times faster than the CPU.
+/// The carve-out is mostly the desktop's framebuffers, so sizing against it
+/// sent every generation to the CPU for nothing. Only consulted when
+/// OFFGRID_GPU_CARVEOUT=1 asks for it. Linux and amdgpu only.
 #[cfg(target_os = "linux")]
 fn amdgpu_vram() -> Option<(u64, u64)> {
     let read = |path: std::path::PathBuf| {
@@ -133,9 +136,13 @@ fn detect_gpu() -> Option<Gpu> {
             vram_free: d.memory_free as u64,
         })
         .map(|mut gpu| {
-            // Only for the integrated case: a discrete card reports its own
-            // memory correctly, and there is nothing to correct.
+            // OFFGRID_GPU_CARVEOUT=1 sizes an integrated card against its
+            // carve-out instead of the shared pool, for a driver that cannot
+            // spill past it. A discrete card reports its own memory correctly
+            // either way.
+            let carveout = std::env::var("OFFGRID_GPU_CARVEOUT").is_ok_and(|v| v != "0");
             if gpu.unified
+                && carveout
                 && let Some((total, used)) = amdgpu_vram()
                 && total < gpu.vram_total
             {
