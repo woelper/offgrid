@@ -158,6 +158,13 @@ pub struct ImageModel {
     pub steps: usize,
     pub cfg: f32,
     pub flash_attn: bool,
+    /// Whether ggml's Vulkan backend computes this diffusion model correctly.
+    /// When it does not, a Vulkan context keeps the diffusion model on the CPU
+    /// and leaves the text encoder and VAE on the GPU. Mage-Flow on a Radeon
+    /// 890M (RADV) gives confetti with 30 GB free: not a memory shortage, as
+    /// 652954f took it for, and not flash attention, coopmat or integer dot
+    /// either, since turning each off left the confetti in place.
+    pub vulkan_diffusion: bool,
     /// sd.cpp's sample_method_t, or -1 for the library's default. Qwen-Image
     /// is trained for euler and gives noise under the default sampler.
     pub sampler: i32,
@@ -293,6 +300,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 768,
         vram: 559_900_000,
         flash_attn: false,
+        vulkan_diffusion: true,
         sampler: SAMPLER_DEFAULT,
         reference: false,
         transparency: false,
@@ -334,6 +342,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 1536,
         vram: 173_310_000,
         flash_attn: true,
+        vulkan_diffusion: true,
         sampler: SAMPLER_DEFAULT,
         reference: false,
         transparency: false,
@@ -372,6 +381,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 1536,
         vram: 173_310_000,
         flash_attn: true,
+        vulkan_diffusion: true,
         sampler: SAMPLER_DEFAULT,
         reference: false,
         transparency: false,
@@ -427,6 +437,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 2048,
         vram: 151_740_000,
         flash_attn: true,
+        vulkan_diffusion: false,
         sampler: SAMPLER_EULER,
         reference: true,
         // Untested here, and the model is not documented as doing it.
@@ -490,6 +501,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 1536,
         vram: 227_430_000,
         flash_attn: true,
+        vulkan_diffusion: true,
         sampler: SAMPLER_EULER,
         reference: true,
         transparency: true,
@@ -543,6 +555,7 @@ pub const MODELS: &[ImageModel] = &[
         max_size: 1536,
         vram: 227_430_000,
         flash_attn: true,
+        vulkan_diffusion: true,
         sampler: SAMPLER_EULER,
         reference: true,
         transparency: true,
@@ -1213,8 +1226,17 @@ fn load<'a>(
     {
         // Free the old one before allocating the new: 4 GB each.
         *loaded = None;
+        let diffusion_on_cpu = !cpu_only
+            && !spec.vulkan_diffusion
+            && crate::hardware::gpu().is_some_and(|g| g.backend == "Vulkan");
         let _ = tx.send(ImageEvent::Note(if cpu_only {
             format!("loading {} on the CPU…", spec.name)
+        } else if diffusion_on_cpu {
+            format!(
+                "loading {}, its diffusion model on the CPU: the Vulkan backend \
+                 computes it wrongly, so only the text encoder and VAE use the GPU…",
+                spec.name
+            )
         } else {
             format!("loading {}…", spec.name)
         }));
@@ -1232,8 +1254,18 @@ fn load<'a>(
             String::new()
         })?;
         // Empty lets sd.cpp pick; "cpu" keeps this context off the accelerator
-        // without touching the one llama.cpp uses in the same process.
-        let backend = cstr(if cpu_only { "cpu" } else { "" }.to_string())?;
+        // without touching the one llama.cpp uses in the same process, and
+        // "diffusion=cpu" does that for the diffusion model alone.
+        let backend = cstr(
+            if cpu_only {
+                "cpu"
+            } else if diffusion_on_cpu {
+                "diffusion=cpu"
+            } else {
+                ""
+            }
+            .to_string(),
+        )?;
         // Every logical core, unlike the LLM worker. Token generation is
         // memory-bound, so SMT siblings buy it nothing; diffusion is
         // convolution and compute-bound, and using them all was worth nearly a
