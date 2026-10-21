@@ -391,16 +391,17 @@ pub const MODELS: &[ImageModel] = &[
         name: "Mage-Flow-Edit-Turbo",
         note: "2026, and the one to reach for: four steps rather than eight or \
                twenty, good pictures from a plain prompt, and the only model \
-               here under 6 GB that can compose from a picture you give it.",
+               here under 7 GB that can compose from a picture you give it.",
         files: &[
             WeightFile {
                 // Quantized for offgrid: upstream ships bf16 and int8 only,
                 // and the int8 variant needs a ggml patch this build does not
-                // have. Q5_K is the floor — see the repository for what 4-bit
-                // does to this transformer.
+                // have. Q6_K is the floor: Q5_K looked clean on a busy 512 px
+                // edit but lays a wavy lattice over every flat background,
+                // worst at 1024, and 4-bit is that lattice everywhere.
                 repo: "johnsor/Mage-Flow-Edit-Turbo-GGUF",
-                path: "mage-flow-edit-turbo-Q5_K.gguf",
-                size: 2_841_935_584,
+                path: "mage-flow-edit-turbo-Q6_K.gguf",
+                size: 3_387_311_156,
                 role: Role::Diffusion,
             },
             WeightFile {
