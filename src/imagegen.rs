@@ -432,7 +432,13 @@ pub const MODELS: &[ImageModel] = &[
         cfg: 1.0,
         cfg_reference: 3.0,
         native: 1024,
-        min_size: 512,
+        // 512 is where the upstream range starts, but not where this model
+        // still draws: the same prompt and seed at 512 merges the eyes of a
+        // face into one socket and softens everything else, while 1024 is
+        // sharp. Four times the pixels is four times the wait — 31s against
+        // 125s here — and that is the honest price of a picture rather than
+        // an impression of one.
+        min_size: 768,
         // "native-resolution": the upstream docs give 512 to 2048,
         // in multiples of 16, which the 64 px rounding satisfies.
         max_size: 2048,
