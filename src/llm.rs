@@ -9,7 +9,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
@@ -270,9 +270,7 @@ impl<'m> Session<'m> {
             .apply_chat_template(&template, &chat, true)
             .map_err(|e| e.to_string())?;
 
-        let tokens = model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| e.to_string())?;
+        let tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
         if tokens.is_empty() {
             return Err("prompt tokenised to nothing".into());
         }
@@ -460,16 +458,16 @@ fn decode_and_generate(
     while (n_cur as u32) < n_ctx && !stop.load(Ordering::Relaxed) {
         let token = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(token);
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             break;
         }
         gen_tokens += 1;
-        if let Ok(bytes) = model.token_to_piece_bytes(token, 256, true, None) {
-            pending.extend_from_slice(&bytes);
-            let text = drain_valid_utf8(&mut pending);
-            if !text.is_empty() {
-                let _ = tx.send(LlmEvent::Token(text));
-            }
+        model
+            .vocab()
+            .token_to_piece_into(token, &mut pending, true, None);
+        let text = drain_valid_utf8(&mut pending);
+        if !text.is_empty() {
+            let _ = tx.send(LlmEvent::Token(text));
         }
         cache.push(token);
         batch.clear();
