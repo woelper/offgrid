@@ -13,6 +13,7 @@ mod hub;
 mod imagegen;
 mod llm;
 mod models;
+mod oai;
 mod server;
 mod session;
 mod theme;

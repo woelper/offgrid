@@ -41,7 +41,10 @@ internet was there in the first place.
   button picks it up where it left off instead of starting over.
 - **Serve**: an OpenAI-compatible API on `127.0.0.1:11633`, so opencode,
   aider, editors, and scripts can use your local models while believing they
-  are talking to something much more expensive. `POST /v1/chat/completions`
+  are talking to something much more expensive. OpenAI tool calls work
+  (`tools` in, `tool_calls` out, streamed or not), so coding agents can read
+  and edit files through it; the Serve tab has a ready opencode config.
+  `POST /v1/chat/completions`
   accepts an offgrid-specific `"web": true` field (streamed or not) that runs
   the same search-before-you-answer pre-pass as the Chat tab; a client that
   cannot add custom fields can instead start offgrid with `OFFGRID_WEB=1` to

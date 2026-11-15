@@ -2334,7 +2334,18 @@ impl OffgridApp {
         let models: serde_json::Map<String, serde_json::Value> = self
             .local_models
             .iter()
-            .map(|m| (m.name.clone(), serde_json::json!({"name": m.name.clone()})))
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    // tool_call: the API speaks OpenAI tool calls; the
+                    // limit tells opencode when to compact the history.
+                    serde_json::json!({
+                        "name": m.name.clone(),
+                        "tool_call": true,
+                        "limit": {"context": self.config.n_ctx.unwrap_or(crate::llm::DEFAULT_N_CTX), "output": 8192}
+                    }),
+                )
+            })
             .collect();
         let snippet = serde_json::json!({
             "$schema": "https://opencode.ai/config.json",

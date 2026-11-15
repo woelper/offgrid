@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use tiny_http::{Header, Response, StatusCode};
 
-use crate::llm::{ChatMessage, LlmCmd, LlmEvent, Role};
+use crate::llm::{ChatMessage, LlmCmd, LlmEvent};
 use crate::models;
 
 pub const DEFAULT_PORT: u16 = 11633;
@@ -504,24 +504,17 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "offgrid".to_string());
+            // OpenAI tools (opencode, aider, …): described in the system prompt
+            // and parsed back out of the reply, see `oai`.
+            let tools: Vec<serde_json::Value> = payload
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
             let messages: Vec<ChatMessage> = payload
                 .get("messages")
                 .and_then(|m| m.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            let role = match m.get("role")?.as_str()? {
-                                "system" => Role::System,
-                                "assistant" => Role::Assistant,
-                                _ => Role::User,
-                            };
-                            Some(ChatMessage {
-                                role,
-                                content: m.get("content")?.as_str()?.to_string(),
-                            })
-                        })
-                        .collect()
-                })
+                .map(|arr| crate::oai::convert_messages(arr, &tools))
                 .unwrap_or_default();
             if messages.is_empty() {
                 let _ = request.respond(json_response(
@@ -579,7 +572,7 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             }
 
             if stream {
-                let sse = SseStream::new(reply_rx, model_name);
+                let sse = SseStream::new(reply_rx, model_name, !tools.is_empty());
                 let response = Response::new(
                     StatusCode(200),
                     vec![
@@ -625,6 +618,22 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                         _ => {}
                     }
                 }
+                let (message, finish) = if tools.is_empty() {
+                    (json!({"role": "assistant", "content": text}), "stop")
+                } else {
+                    let reply = crate::oai::parse_reply(&text);
+                    let mut message = json!({
+                        "role": "assistant",
+                        "content": reply.content,
+                        "reasoning_content": reply.reasoning,
+                    });
+                    if reply.calls.is_empty() {
+                        (message, "stop")
+                    } else {
+                        message["tool_calls"] = json!(crate::oai::tool_calls_json(&reply.calls));
+                        (message, "tool_calls")
+                    }
+                };
                 let response = match error {
                     Some(e) => json_response(500, json!({"error": {"message": e}})),
                     None => json_response(
@@ -636,8 +645,8 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                             "model": model_name,
                             "choices": [{
                                 "index": 0,
-                                "message": {"role": "assistant", "content": text},
-                                "finish_reason": "stop"
+                                "message": message,
+                                "finish_reason": finish
                             }],
                             "usage": usage,
                             "timings": timings,
@@ -672,10 +681,13 @@ struct SseStream {
     pos: usize,
     sent_role: bool,
     done: bool,
+    /// Set when the request carried tools: reasoning and tool calls are
+    /// split out of the text instead of streamed as content.
+    splitter: Option<crate::oai::StreamSplitter>,
 }
 
 impl SseStream {
-    fn new(rx: Receiver<LlmEvent>, model: String) -> Self {
+    fn new(rx: Receiver<LlmEvent>, model: String, tools: bool) -> Self {
         Self {
             rx,
             model,
@@ -683,7 +695,17 @@ impl SseStream {
             pos: 0,
             sent_role: false,
             done: false,
+            splitter: tools.then(crate::oai::StreamSplitter::default),
         }
+    }
+
+    /// A delta chunk, carrying the role on the first one.
+    fn delta(&mut self, mut delta: serde_json::Value) -> String {
+        if !self.sent_role {
+            self.sent_role = true;
+            delta["role"] = json!("assistant");
+        }
+        self.chunk(delta, None)
     }
 
     fn chunk(&self, delta: serde_json::Value, finish: Option<&str>) -> String {
@@ -706,16 +728,38 @@ impl SseStream {
         self.pos = 0;
         match self.rx.recv() {
             Ok(LlmEvent::Token(t)) => {
-                let delta = if self.sent_role {
-                    json!({"content": t})
-                } else {
-                    self.sent_role = true;
-                    json!({"role": "assistant", "content": t})
+                let deltas = match self.splitter.as_mut() {
+                    None => vec![json!({"content": t})],
+                    Some(splitter) => splitter
+                        .push(&t)
+                        .into_iter()
+                        .map(|d| match d {
+                            crate::oai::Delta::Reasoning(r) => json!({"reasoning_content": r}),
+                            crate::oai::Delta::Content(c) => json!({"content": c}),
+                        })
+                        .collect(),
                 };
-                self.buf = self.chunk(delta, None).into_bytes();
+                let mut out = String::new();
+                for delta in deltas {
+                    out.push_str(&self.delta(delta));
+                }
+                self.buf = out.into_bytes();
             }
             Ok(LlmEvent::GenDone) | Ok(LlmEvent::Error(_)) | Err(_) => {
-                let mut out = self.chunk(json!({}), Some("stop"));
+                let mut out = String::new();
+                let mut finish = "stop";
+                if let Some(splitter) = self.splitter.take() {
+                    let (reply, rest) = splitter.finish();
+                    if !rest.is_empty() {
+                        out.push_str(&self.delta(json!({"content": rest})));
+                    }
+                    if !reply.calls.is_empty() {
+                        let calls = crate::oai::tool_calls_json(&reply.calls);
+                        out.push_str(&self.delta(json!({"tool_calls": calls})));
+                        finish = "tool_calls";
+                    }
+                }
+                out.push_str(&self.chunk(json!({}), Some(finish)));
                 out.push_str("data: [DONE]\n\n");
                 self.buf = out.into_bytes();
                 self.done = true;
