@@ -139,6 +139,16 @@ strong text and headings use the `bold` font family that `theme.rs` binds to
 each skin's Bold face. Cargo picks it up via `[patch.crates-io]`; nothing to
 install.
 
+## Multi-token prediction
+
+Some models ship extra prediction heads that guess the next few tokens
+(Qwen3.6, GLM, DeepSeek; the GGUF carries `nextn_predict_layers`). offgrid
+uses them automatically: each step decodes the current token plus two
+drafted ones and keeps the drafts the model would have sampled anyway, so
+the output is the same and only arrives sooner. Qwen3.6-35B-A3B on a Radeon
+890M goes from about 20 to 30 tokens/s. Models without such heads run as
+before. `OFFGRID_NO_MTP=1` turns it off, for comparing.
+
 ## GPU offload
 
 Off by default. Build with `--features vulkan` and llama.cpp gets the Vulkan

@@ -594,10 +594,33 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
             } else {
                 let mut text = String::new();
                 let mut error = None;
+                let mut usage =
+                    json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+                let mut timings = serde_json::Value::Null;
                 for event in reply_rx {
                     match event {
                         LlmEvent::Token(t) => text.push_str(&t),
                         LlmEvent::Error(e) => error = Some(e),
+                        LlmEvent::Stats {
+                            prompt_tokens,
+                            prompt_secs,
+                            gen_tokens,
+                            gen_secs,
+                        } => {
+                            usage = json!({
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": gen_tokens,
+                                "total_tokens": prompt_tokens + gen_tokens,
+                            });
+                            // Same field names as llama-server, so existing
+                            // tooling can read the speeds.
+                            timings = json!({
+                                "prompt_ms": prompt_secs * 1000.0,
+                                "predicted_n": gen_tokens,
+                                "predicted_ms": gen_secs * 1000.0,
+                                "predicted_per_second": gen_tokens as f32 / gen_secs.max(1e-3),
+                            });
+                        }
                         LlmEvent::GenDone => break,
                         _ => {}
                     }
@@ -616,7 +639,8 @@ fn handle(mut request: tiny_http::Request, ctx: &Ctx) {
                                 "message": {"role": "assistant", "content": text},
                                 "finish_reason": "stop"
                             }],
-                            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                            "usage": usage,
+                            "timings": timings,
                         }),
                     ),
                 };

@@ -5,18 +5,23 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::token::LlamaToken;
 
 /// Default context window; configurable in Settings. Prompt decoding is
 /// chunked, so a large window costs KV-cache memory but not batch memory.
 pub const DEFAULT_N_CTX: u32 = 16384;
 const N_BATCH: u32 = 2048;
+/// Draft tokens per step for models with built-in multi-token prediction
+/// heads (Qwen3.6, GLM, DeepSeek). Two was the sweet spot on a Radeon 890M:
+/// 21 -> 31 tok/s with ~87% of drafts accepted; three gained nothing more.
+const MTP_DRAFT: i32 = 2;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
@@ -172,6 +177,9 @@ fn worker(
             LlmCmd::Load { path, n_ctx } => {
                 // Free the old model before loading the new one.
                 let (params, placement) = load_params(&path, n_ctx);
+                // Keep the multi-token prediction layers of models that have
+                // them; a model without such layers loads exactly as before.
+                let params = params.with_load_mtp(true);
                 if let Ok(mut slot) = accel.lock() {
                     *slot = placement;
                 }
@@ -234,9 +242,111 @@ fn run_model(
 /// appends turns), so only the tail has to be decoded.
 #[derive(Default)]
 struct Session<'m> {
-    ctx: Option<LlamaContext<'m>>,
+    ctx: Option<Ctx<'m>>,
     cache: Vec<LlamaToken>,
     n_ctx: u32,
+}
+
+/// The decoding context, wrapped together with a draft context when the model
+/// ships multi-token prediction heads. The MTP draft runs on the same weights,
+/// so it costs a little memory and roughly 1.5x the generation speed.
+enum Ctx<'m> {
+    Plain(LlamaContext<'m>),
+    Mtp(MtpSpeculative<'m>),
+}
+
+impl<'m> Ctx<'m> {
+    fn new(
+        model: &'m LlamaModel,
+        backend: &LlamaBackend,
+        params: LlamaContextParams,
+    ) -> Result<Self, String> {
+        // OFFGRID_NO_MTP=1 turns drafting off, for comparing speeds.
+        if !has_mtp_tensors(model) || std::env::var_os("OFFGRID_NO_MTP").is_some() {
+            return Ok(Ctx::Plain(
+                model
+                    .new_context(backend, params)
+                    .map_err(|e| e.to_string())?,
+            ));
+        }
+        // Recurrent layers (Qwen3.6 mixes them in) need state snapshots to
+        // roll back a partially accepted draft; one per draft token.
+        let target = model
+            .new_context(backend, params.clone().with_n_rs_seq(MTP_DRAFT as u32))
+            .map_err(|e| e.to_string())?;
+        let draft = model.new_context(
+            backend,
+            params
+                .clone()
+                .with_context_type(LlamaContextType::Mtp)
+                .with_n_rs_seq(0),
+        );
+        let spec = draft.map_err(|e| e.to_string()).and_then(|draft| {
+            MtpSpeculative::new(
+                target,
+                draft,
+                MtpSpeculativeParams {
+                    n_max: MTP_DRAFT,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| e.to_string())
+        });
+        match spec {
+            Ok(spec) => Ok(Ctx::Mtp(spec)),
+            // The heads are there but llama.cpp cannot draft with them: plain
+            // decoding still works, just without the speed-up.
+            Err(_) => Ok(Ctx::Plain(
+                model
+                    .new_context(backend, params)
+                    .map_err(|e| e.to_string())?,
+            )),
+        }
+    }
+
+    fn target(&mut self) -> &mut LlamaContext<'m> {
+        match self {
+            Ctx::Plain(ctx) => ctx,
+            Ctx::Mtp(spec) => spec.target_context_mut(),
+        }
+    }
+
+    /// Drop everything from `pos` on in every context; `false` when the
+    /// backend cannot remove a partial sequence.
+    fn truncate(&mut self, pos: usize) -> bool {
+        let ok = self
+            .target()
+            .kv_cache_seq_rm(0, Some(pos as u32), None)
+            .is_ok();
+        match self {
+            Ctx::Plain(_) => ok,
+            Ctx::Mtp(spec) => {
+                ok && spec
+                    .draft_context_mut()
+                    .kv_cache_seq_rm(0, Some(pos as u32), None)
+                    .is_ok()
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.target().clear_kv_cache();
+        if let Ctx::Mtp(spec) = self {
+            spec.draft_context_mut().clear_kv_cache();
+        }
+    }
+}
+
+/// A loaded model has MTP heads when llama.cpp kept its NextN layers.
+fn has_mtp_tensors(model: &LlamaModel) -> bool {
+    let Ok(arch) = model.meta_val_str("general.architecture") else {
+        return false;
+    };
+    model
+        .meta_val_str(&format!("{arch}.nextn_predict_layers"))
+        .ok()
+        .and_then(|n| n.trim().parse::<u32>().ok())
+        .is_some_and(|n| n > 0)
 }
 
 impl<'m> Session<'m> {
@@ -291,11 +401,7 @@ impl<'m> Session<'m> {
                 .with_n_batch(N_BATCH)
                 .with_n_threads(n_threads as i32)
                 .with_n_threads_batch(n_threads as i32);
-            self.ctx = Some(
-                model
-                    .new_context(backend, ctx_params)
-                    .map_err(|e| e.to_string())?,
-            );
+            self.ctx = Some(Ctx::new(model, backend, ctx_params)?);
             self.n_ctx = n_ctx;
             self.cache.clear();
         }
@@ -307,10 +413,10 @@ impl<'m> Session<'m> {
         // Longest prefix already in the cache, leaving one token to decode so
         // the sampler always gets fresh logits for the final position.
         let mut common = reusable_prefix(cache, &tokens);
-        if common < cache.len() && ctx.kv_cache_seq_rm(0, Some(common as u32), None).is_err() {
+        if common < cache.len() && !ctx.truncate(common) {
             // The backend cannot drop a partial sequence (sliding-window or
             // recurrent models): start the cache over.
-            ctx.clear_kv_cache();
+            ctx.clear();
             cache.clear();
             common = 0;
         }
@@ -320,7 +426,7 @@ impl<'m> Session<'m> {
         // next call must start over rather than reuse a stale prefix.
         let result = decode_and_generate(ctx, cache, model, tx, stop, temp, n_ctx, &tokens, common);
         if result.is_err() {
-            ctx.clear_kv_cache();
+            ctx.clear();
             cache.clear();
         }
         result
@@ -411,7 +517,7 @@ fn load_params(path: &std::path::Path, n_ctx: u32) -> (LlamaModelParams, Accel) 
 
 #[allow(clippy::too_many_arguments)]
 fn decode_and_generate(
-    ctx: &mut LlamaContext<'_>,
+    ctx: &mut Ctx<'_>,
     cache: &mut Vec<LlamaToken>,
     model: &LlamaModel,
     tx: &Sender<LlmEvent>,
@@ -435,10 +541,14 @@ fn decode_and_generate(
                 .map_err(|e| e.to_string())?;
             pos += 1;
         }
-        ctx.decode(&mut batch).map_err(|e| e.to_string())?;
+        decode(ctx, &mut batch)?;
     }
     let prompt_secs = prompt_start.elapsed().as_secs_f32();
     cache.extend_from_slice(&tokens[common..]);
+    // The drafter starts from the evaluated prompt, like llama-server does.
+    if let Ctx::Mtp(spec) = ctx {
+        spec.begin(tokens).map_err(|e| format!("MTP begin: {e}"))?;
+    }
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -451,31 +561,80 @@ fn decode_and_generate(
         LlamaSampler::dist(seed),
     ]);
 
-    let mut n_cur = tokens.len() as i32;
     let mut pending: Vec<u8> = Vec::new();
     let gen_start = std::time::Instant::now();
     let mut gen_tokens = 0usize;
-    while (n_cur as u32) < n_ctx && !stop.load(Ordering::Relaxed) {
-        let token = sampler.sample(ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-        if model.vocab().is_eog(token) {
+    // The newest sampled token: emitted already, not yet decoded.
+    let mut last = sampler.sample(ctx.target(), batch.n_tokens() - 1);
+    sampler.accept(last);
+    while (cache.len() as u32) < n_ctx && !stop.load(Ordering::Relaxed) {
+        if model.vocab().is_eog(last) {
             break;
         }
         gen_tokens += 1;
-        model
-            .vocab()
-            .token_to_piece_into(token, &mut pending, true, None);
-        let text = drain_valid_utf8(&mut pending);
-        if !text.is_empty() {
-            let _ = tx.send(LlmEvent::Token(text));
-        }
-        cache.push(token);
+        emit(model, last, &mut pending, tx);
+
+        // Decode `last` together with up to MTP_DRAFT drafted successors and
+        // keep the drafts the target samples itself; plain decoding is the
+        // same step with an empty draft.
+        let n_past = cache.len();
+        let draft = match ctx {
+            Ctx::Mtp(spec) => {
+                let draft = spec
+                    .draft(n_past as i32, last, cache)
+                    .map_err(|e| format!("MTP draft: {e}"))?;
+                // Drafting wrote its guesses into the draft context; drop them
+                // so it can follow the verified batch (llama-server does the
+                // same and re-evaluates the drafted tokens).
+                spec.draft_context_mut()
+                    .kv_cache_seq_rm(0, Some(n_past as u32), None)
+                    .map_err(|e| format!("MTP draft rollback: {e}"))?;
+                draft
+            }
+            Ctx::Plain(_) => Vec::new(),
+        };
+        let draft: Vec<LlamaToken> = draft
+            .into_iter()
+            .take((n_ctx as usize).saturating_sub(n_past + 1))
+            .collect();
         batch.clear();
         batch
-            .add(token, n_cur, &[0], true)
+            .add(last, n_past as i32, &[0], true)
             .map_err(|e| e.to_string())?;
-        n_cur += 1;
-        ctx.decode(&mut batch).map_err(|e| e.to_string())?;
+        for (i, token) in draft.iter().enumerate() {
+            batch
+                .add(*token, (n_past + 1 + i) as i32, &[0], true)
+                .map_err(|e| e.to_string())?;
+        }
+        decode(ctx, &mut batch)?;
+        cache.push(last);
+
+        // Sample at each position; a draft token counts only if the target
+        // would have sampled it there, so the output distribution is the
+        // target's own.
+        let mut accepted = 0usize;
+        let next = loop {
+            let token = sampler.sample(ctx.target(), accepted as i32);
+            sampler.accept(token);
+            // An end-of-generation draft is handled like a rejection: it is
+            // rolled back below and ends the loop as `last`.
+            if accepted < draft.len() && token == draft[accepted] && !model.vocab().is_eog(token) {
+                accepted += 1;
+                gen_tokens += 1;
+                emit(model, token, &mut pending, tx);
+                cache.push(token);
+                continue;
+            }
+            break token;
+        };
+        if let Ctx::Mtp(spec) = ctx {
+            spec.accept(accepted as u16)
+                .map_err(|e| format!("MTP accept: {e}"))?;
+        }
+        if accepted < draft.len() && !ctx.truncate(cache.len()) {
+            return Err("could not roll back a rejected draft".into());
+        }
+        last = next;
     }
     let _ = tx.send(LlmEvent::Stats {
         prompt_tokens: tokens.len(),
@@ -484,6 +643,28 @@ fn decode_and_generate(
         gen_secs: gen_start.elapsed().as_secs_f32(),
     });
     Ok(())
+}
+
+/// Decode a batch on the target context and, with MTP, let the draft context
+/// follow it.
+fn decode(ctx: &mut Ctx<'_>, batch: &mut LlamaBatch<'_>) -> Result<(), String> {
+    ctx.target().decode(batch).map_err(|e| e.to_string())?;
+    if let Ctx::Mtp(spec) = ctx {
+        spec.process(batch)
+            .map_err(|e| format!("MTP process: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Stream one token's text, holding back an incomplete UTF-8 sequence.
+fn emit(model: &LlamaModel, token: LlamaToken, pending: &mut Vec<u8>, tx: &Sender<LlmEvent>) {
+    model
+        .vocab()
+        .token_to_piece_into(token, pending, true, None);
+    let text = drain_valid_utf8(pending);
+    if !text.is_empty() {
+        let _ = tx.send(LlmEvent::Token(text));
+    }
 }
 
 /// Leading tokens shared by the cached sequence and the new prompt, capped so
